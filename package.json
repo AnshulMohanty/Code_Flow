@@ -1,0 +1,29 @@
+{
+  "name": "codeflow",
+  "version": "0.0.0",
+  "private": true,
+  "description": "CodeFlow MERN migration monorepo skeleton.",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:web": "pnpm --filter @codeflow/web dev",
+    "dev:api": "pnpm --filter @codeflow/api dev",
+    "dev:worker": "pnpm --filter @codeflow/worker dev",
+    "dev:local": "pnpm --filter @codeflow/local-cli dev",
+    "eval": "pnpm --filter @codeflow/eval run eval",
+    "build": "pnpm -r build",
+    "test": "pnpm -r --workspace-concurrency=1 test",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

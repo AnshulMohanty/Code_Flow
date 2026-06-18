@@ -1,0 +1,90 @@
+# CodeFlow — full self-contained stack (web + api + worker + Mongo + Redis).
+#
+# This is the "download and run" file: it builds all three app images from source and runs
+# them alongside Mongo + Redis, so a recipient needs NOTHING except Docker Desktop and a
+# Gemini API key. (The plain docker-compose.yml is the dev-only stores file.)
+#
+#   1. Create  codeflow.env  next to this file with one line:  GEMINI_API_KEY=your-key
+#   2. Run:    docker compose --env-file codeflow.env -f docker-compose.app.yml up -d --build
+#      (or just run ./start.sh on macOS/Linux, or start.bat on Windows)
+#   3. Open:   http://localhost:5173
+#
+# Secrets are injected at runtime, never baked into images. First build takes a few minutes;
+# subsequent starts are instant.
+name: codeflow
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://mongo:27017/codeflow
+      REDIS_URL: redis://redis:6379
+      API_PORT: "4000"
+      # The browser loads the SPA from http://localhost:5173 and calls the API at this origin.
+      CORS_ORIGINS: http://localhost:5173
+      LLM_PROVIDER: gemini
+      EMBEDDING_PROVIDER: gemini # Gemini powers BOTH chat + embeddings from one key (avoids Voyage's free-tier 3 RPM)
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
+    ports:
+      - "4000:4000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://mongo:27017/codeflow
+      REDIS_URL: redis://redis:6379
+      LLM_PROVIDER: gemini
+      EMBEDDING_PROVIDER: gemini
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Browser-side API URL (host-published port), injected into /config.js at container start.
+      API_BASE_URL: http://localhost:4000
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  mongo-data:

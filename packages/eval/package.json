@@ -1,0 +1,31 @@
+{
+  "name": "@codeflow/eval",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "build": "tsc -p tsconfig.json",
+    "eval": "tsx src/cli.ts",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codeflow/analyzers": "workspace:*",
+    "@codeflow/shared-types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@codeflow/analyzers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codeflow/config": "workspace:*",
+    "@codeflow/graph": "workspace:*",
+    "@codeflow/parsers": "workspace:*",
+    "@codeflow/shared-types": "workspace:*"
+  }
+}

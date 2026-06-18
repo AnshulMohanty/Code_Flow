@@ -1,0 +1,22 @@
+{
+  "name": "@codeflow/local-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "codeflow-local": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codeflow/config": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0"
+  }
+}

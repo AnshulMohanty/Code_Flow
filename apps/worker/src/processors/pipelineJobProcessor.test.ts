@@ -1,0 +1,137 @@
+import { describe, expect, it, vi } from "vitest";
+import type {
+  AnalysisJobPayload,
+  AnalysisResult,
+  PipelineRunStatus,
+  ProgressEvent,
+  ProgressMessage,
+} from "@codeflow/shared-types";
+import type { RepoCloner } from "@codeflow/analyzers";
+import { runAnalysisJob } from "./pipelineJobProcessor.js";
+import type { SavedWorkerAnalysis, WorkerAnalysisService, WorkerJobPatch } from "../services/workerAnalysisService.js";
+
+const RESOLVED_SHA = "abcdef1234567890abcdef1234567890abcdef12";
+
+const payload: AnalysisJobPayload = {
+  jobId: "job-1",
+  mode: "public_hosted",
+  repositoryRef: { provider: "github", owner: "facebook", name: "react", branch: "main" },
+  commitSha: "requested",
+  analyzerVersion: "v1",
+};
+
+function fakeCloner(overrides: Partial<RepoCloner> = {}): RepoCloner {
+  return { clone: vi.fn(async () => ({ repoPath: "/tmp/clone", commitSha: RESOLVED_SHA })), ...overrides };
+}
+
+function fakeService(cached: SavedWorkerAnalysis | null) {
+  const updates: WorkerJobPatch[] = [];
+  const service: WorkerAnalysisService = {
+    updateJob: vi.fn(async (_id: string, patch: WorkerJobPatch) => {
+      updates.push(patch);
+    }),
+    findCachedAnalysis: vi.fn(async () => cached),
+    saveAnalysis: vi.fn(async ({ result }) => ({ analysisId: "saved-1", result: { ...result, id: "saved-1" } })),
+  };
+  return { service, updates };
+}
+
+// In-memory progress channel (publisher + subscriber) — stands in for the BullMQ
+// transport. Subscribe-before-run, so live delivery is enough.
+function createChannel() {
+  const handlers = new Map<string, Array<(m: ProgressMessage) => void>>();
+  const emit = (m: ProgressMessage) => (handlers.get(m.jobId) ?? []).forEach((h) => h(m));
+  return {
+    publishProgress(jobId: string, event: ProgressEvent) {
+      emit({ kind: "progress", jobId, event });
+    },
+    publishDone(jobId: string, status: PipelineRunStatus) {
+      emit({ kind: "done", jobId, status });
+    },
+    subscribe(jobId: string, handler: (m: ProgressMessage) => void) {
+      const list = handlers.get(jobId) ?? [];
+      list.push(handler);
+      handlers.set(jobId, list);
+      return () => {};
+    },
+  };
+}
+
+describe("runAnalysisJob", () => {
+  it("cache miss: runs the orchestrator, persists the result, streams events + done", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+    const received: ProgressMessage[] = [];
+    channel.subscribe(payload.jobId, (m) => received.push(m));
+
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: channel,
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+    });
+
+    // orchestrator ran Ingest and resolved the real SHA
+    expect(outcome.status).toBe("completed");
+    expect(outcome.cached).toBe(false);
+    expect(outcome.analysisId).toBe("saved-1");
+
+    // persisted on miss, keyed on the resolved SHA
+    expect(service.saveAnalysis).toHaveBeenCalledTimes(1);
+    expect(service.saveAnalysis).toHaveBeenCalledWith(
+      expect.objectContaining({ commitSha: RESOLVED_SHA, result: expect.objectContaining({ commitSha: RESOLVED_SHA }) }),
+    );
+
+    // run status surfaced onto the job
+    const terminal = updates.at(-1);
+    expect(terminal).toMatchObject({ status: "completed", runStatus: "completed", analysisId: "saved-1", cached: false });
+
+    // events streamed: at least one ingest progress event + a terminal done(completed)
+    expect(received.some((m) => m.kind === "progress" && m.event.stage === "ingest")).toBe(true);
+    expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "completed" });
+  });
+
+  it("cache hit: skips save and returns the cached analysis", async () => {
+    // producedBy must cover the worker's configured pipeline [ingest, orient, map-structure, inventory, connect, analyze].
+    const cachedResult = { id: "cached-1", commitSha: RESOLVED_SHA, producedBy: ["ingest", "orient", "map-structure", "inventory", "connect", "analyze"] } as AnalysisResult;
+    const { service, updates } = fakeService({ analysisId: "cached-1", result: cachedResult, cached: true });
+    const channel = createChannel();
+    const received: ProgressMessage[] = [];
+    channel.subscribe(payload.jobId, (m) => received.push(m));
+
+    const outcome = await runAnalysisJob(payload, { service, cloner: fakeCloner(), publisher: channel, readFile: noFiles, readDir: emptyDir, now: makeClock() });
+
+    expect(outcome.cached).toBe(true);
+    expect(outcome.analysisId).toBe("cached-1");
+    expect(service.saveAnalysis).not.toHaveBeenCalled();
+    expect(updates.at(-1)).toMatchObject({ cached: true, runStatus: "completed" });
+    expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "completed" });
+  });
+
+  it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+    const received: ProgressMessage[] = [];
+    channel.subscribe(payload.jobId, (m) => received.push(m));
+
+    const cloner = fakeCloner({ clone: vi.fn(async () => { throw new Error("invalid repo url"); }) });
+    const outcome = await runAnalysisJob(payload, { service, cloner, publisher: channel, readFile: noFiles, readDir: emptyDir, now: makeClock() });
+
+    expect(outcome.status).toBe("failed");
+    expect(service.saveAnalysis).not.toHaveBeenCalled();
+    expect(updates.at(-1)).toMatchObject({ status: "failed", runStatus: "failed" });
+    expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "failed" });
+  });
+});
+
+// Orient reader / Map-structure walker that find nothing → empty-but-valid slices
+// (those stages have their own dedicated tests; these focus on job orchestration).
+const noFiles = async () => null;
+const emptyDir = async () => [];
+
+function makeClock() {
+  let t = 0;
+  return () => ++t;
+}

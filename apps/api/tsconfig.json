@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "declaration": false,
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "paths": {
+      "@codeflow/analyzers": ["../../packages/analyzers/dist/index.d.ts"],
+      "@codeflow/config": ["../../packages/config/dist/index.d.ts"],
+      "@codeflow/shared-types": ["../../packages/shared-types/dist/index.d.ts"]
+    }
+  },
+  "include": ["src"]
+}

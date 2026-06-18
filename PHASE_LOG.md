@@ -1,0 +1,1057 @@
+# CodeFlow — Phase Log
+
+> Append-only record of what actually executed each session. Intent lives in [PLAN.md](PLAN.md);
+> live status in [CURRENT_STATE.md](CURRENT_STATE.md).
+
+## 2026-05-30 — Cleanup pass (prerequisite for PLAN P1)
+
+Branch: `codeflow-cleanup` (off the Phase 6–10 baseline checkpoint `3aa1839`). Cleanup only —
+no new features.
+
+**Mock scoring removed**
+- Deleted `packages/analyzers/src/mock/mockAnalysisFactory.ts` (`createMockAnalysisResult`,
+  hardcoded `healthScore: 82` / `healthGrade: "B"` / `securityIssues: 2` /
+  `architectureViolations: 3` and the literal `issues[]`).
+- Removed the empty analyzer-registry stub (`{ analyzers: [] }`) from
+  `packages/analyzers/src/index.ts`; left a P1-orchestrator TODO.
+- Rewrote `apps/worker/.../analysisProcessor.ts` to assemble a real `AnalysisResult` from parsed
+  data, with graph-derived metrics and no fabricated values (health unscored → `null`,
+  `issues: []`).
+
+**Truncation caps split to render-only**
+- Removed the `files 50 / symbols 250 / dependencies 500` caps from the analysis path. The graph
+  and all of its metrics now compute on the FULL parsed dataset.
+- Added separate UI render caps (env-overridable) applied only to the serialized result + graph
+  for the frontend; they never feed back into computed metrics.
+- `serializeGraphForUI` gained optional `{ maxNodes, maxLinks }`; `summary` stays full.
+
+**API fails honestly**
+- Deleted `runImmediateMockFallback` in `analyze.ts`; queue-unavailable now marks the job failed
+  and returns 503 `QUEUE_UNAVAILABLE` (no fake Mongo save). Left a TODO for a future real inline
+  runner.
+- Deleted the `results.ts` branch that fabricated a result when a completed job had no
+  `analysisId`; it now returns a real error.
+- Deleted dead `apps/api/src/services/mockAnalysisFactory.ts` and `mockJobStore.ts`, and their
+  unused `AnalyzeJob` / `MockJobProgress` / `MockAnalysisResult` types.
+
+**Frontend scope → public-hosted only**
+- Collapsed `AnalysisMode` to `"public_hosted"`; removed `ModeSelector` + `PrivateLocalModeGuide`
+  and the mode branching in `RepoInput`, `RepositorySummary`, `mockAnalysis`, and the store
+  (`setAnalysisMode` removed). Updated the Mongo `mode` enums.
+- Kept `apps/web/src/lib/mockAnalysis.ts` + the public-preview render path as PLAN P5
+  scaffolding; marked with `// MOCK — replaced in P5`.
+
+**Exports / legacy quarantined**
+- Removed the `exportAnalysisAsJsonPlaceholder` from `@codeflow/exports`; TODO left (deferred).
+- Moved `index.html` → `legacy/index.html` (`git mv`). Repointed the legacy root tests
+  (`tests/*.mjs`) and made the `card/` action tolerant of both locations.
+
+**Verification:** `pnpm -r typecheck` / `lint` / `test` all green (web 4, graph 16, parsers 10,
+api 15, worker 11). Legacy `node --test tests/*.mjs` green against `legacy/index.html`.
+
+**Tests changed:** rewrote `apps/api/src/app.test.ts` to assert the honest queue/503 + seeded
+cache behavior instead of the mock fallback; removed the two `private_local` cases from
+`apps/web/src/App.test.tsx`; renamed the worker test (now asserts real graph values, unchanged
+assertions).
+
+## 2026-05-31 — P1: pipeline orchestrator + Ingest stage
+
+One job: build the sequential orchestrator and wire the single Ingest stage end-to-end. No other
+stage; worker/API untouched (next session).
+
+**Contract change (approved):** `PipelineContext.repoPath`/`commitSha` are now optional — Ingest
+resolves them; the orchestrator populates ctx before stages 2+. Conformance test updated to prove
+a pre-Ingest context is valid without them.
+
+**Orchestrator** (`packages/analyzers/src/pipeline/orchestrator.ts`, `runPipeline`):
+- Runs stages in declared order; exposes accumulated slices to each stage via `ctx.prior`.
+- Assembles `AnalysisResult` by **per-key slice assignment** (`result[key] = partial[key]`) —
+  no deep-merge; `ai*` slice keys nest under `result.ai`; required deterministic fields not yet
+  produced get honest empty defaults.
+- Emits **one authoritative ProgressEvent per stage** (orchestrator owns
+  `stageIndex`/`stageCount`/`progress`/`status`/timing; stage contributes `detail`/`preview`).
+- Error contract: deterministic fail → `"failed"` + dependents skipped + partial result + warning;
+  AI fail → `"partial"`, deterministic result intact, `ai` unset + warning; abort → remaining
+  stages skipped + warning. Returns `{ result, cached }`.
+
+**Ingest stage** (`packages/analyzers/src/stages/ingest.ts`, `createIngestStage`):
+- Validates + shallow-clones + resolves the real commit SHA behind a `RepoCloner` interface;
+  writes `repoPath`/`commitSha` into ctx; checks the analysis cache behind a
+  `CachedAnalysisLookup` interface. Owns no slice (`owns: []`, `partial: {}`).
+- Cache hit throws `CacheHitShortCircuit`; the orchestrator catches it (control flow, not an
+  error) and returns the cached result, skipping the rest.
+
+**Tests** (`packages/analyzers/src/__tests__`, faked clone/cache — no network): orchestrator
+ordering + per-key assembly, the three error paths (det-fail / ai-fail / abort), Ingest SHA
+resolution + ctx population + cache-hit short-circuit + clone-failure. 9 analyzers tests.
+
+**Verification:** workspace `typecheck` / `lint` / `test` all green (shared-types 3, web 4,
+analyzers 9, graph 16, parsers 10, api 15, worker 11).
+
+**Flagged for review:** (1) cache-hit short-circuit uses a thrown `CacheHitShortCircuit` sentinel
+because the `{partial,event}` stage contract can't express whole-run early-exit; (2) abort maps to
+run status `"partial"` (the enum has no dedicated `"aborted"`); (3) stages can't know
+`stageIndex`/`stageCount`, so the orchestrator is the source of truth for the emitted event and the
+stage-returned event only contributes `detail`/`preview`.
+
+## 2026-05-31 (b) — P1: worker/API wired to orchestrator + SSE
+
+Two approved contract tweaks, then the worker/API wiring. Two commits.
+
+**Tweaks (commit 1ac9906):**
+- Cache read moved from Ingest into the orchestrator (`runPipeline` gains a `cacheLookup`; checks
+  once `ctx.commitSha` is set; hit → `{ result, cached: true }` + skip rest). Deleted the
+  `CacheHitShortCircuit` sentinel + the instanceof catch (no exception-as-control-flow). Ingest is
+  now pure (clone + resolve SHA only).
+- Added `"aborted"` to `PipelineRunSummary.status` (new `PipelineRunStatus`); abort with no
+  deterministic failure → `"aborted"` (was `"partial"`).
+
+**Cross-process progress channel:** new contracts in shared-types (`ProgressMessage`,
+`ProgressPublisher`, `ProgressSubscriber`). Production transport = BullMQ `job.updateProgress`
+(worker) → `QueueEvents` `"progress"` listener filtered by jobId (API). No new dependency. Tests
+use an in-memory channel implementing the same interfaces.
+
+**Worker:** `runAnalysisJob` runs `runPipeline([ingest])` (Ingest only → minimal result),
+publishes each ProgressEvent + a terminal done(status), persists on cache miss (completed/partial)
+keyed on the resolved SHA, skips save on hit, does not persist failed/aborted, surfaces `runStatus`
+on the job. Real `RepoCloner` (`gitRepoCloner`) wraps the existing clone/SHA helpers; working tree
+cleaned up after. The BullMQ worker entrypoint now calls this. The legacy `processAnalysisJob`
+(parse → graph → metrics) is kept **unwired** as the reference for stages 2–6.
+
+**API:** `GET /api/job/:id/events` rewritten to stream `progress` events + a terminal `done` event
+via a `ProgressSubscriber` (extracted `streamProgress(res, jobId, subscriber)` helper; fixed a TDZ
+bug where a synchronous subscriber's terminal event ran `close()` before `unsubscribe` was
+assigned). 404-before-SSE preserved. `POST /api/analyze` 503-on-Redis-down unchanged.
+
+**Tests:** worker — cache miss persists + streams events + done; cache hit skips save; clone
+failure → failed + not persisted + done(failed). API — `streamProgress` framing (fake sink, since
+superagent reports "aborted" on event-streams); 404-before-SSE. Orchestrator — cache hit/miss via
+`cacheLookup`, abort → `"aborted"`. Workspace green: shared-types 3, web 4, analyzers 10, graph 16,
+parsers 10, api 17, worker 14.
+
+**Flagged:** (1) worker now produces a **minimal** result (Ingest only) — deliberate regression
+until stages 2–6 reimplement parse/graph; `processAnalysisJob` retained unwired. (2) BullMQ
+transport not exercised in tests (interface + in-memory only) — needs a real-Redis check. (3) real
+transport doesn't replay → late SSE subscribers miss earlier events. (4) `/api/job/:id` doesn't yet
+surface `runStatus`; web `streamJobEvents` expects the old SSE shape (web untouched).
+
+## 2026-05-31 (c) — P1: producedBy cache stamp + Orient stage (stage 2)
+
+Do-first tweak, then the Orient stage. Two commits.
+
+**Tweak (commit 3e92108):** orchestrator stamps each `AnalysisResult` with
+`producedBy: PipelineStageId[]` (completed stages, sorted). Cache READ now serves a HIT only when
+`producedBy` **covers** the configured pipeline (superset test) — smaller/older or unstamped
+(legacy) records miss → real re-run. Chose an explicit list over a hash because the rule is
+coverage, not equality. Persisted automatically (result stored as Mixed). Tests: covering hit;
+smaller-pipeline + unstamped → miss + re-run + fresh stamp.
+
+**Orient stage (commit <this>):** stage 2, deterministic, owns the `orientation` slice.
+- Contract: extended `RepoOrientation` — `manifests: DetectedManifest[]` (path + ecosystem),
+  `projectType: ProjectType` (enum), added `readme: ReadmeCapture | null` (FULL raw text, a fact
+  for P3). New `ProjectType`/`PackageEcosystem`/`DetectedManifest`/`ReadmeCapture` types.
+- Detection from ROOT manifests + README only (behind a `readFile` interface — no tree walk, no
+  source parse). Languages from which manifests exist (+ `typescript` dep → TypeScript);
+  frameworks from a curated keyword scan (JSON manifests parsed for deps; others substring-scanned,
+  regex/token style per PLAN §9); `projectType` heuristic monorepo > cli > library > application,
+  unknown when no manifest. README probed as a candidate-name set. **No LLM** (AI 3-liner → P3).
+- Manifests recognised: package.json, requirements.txt, pyproject.toml, **setup.py** (added),
+  go.mod, Cargo.toml, pom.xml, build.gradle, **build.gradle.kts** (added), Gemfile, composer.json;
+  pnpm-workspace.yaml / lerna.json probed as monorepo signals (not listed as manifests).
+- Wired into the worker pipeline: `runPipeline([ingest, orient])` with `readRepoFile` (fs reader,
+  ENOENT→null). The worker cache-hit fixture bumped to `producedBy: ["ingest","orient"]`.
+- Tests (faked readFile): JS monorepo (workspaces+TS+React → monorepo), Python lib (setup.py
+  find_packages → library, Flask), Go CLI (cobra → cli), npm library, empty repo (empty-but-valid,
+  no throw), full-README capture (50k chars, untruncated), malformed package.json (still counted),
+  missing repoPath → throws. Workspace green: shared-types 3, web 4, analyzers 20, graph 16,
+  parsers 10, api 17, worker 14.
+
+**Flagged judgment calls:** `projectType` is heuristic, not a fact. Go CLI vs app/lib can't be told
+from go.mod alone, so it leans on a cobra/urfave-cli dependency signal; Python lib leans on
+`find_packages`/`packages=`. True entry-point classification is Inventory (stage 4). README
+case-insensitive matching is approximated by a candidate-name probe (real globbing needs the dir
+listing from Map-structure, stage 3). build.gradle is reported as Java (could be Kotlin).
+
+## 2026-06-01 — P1: Map-structure stage (stage 3)
+
+One job: the deterministic Map-structure stage — the first stage that discovers the full tree.
+No LLM. Single commit.
+
+**Contract (structure slice):** redefined `RepoStructure` to `{ layout: RepoLayout, files:
+RepoFile[], fileCount }`; new `RepoFile = { path, ext, role, language, sizeBytes }` keyed by
+`path`; `FileRole` `"unknown"`→`"other"` (prompt enum); `RepoLayout =
+monorepo|src-rooted|app-rooted|flat`. Removed the now-unused `ClassifiedFile`.
+
+**Stage** (`packages/analyzers/src/stages/mapStructure.ts`, owns `structure`):
+- Walks the tree behind a `readDir(repoPath, relativeDir) → WalkEntry[]` interface (stage owns
+  recursion + ignores; tests fake it — no real fs). Ignores = HARD_IGNORE_DIRS (node_modules/.git/
+  dist/build/vendor/.venv/caches/…) + a pragmatic-subset `.gitignore` matcher (comments/blanks,
+  `!` negation last-match, trailing-slash dir-only, leading/embedded-slash anchoring, `*`/`**`/`?`).
+- Classifies role ordered test > docs > build > config > asset > source > other (first match wins,
+  so `*.test.ts` is test and a CI yml is build); records ext + language-by-extension + sizeBytes.
+- Detects layout (presence-based: a `packages/`|`apps/` path → monorepo; else top-level `src`/`app`
+  → src/app-rooted; else flat). Layout is the owned fact: on disagreement with Orient's
+  `projectType` it logs and does NOT overwrite (reconciled when Inventory lands).
+- File list is COMPLETE/uncapped (load-bearing — feeds the graph later). Deterministic sort by path.
+- Throws if `ctx.repoPath` is unset (Ingest must run first).
+
+**Wiring:** exported from analyzers; worker pipeline now `[ingest, orient, map-structure]` with an
+fs `readRepoDir` walker (skips symlinks). Worker cache-hit fixture bumped to
+`producedBy: ["ingest","orient","map-structure"]`; worker test deps gain a `readDir`.
+
+**Tests** (faked tree, no fs): role classification across source/test/config/docs/build/asset/other
++ ext/language/sizeBytes; hard-ignore-set + `.gitignore` (glob/dir/negation) exclusion; layout
+(monorepo/src/app/flat) + no-overwrite-on-disagreement; 1000-file uncapped list; empty repo; missing
+repoPath throws. Workspace green: shared-types 3, web 4, analyzers 32, graph 16, parsers 10, api 17,
+worker 14.
+
+**Flagged:** (1) file list keyed by `path` (POSIX, unique); Map-structure owns only `structure`
+(not `files: FileNode[]`) — deferring the graph-node projection + LOC to Connect/Inventory so one
+stage owns `files`. (2) `.gitignore` is a subset (root only, no nested files / `[]` classes).
+(3) role config-vs-build and `.txt`→other are genuine judgment calls; `.github/workflows`→build.
+(4) layout monorepo detection is presence-based (top-level `packages/`/`apps/` path).
+
+## 2026-06-03 — P2: Inventory stage (stage 4)
+
+One job: the deterministic Inventory stage — parses source into symbols + detects entry
+points. No graph (Connect, stage 5), no AST dep (regex/token parsers). Single commit.
+
+**Contract (new `inventory` slice):** added `Inventory = { symbols: InventorySymbol[];
+entryPoints: InventoryEntryPoint[]; symbolCount; loc: Record<posix,number>;
+projectTypeSignal?; unparsedFiles? }`. `InventorySymbol = { name, kind, filePath (repo-
+relative POSIX), line (1-based), endLine?, exported, language }` with `SymbolKind =
+function|class|method|interface|type|enum|variable|export`. `InventoryEntryPoint = {
+filePath, kind: main|index|server|app|cli-bin, evidence: package-json-bin|-main|-exports|
+filename-convention|framework }`. Keyed by **POSIX filePath** (NOT fileId) — Inventory has
+no FileNode ids yet. New types are PREFIXED (`InventorySymbol`/`InventoryEntryPoint`) to
+avoid shadowing the JS `Symbol` global and colliding with the legacy fileId-keyed
+`EntryPoint`. `AnalysisResultSlices`/`AnalysisResult` gained `inventory`; the legacy
+`files`/`symbols`/`entryPoints` slice-ownership comments moved to **Connect** (it does the
+single join into fileId-keyed projections).
+
+**Stage** (`packages/analyzers/src/stages/inventory.ts`, owns `inventory`):
+- Drives off `ctx.prior.structure.files` (role==='source'), reads contents behind the same
+  `readFile` interface Orient/Map-structure use, parses via `@codeflow/parsers`
+  `registry.parseFile` (regex/token — no AST dep, the known later fork). Joins strictly by
+  repo-relative POSIX path.
+- Symbols built from the parser's `symbols` (declarations) + `exports` (public surface):
+  an export on an in-file name FLIPS that symbol's `exported` flag; an export of a name not
+  declared in-file (barrel/re-export) becomes its own symbol. No duplicate-name noise.
+  Kind normalization: component/hook→function; TS `unknown` (interface/type) recovered from
+  the captured signature line; export-only unknowns→`export`.
+- Entry points: package.json `bin`⇒cli-bin (string or object), `main`/`module`⇒main,
+  `exports`⇒main (string + nested conditional-exports walked); filename conventions
+  index/main/server/app.*; cheap framework conventions (manage.py⇒cli-bin, wsgi/asgi.py⇒
+  server, __main__.py⇒main). Evidence recorded on each; deduped on (path,kind,evidence).
+- Real LOC captured into `inventory.loc` (the ONE place LOC is produced — Connect joins it
+  into FileNode[].lines later; Inventory does NOT write structure.files / FileNode[]).
+- **UNCAPPED** symbol list (load-bearing — never truncated; caps are UI-only).
+- Single-file failure (parse throw OR unreadable/null) → recorded in `unparsedFiles`,
+  skipped, run continues. Throws only if repoPath or the structure slice is missing.
+
+**Reconciliation (orchestrator-owned):** Inventory emits a hard-evidence verdict
+(`projectTypeSignal`, ONLY on a package.json `bin` ⇒ cli) inside its OWN slice — it never
+reaches into orientation. The orchestrator runs an explicit `reconcileProjectType` step
+after the stage loop that writes the SINGLE canonical `orientation.projectType` (Inventory
+wins on hard evidence, else Orient's heuristic stands). Same deferral pattern Map-structure
+uses for layout. No second competing projectType field.
+
+**Wiring:** exported from analyzers; worker pipeline now `[ingest, orient, map-structure,
+inventory]` (reuses the existing `readFile` dep). `inventory` joins the `producedBy` stamp;
+worker cache-hit fixture bumped to `[ingest, orient, map-structure, inventory]`. Added
+`@codeflow/parsers` as an analyzers dependency (+ tsconfig path to its dist).
+
+**Tests** (faked readFile + in-memory structure): symbol extraction TS (func/class/arrow/
+interface/type, exported flag, line) + Python (func/class/method) + JS (export-surface flag);
+real LOC; source-role-only parsing; POSIX join (symbol.filePath ∈ structure.files); entry
+points bin⇒cli-bin / main / exports / filename / framework with evidence; string-form bin;
+projectTypeSignal only on bin; uncapped 500-symbol fixture; bad-file + unreadable-file skip
+with the run still succeeding; missing structure/repoPath throw. Reconciliation (orchestrator
+suite): bin+Orient=library⇒cli; no signal⇒library preserved; asserts exactly ONE projectType
+field (orientation owns it, inventory exposes only a signal). Workspace green: shared-types 3,
+web 4, analyzers 47, graph 16, parsers 10, api 17, worker 14.
+
+**Flagged judgment calls:** (1) `inventory` is a NEW slice keyed by POSIX path; the legacy
+fileId-keyed `files`/`symbols`/`entryPoints` projections are deferred to Connect (one join of
+structure.files + inventory.loc + graph). (2) bin/main/exports paths often point at BUILD
+output (dist/, hard-ignored by Map-structure) so an entry point's filePath may not join to a
+source file — it's recorded as the declared fact regardless. (3) `module` evidence folded
+under `package-json-main` (the evidence enum has no module variant). (4) filename-convention
+entries are broad (any source index/main/server/app.*) — facts, uncapped; ranking is a UI
+concern. (5) hard evidence for reconciliation is package-json-bin ONLY (framework manage.py
+is cli-bin but deliberately does NOT flip projectType). (6) no `enum` detection in the
+parsers today — the kind exists in the union for forward-compat.
+
+## 2026-06-03 — P2: Connect stage (stage 5)
+
+One job: the deterministic Connect stage — builds the dependency-graph STRUCTURE from
+real imports and produces the single FileNode[] projection. NO metrics (Analyze's job).
+First feed of @codeflow/graph. Single commit.
+
+**Pre-flight (3 carried-over Inventory items, gates not a second job):**
+- (i) `inventory.loc` scope CONFIRMED source-only (Inventory's loop filters role==='source').
+  Decision: Connect's FileNode.lines = `inventory.loc[path] ?? 0`; non-source nodes report 0
+  (LOC is a source-code metric — Inventory measures source only). Recorded in CURRENT_STATE.
+- (ii) Barrel re-export provenance — GAP confirmed + FLAGGED (own follow-up): Inventory makes a
+  barrel re-export its own symbol at the BARREL file/line, not the definition. P3 RAG citation
+  needs the definition; recovering it needs import-resolution-to-definition (> small fix). Not
+  fixed here.
+- (iii) Entry-point manifest source — Inventory re-reads package.json; `orientation.manifests`
+  is only `{ path, ecosystem }` (no bin/main/exports). "Switch to the owned fact" needs Orient
+  to expose manifest fields first (> one-liner). FLAGGED as its own session. Not fixed here.
+
+**Contract (new `graph` slice = RepoGraph):** `fileId === repo-relative POSIX path` (no opaque
+ids — verified @codeflow/graph buildNodes uses file.id directly; no translation map). New
+`RepoDependencyEdge = { from, to, kind: import|require|dynamic|reexport, specifier }`;
+`GraphResolution = { resolved, external, unresolved, externalModules[], unresolvedImports[] }`;
+`RepoGraph = { nodes: FileNode[], edges: RepoDependencyEdge[], resolution }`. `AnalysisResult.graph`
+RETYPED `SerializedDependencyGraph → RepoGraph` (structure only, no metrics); the old serialized
+shape (with `summary` metrics) stays as the UI-serialization output type for Analyze/P5. `FileNode`
+gained `symbolCount?`. `result.files` is now a DERIVED view of `graph.nodes` at assembly (single
+FileNode[] home). The fileId-keyed flat projections (symbols/entryPoints/dependencies) are deferred
+(trivial later since fileId===path).
+
+**Stage** (`packages/analyzers/src/stages/connect.ts`, owns `graph`):
+- One FileNode per `structure.files` entry: id=path, name=basename, layer=role, language, lines=
+  loc??0, symbolCount (from inventory.symbols grouped by filePath).
+- Import extraction via `@codeflow/parsers` `registry.parseFile().imports` (import/require/dynamic/
+  python) + a Connect-local regex pass for `export … from` re-exports (the parser only does `import`).
+- Resolution is Connect's OWN pass against the discovered `structure.files` POSIX set (NOT fs
+  statSync — deterministic/testable): relative `./`/`../` + ext (.ts/.tsx/.js/.jsx/.mjs/.cjs) +
+  `index.*`; Python `.mod`/`.pkg` → `.py`/`__init__.py`. tsconfig/package path ALIASES out of scope
+  (counted as unresolved) — recorded in `resolution`.
+- Bare/package/`node:` specifiers → external (tallied in resolution.externalModules, NEVER nodes);
+  unresolvable relative imports → resolution.unresolvedImports (never a crash). resolved edges →
+  graph.edges (deduped on from|to|kind|specifier).
+- Feeds `@codeflow/graph` `buildDependencyGraph(nodes, richDeps)` to construct + validate (warnings
+  surfaced); STORES plain data only (no live graph object). NO metrics computed.
+- Node + edge lists COMPLETE/uncapped. Throws only if repoPath or structure is missing.
+
+**Wiring:** exported from analyzers; worker pipeline now `[ingest, orient, map-structure, inventory,
+connect]`; `connect` joins the producedBy stamp; cache-hit fixture bumped. Added `@codeflow/graph`
+as an analyzers dependency (+ tsconfig path). Unwired reference `analysisProcessor.ts` no longer
+assigns the UI graph to `.graph` (now the structure slice) — its metrics path is untouched; its
+test's `graph:` assertion dropped (metrics assertion kept).
+
+**Tests** (faked readFile + in-memory structure/inventory): relative resolution by extension + by
+index + parent (../); require/dynamic/reexport kinds; Python module + `__init__` resolution; bare
+import → external + tallied, not a node; unresolvable relative → recorded, stage still succeeds;
+FileNode join (one node per file, loc + symbolCount + role/language, non-source loc=0); fileId===path
++ every edge endpoint is a node + POSIX keys line up; NO metrics field on slice/nodes; uncapped
+400-node/399-edge fixture; unreadable source → node but no edges; missing structure/repoPath throw.
+Workspace green: shared-types 3, web 4, analyzers 61, graph 16, parsers 10, api 17, worker 14.
+
+**Flagged judgment calls:** (1) only JS/TS/Py get import edges (generic parser extracts none) —
+.go/.rs/etc. contribute nodes but no edges. (2) tsconfig/package path aliases unresolved (counted,
+not resolved). (3) regex extraction + heuristic resolution is approximate — resolution stats make it
+data-backed. (4) Connect re-parses source files for imports (Inventory didn't store them) — accepted
+double-parse. (5) result.dependencies / symbols / entryPoints flat projections left empty this
+session (graph.edges is the single edge home; projections deferred). (6) `RepoDependencyEdge` is a
+NEW type distinct from the legacy rich `DependencyEdge` (kept for parsers/@codeflow/graph input).
+
+## 2026-06-03 — P2: Analyze stage (stage 6) — deterministic pipeline COMPLETE
+
+One job: the deterministic Analyze stage — graph METRICS as numbers from Connect's RepoGraph.
+Last deterministic stage; the pipeline's deterministic half is now complete. Single commit.
+
+**Pre-flight (algorithm availability in @codeflow/graph):** centrality (`computeCentrality`),
+cycles (`findCircularDependencies`), blast radius (`getTransitiveDependents`/`getBlastRadius`),
+coupling fan-in/out (`detectHighCouplingFiles` + degrees) all PRESENT. **clusters/modules MISSING**
+— flagged + OMITTED this session (implementing a clustering algorithm is its own session; no
+empty-array placeholder pretending coverage).
+
+**Contract (metrics slice retyped → RepoMetrics):** the flat-bag stub
+`metrics: Record<string,number|string|string[]>` was retyped to structured `RepoMetrics`
+(analyze-owned). `FileMetrics = { fileId (===POSIX path), centrality, fanIn, fanOut, blastRadius,
+complexity }`; `RepoMetrics = { perFile: FileMetrics[] (sorted by fileId), keyFiles: string[]
+(FULL centrality ranking), hotspots: string[] (FULL complexity ranking), cycles: {files:[]}[],
+summary: { fileCount, edgeCount, cycleCount, isolatedFileCount, maxBlastRadius } }`.
+**complexity is a declared STRUCTURAL PROXY** (NOT cyclomatic — no AST/control-flow):
+`complexity = loc + symbolCount + fanIn + fanOut`. Metrics are NEVER written onto graph.nodes
+(Connect owns `graph`; FileNode stays metrics-free).
+
+**Stage** (`packages/analyzers/src/stages/analyze.ts`, owns `metrics`):
+- Rebuilds the live @codeflow/graph object from Connect's plain RepoGraph (nodes + edges→rich
+  DependencyEdge) via `buildDependencyGraph`, then runs the EXISTING algorithms (no reimpl).
+- centrality = degree (fanIn+fanOut); blastRadius = transitive dependents (reverse reachability,
+  not just direct); cycles from findCircularDependencies (each rotation-normalized), cycle LIST
+  sorted deterministically; isolatedFileCount from detectIsolatedFiles.
+- DETERMINISM (load-bearing for SHA cache + P3 eval): identical graph ⇒ identical numbers AND
+  ordering — perFile sorted by fileId, all rankings tie-broken by fileId, cycles sorted by joined
+  fileIds. Verified by a run-twice byte-identical test.
+- UNCAPPED: keyFiles/hotspots/perFile/cycles are FULL (top-N is a P5 render concern only).
+- Degenerate graphs (edgeless/empty) don't crash → sane zeros, no divide-by-zero.
+- NO AI / NO prose / no result.ai.* — numbers only (Synthesize, st.7, is the AI step).
+
+**Wiring:** exported from analyzers; worker pipeline now `[ingest, orient, map-structure,
+inventory, connect, analyze]` (full deterministic pipeline); `analyze` joins the producedBy stamp;
+cache-hit fixture bumped. Orchestrator default metrics → honest empty RepoMetrics. Retype fallout
+fixed: contract-test envelope, graph fixtures, api app.test, web App.test mock (all `metrics: {}` /
+flat → valid RepoMetrics), web normalizer drops the redundant `metrics.languages` fallback (uses
+`summary.languages`), unused `stringArrayMetric`/`formatRepo` helpers removed; unwired reference
+`analysisProcessor.ts` now fills only `metrics.summary` counts (its test asserts `summary.fileCount/
+edgeCount`).
+
+**Tests** (in-memory RepoGraph): centrality ranking + ties by fileId; fanIn/fanOut hand-counted;
+cycle detected / acyclic none; blastRadius transitive (A→B→C ⇒ C affects A); complexity proxy
+formula exact; determinism (run-twice byte-identical, perFile sorted); uncapped 300-node fixture;
+edgeless + empty degenerate; no-prose/no-ai boundary; every perFile.fileId ∈ graph.nodes; missing
+graph throws. Workspace green: shared-types 3, web 4, analyzers 75, graph 16, parsers 10, api 17,
+worker 14.
+
+**Deferred ledger (recorded, NOT actioned this session):** (ii) re-export provenance (barrel →
+definition; ride Connect's resolver later); (iii) entry-point manifest source (extend Orient's
+manifest capture, then point Inventory at the owned fact — own session); codeflow-repo-smoke.mjs
+(needs skip-with-reason / `live` gate BEFORE P6 CI); cache-coverage split (producedBy coverage test
+should count DETERMINISTIC stages only — actionable when Synthesize lands). See CURRENT_STATE.
+
+**Flagged:** clusters/modules omitted (no algorithm in @codeflow/graph). complexity is a structural
+proxy, not cyclomatic. blastRadius is exact transitive reverse-reachability — the obvious large-repo
+perf cost (P4 watch; NOT pre-optimized, NOT silently skipping files).
+
+## 2026-06-03 — P2/P3: Synthesize stage (stage 7) — FIRST AI STAGE
+
+One job: the Synthesize AI stage — a grounded "where do I start" onboarding narrative +
+ranked reading order from the deterministic facts (stages 2–6). LLM mocked in all tests;
+no real API calls. Single commit.
+
+**Contract (result.ai.synthesis, realigned):** replaced the stub `SynthesisOutput`/
+`ReadingOrderItem` with `Synthesis { summary, readingOrder: ReadingStep[], keyConcepts?,
+droppedCitations? }` and `ReadingStep { fileId (=== POSIX path, MUST exist in graph.nodes),
+order, reason }`. Citations key on fileId so grounding is checkable by string equality.
+`AiAnalysis.synthesis` + `AnalysisResultSlices.aiSynthesis` retyped to `Synthesis`. Owns
+`aiSynthesis` ONLY (nests under result.ai.synthesis; deterministic slices stay top-level).
+
+**Three load-bearing decisions (all confirmed as recommended):**
+- (a) GROUNDING: deterministic post-validation drops reading steps whose fileId ∉ graph.nodes,
+  keeps the grounded ones, renumbers `order`, records `droppedCitations`. Empty-after-grounding
+  ⇒ schema failure ⇒ retry. Grounding is enforced by CODE, never trusted from the model.
+- (b) CONTEXT BUDGET: stored slices stay uncapped; the LLM PROMPT is a bounded VIEW assembled
+  read-only from orientation (type/langs/frameworks + README head ~1200 chars) + layout +
+  metrics.summary + top-30 keyFiles (with FileMetrics) + all entryPoints + top-10 by blastRadius
+  + top-15 cycles. The full symbol/node list is NEVER fed (asserted by test).
+- (c) LLM-OUTPUT CACHE (wallet defense, required): uses the `AnalysisCacheHandle` (ctx.cache);
+  key = `synthesis/v1/{commitSha}/{sha256(assembledPrompt)}`; checked BEFORE every call; only
+  valid+grounded completions are cached; temperature 0 for stable per-SHA output. A Mongo-backed
+  handle (`createMongoCacheHandle`, new `llmcache` collection) is wired in the worker so re-runs
+  skip the paid API; tests inject an in-memory handle. SEPARATE from the producedBy result-cache.
+
+**Stage** (`packages/analyzers/src/stages/synthesize.ts`, kind "ai", owns `aiSynthesis`):
+- LLM behind an injectable `LlmClient` interface (`packages/analyzers/src/llm/llmClient.ts`);
+  a minimal `fetch`-based `createAnthropicClient` (no SDK dep, model+key from env) is the
+  production adapter — NOT unit-tested (tests always mock). Prompt instructs JSON-only; output
+  is fence-stripped, JSON-parsed, hand-rolled-schema-validated (no zod dep), then ground-checked.
+- Retry up to maxAttempts (default 3) on malformed-JSON / schema-miss / empty-after-grounding /
+  thrown client; exhausted ⇒ stage THROWS ⇒ orchestrator marks AI failure ⇒ run "partial",
+  deterministic slices intact. No token streaming (P5 question); normal stage ProgressEvent only.
+
+**Wiring:** worker pipeline becomes `[…, analyze, synthesize]` but Synthesize is registered ONLY
+when an LLM client is configured (`ANTHROPIC_API_KEY` present, `SYNTHESIS_MODEL` default
+claude-opus-4-8) — no key ⇒ deterministic-only. `synthesize` joins producedBy when it runs.
+Worker passes the Mongo cache as `runPipeline({ cache })`. Realign fallout: 3 contract/orchestrator
+test stubs updated (narrative→summary).
+
+**Tests** (LLM mocked): valid completion parsed; fence-stripping; malformed/missing-field retried
+then throws (3 calls); grounding drops invalid + keeps valid + records dropped count + renumbers;
+all-ungrounded retried→throws; AI error contract via runPipeline (client throws ⇒ "partial",
+graph/metrics intact, ai unset); cache (same SHA+prompt ⇒ client called ONCE; different SHA ⇒ 2
+calls); context budget (deep sentinel symbol absent from prompt, top key file present, uncapped
+slices unmutated); writes only aiSynthesis; missing graph throws. Workspace green: shared-types 3,
+web 4, analyzers 87, graph 16, parsers 10, api 17, worker 14.
+
+**WALLET BUG — ACTIVATED, recorded NEXT-SESSION-BLOCKING (not fixed here):** landing an AI stage
+makes the producedBy cache-coverage bug a money/compute bug — a repo whose synthesis fails omits
+`synthesize` from producedBy ⇒ result-cache miss ⇒ full re-analyze on every view. The LLM-output
+cache defuses the API-SPEND dimension (re-runs hit the completion cache). The coverage split
+(coverage tested against DETERMINISTIC stages only; AI absence ⇒ AI-only retry, not full
+re-analyze) MUST be the very next session and precede any real deploy/sustained spend.
+
+**Flagged:** the real Anthropic adapter is integration-only (untested, gated on env key).
+Grounding only checks reading-step fileIds (the summary is prose; keyConcepts are plain strings).
+
+## 2026-06-03 — Bounded cleanup (pre-flight before the cache-coverage fix)
+
+Tidies only, committed separately from the fix. Audit-first; almost everything turned out live.
+
+**1) Dead mock-era scaffolding audit (report):**
+- `apps/worker/src/processors/analysisProcessor.ts` (415 lines) + its test (207) — PRODUCTION-DEAD
+  (the worker runs `runAnalysisJob`; nothing imports `processAnalysisJob` except its own test),
+  superseded by Connect (graph) + Analyze (metrics). NOT deleted: >600 lines with a live test
+  exceeds "a few lines" → **flagged as its own deletion session** (recorded in CURRENT_STATE ledger).
+- `apps/web/src/lib/mockAnalysis.ts` — LIVE (web `appStore` + 8 feature panels render off it; P5
+  replaces it). Left as-is.
+- Legacy fileId-keyed types `DependencyEdge`/`FileNode`/`SymbolNode`/`EntryPoint` — all LIVE
+  (parsers, `@codeflow/graph` build input, Connect/Analyze feed, web normalizer, `AnalysisResult`
+  fields). Left as-is. Net: zero deletions, findings recorded.
+
+**2) `tests/codeflow-repo-smoke.mjs` honest-green:** it is a CLI utility (`<repo-dir>...` args,
+previously `process.exit(2)` on none), not a unit test — swept up by `node --test tests/*.mjs` and
+red on every clean tree. Changed the no-args branch to **skip-with-reason + `exit 0`** (no clone
+faked). Legacy root suite now 25/25 pass, 0 fail.
+
+**3) Stray/temp files:** none. No tracked `dist/`/`coverage/`/`*.log`/editor junk, no empty tracked
+files; `.gitignore` already covers them.
+
+**4) Hermetic gate:** `pnpm -r typecheck && lint && test` green with NO Mongo/Redis running — no
+hidden live-service dependency (in-memory cache handle + mocked LLM throughout). Confirmed hermetic.
+
+## 2026-06-03 — Cache-coverage split (the wallet fix) — NEXT-SESSION-BLOCKING cleared
+
+The orchestrator-only fix that stops AI-only failures from triggering a full re-analyze on every
+view. No pipeline/stage changes; no new service; suite stays hermetic. Committed AFTER the bounded
+cleanup (two commits).
+
+**Two-tier coverage (decideCacheAction).** producedBy stays an honest sorted list; only the
+INTERPRETATION changed. Partition the configured stages by their first-class `kind`:
+`detCovered = configured.deterministic ⊆ producedBy`, `aiCovered = configured.ai ⊆ producedBy`.
+Decision: det+ai → FULL HIT (return cached, run nothing); det&&!ai → AI-ONLY RETRY (seed from cache,
+run only uncovered AI stages); !det → FULL MISS. Empty configured.ai ⇒ aiCovered trivially true ⇒
+deterministic-only hit. Replaced the old all-or-nothing `coversRequiredStages`.
+
+**Where it runs.** The cloner resolves the SHA only by cloning, so the decision runs **pre-Ingest**
+keyed on `input.requestedCommitSha` (the wallet win: a full hit / AI-retry pays NO clone), with a
+**post-Ingest fallback** by the resolved SHA for the branch/unknown-SHA first analysis. One shared
+helper used in both places.
+
+**AI-only retry resume.** `seedSlicesFromResult` hydrates the slice accumulator from the cached
+result's deterministic (+ covered-AI) slices; the SINGLE run loop skips covered stages (records them
+`completed` so the re-stamp is honest) and runs only the uncovered AI stages off `ctx.prior`. No
+parallel pipeline. General by design (runs whatever AI is uncovered) — NOT hardcoded to "AI needs no
+disk"; `ctx.repoPath` stays unset on a no-clone retry (Synthesize needs none; RAG forward-flagged).
+
+**AI-partial persistence (reverses a P1 line).** Confirmed it already falls out of the status logic:
+a deterministic failure ⇒ `"failed"` ⇒ worker does NOT persist (not reusable); an AI failure ⇒
+`"partial"` (all deterministic done) ⇒ worker persists with det-only producedBy ⇒ reused as an
+AI-retry next view. Reusability keys on DETERMINISTIC completeness; the fix is purely the READ side
+(no save-path change). Added a comment + tests.
+
+**Two caches compose.** An AI-only retry with an identical assembled prompt hits the LLM-output cache
+(zero API $); a retry after a genuine synthesis failure (no cached completion) makes a real call.
+Tested.
+
+**Tests** (in-memory cache handle, LLM mocked) — new `cacheCoverage.test.ts` (8): full hit (no
+clone/no stage/no LLM); AI-only retry (only synthesize runs, clone+connect+analyze NOT invoked,
+det slices are the cached ones, producedBy re-stamped with synthesize); full miss; det-incomplete
+not reusable; no-AI deployment (empty-AI full hit); AI-partial persisted → second view → AI-only
+retry; backfill (det-only cache + AI now configured); LLM-cache compose. Updated `ingest.test.ts`
+cache-hit test to assert the new no-clone pre-ingest hit. Workspace green: shared-types 3, web 4,
+analyzers 95, graph 16, parsers 10, api 17, worker 14.
+
+**Ledger:** cache-coverage CLEARED. Carried: re-export provenance, entry-point manifest source,
+clusters algorithm, delete the unwired analysisProcessor.ts (415+207 lines, too big for a fold-in),
+real Anthropic adapter is integration-only / end-to-end smoke-run candidate, RAG AI-only-retry needs
+file access (forward flag), synthesis prompt-selection sizes for P4 tuning.
+
+## 2026-06-10 — P3: RAG / Q&A index (stage 8) — SECOND AI STAGE
+
+Branch: `codeflow-cleanup`. Index-build ONLY — the ask-the-repo query path (retrieve → answer →
+cite) is a deliberately-separate later session. Modeled on Synthesize (`796a423`): nests under
+`result.ai.*`, ai-fail ⇒ `"partial"` with deterministic + synthesis slices intact, grounding
+enforced by code.
+
+**Contract (realized a placeholder, no second parallel field).** The pre-existing scaffolding
+(`index-qa` stage id, `QaIndex`, `aiQaIndex`, `AiAnalysis.qaIndex`) was a placeholder for exactly
+this stage. Per the project's one-canonical-representation rule, it was REPLACED (not duplicated):
+stage id `index-qa` → `rag`; new `RagChunk` + `Rag` interfaces; slice key `aiQaIndex` → `aiRag`;
+`AiAnalysis.qaIndex` → `AiAnalysis.rag`. Updated the orchestrator (`seedSlicesFromResult` /
+`buildAi`) and the shared-types contract test accordingly. `Rag = { chunks: RagChunk[], chunkCount,
+embeddingModel, embeddingDim, droppedChunks? }`; `RagChunk = { id, fileId, startLine, endLine,
+symbolName?, text, embedding: number[], tokenCount }`. Vectors are plain serializable arrays.
+
+**Chunking (deterministic, symbol-aware).** Drives off `inventory.symbols` + `structure` + file
+contents (NOT a naive fixed window). Source files: select non-overlapping top-level symbol spans
+(`line..endLine`; absent endLine extends to the next symbol/window via a classic interval cover),
+sweep uncovered regions (module header / top-level code) into window chunks so nothing is silently
+dropped. Docs files: window-chunked. Roles `config`/`build`/`asset`/`test`/`other` skipped. Oversized
+spans split into contiguous sub-chunks within the token cap. Role allowlist, `MAX_CHUNK_TOKENS`
+(32K — voyage-code-3 documented context), `WINDOW_CHUNK_LINES`, and the ~4-chars/token estimate are
+NAMED CONSTANTS flagged for P4 tuning.
+
+**Grounding (code-enforced, never trusted).** Drop chunks whose `fileId ∉ graph.nodes` or whose line
+range falls outside the file; record `droppedChunks {count, fileIds}` (omitted when none — absent ≠
+empty). NO retry on grounding (chunking is deterministic — contrast Synthesize, whose nondeterministic
+LLM justifies a retry). Empty-after-grounding ⇒ `throw` ⇒ ai-fail ⇒ `"partial"`.
+
+**Embedding client (mirrors LlmClient).** Injectable `EmbeddingClient`; `createVoyageClient` is the
+fetch-based prod adapter (NO SDK). Confirmed against current Voyage docs (June 2026):
+`voyage-code-3`, dim 1024, 32K max input tokens, ≤1000 texts / ≤120K tokens per request,
+`POST /v1/embeddings` Bearer-auth → `{ data: [{embedding, index}], usage }`, `input_type:
+"document"` on the indexing side. Misses batched under those limits; transient failures retry (≤3)
+then throw ⇒ `"partial"`. Tests ALWAYS inject a deterministic mock (stable hash → fixed-length
+vector) — zero real API calls.
+
+**Two caches (via `ctx.cache`, namespaced; Mongo `llmcache` in the worker, in-memory in tests).**
+(1) Embedding cache — content-addressed `embed/{model}/v1/{sha256(normalizedChunkText)}`, checked
+before every embed; an unchanged repo costs ZERO API (asserted: mock not called on a full hit). The
+`v1` prefix is a manual bust; model is in the key so switching models re-embeds. (2) Chunk-plan
+cache — SHA-keyed `rag/v1/{commitSha}` storing the GROUNDED plan (no vectors), persisted BEFORE
+embedding so it survives a mid-embed failure. Resolution order: `repoPath` present → read disk; else
+chunk-plan cache → use it (no disk); else throw. This makes a **pinned-SHA AI-only retry invoke no
+cloner and no deterministic stage** — the ledger's "design RAG's retry deliberately" requirement.
+
+**Worker wiring.** RAG registers as stage 8 ONLY when `VOYAGE_API_KEY` is set; with no key it does
+not register and `configured.ai` omits it (so an ANTHROPIC-only setup runs Synthesize but not RAG
+and the P10 two-tier partition stays correct). NO new orchestrator coverage logic — RAG is just
+another `kind: "ai"` stage. Reuses the existing `readFile` abstraction (disk path) and the shared
+cache handle. `createVoyageClient({ apiKey: VOYAGE_API_KEY, model: VOYAGE_MODEL || "voyage-code-3" })`.
+
+**Tests** (hermetic — mocked embedding client, in-memory cache, no real API/Mongo/Redis). New
+`rag.test.ts` (13): symbol-aligned chunking + window fallback + docs window-chunking + skipped roles;
+chunk text matches the cited range + carries a vector; oversized-symbol split tiles the range within
+the cap; grounding drops a non-node fileId into `droppedChunks`; empty-after-grounding throws;
+embedding-cache full hit ⇒ zero API; embedding-API failure ⇒ retry ×3 ⇒ throw; determinism (run
+twice ⇒ byte-identical `Rag`); plain-serializable round-trip; no-disk retry (cached plan, repoPath
+absent ⇒ no disk) + throw-when-neither; via orchestrator: ai-fail ⇒ `"partial"` with det+synthesis
+intact, and no-clone AI-only retry (no clone, no deterministic stage, no disk; `producedBy` re-stamps
+with `rag`). Workspace green: shared-types 3, web 4, analyzers 108, graph 16, parsers 10, api 17,
+worker 14.
+
+**Ledger:** RAG AI-only-retry forward-flag CLEARED. New carries: result-slice vector size vs Mongo
+16MB BSON limit (P4 — externalize vectors); ask-the-repo query path (own session); chunk-size /
+role-allowlist / `MAX_CHUNK_TOKENS` / token-estimate tuning (P4); re-export provenance extends to
+chunk citations; `createVoyageClient` is integration-only (real-key smoke run pending). Next session
+is the **eval set** (its own session — do not fold into RAG).
+
+## 2026-06-10 (b) — P3: Multi-provider AI layer (add Gemini) + cache-key/homogeneity fixes
+
+Branch: `codeflow-cleanup`. Make both AI providers swappable behind the EXISTING injectable
+interfaces — no vendor lock-in, no new manual setup (every adapter mocked in tests, zero real
+calls). Chunking / grounding / stage logic untouched; the provider is the only thing that varies.
+
+**Gemini adapters (fetch-based, no SDK).** `createGeminiClient` (LlmClient) →
+`POST .../v1beta/models/{model}:generateContent`, header `x-goog-api-key`, body
+`{ contents:[{parts:[{text}]}], systemInstruction?, generationConfig:{ temperature:0,
+responseMimeType:"application/json" } }`, text at `candidates[0].content.parts[].text`; default model
+`gemini-2.5-flash` (NOT the shut-down 2.0-flash). `createGeminiEmbeddingClient` (EmbeddingClient) →
+`:batchEmbedContents`, body `{ requests:[{ model:"models/{m}", content:{parts:[{text}]}, taskType:
+"RETRIEVAL_DOCUMENT", outputDimensionality:{dim} }] }`, vectors at `embeddings[].values`; default
+`gemini-embedding-001` @ dim **768** (recommended — ~0.26% quality loss vs 3072, 4× smaller, eases
+the BSON-size ledger item), re-chunks under Gemini's per-request cap (100). temp 0 + json mime keeps
+the assembled-prompt → output path deterministic (the fence-strip→parse→validate→ground pipeline is
+unchanged). Anthropic/Voyage adapters unchanged (Voyage still the better code-retrieval option).
+
+**Provider field (canonical source for cache scoping).** Added `readonly provider` to both client
+interfaces (`LlmProvider` = anthropic|gemini, `EmbeddingProvider` = voyage|gemini) and set it in
+every adapter + test mock. No translation map — the client IS the source of its provider/model/dim.
+
+**Env selection (`providers.ts`, pure given an env record).** `resolveChatProvider` /
+`resolveEmbeddingProvider`: explicit `LLM_PROVIDER` / `EMBEDDING_PROVIDER` wins (validated); else
+infer from the single present key; **both keys + no explicit provider ⇒ throw a clear config error**.
+`createLlmClientFromEnv` / `createEmbeddingClientFromEnv` build the selected client, or undefined when
+the selected provider's key is absent (⇒ that AI stage simply isn't registered). A single
+`GEMINI_API_KEY` powers both synthesis and RAG. Worker `index.ts` now calls these with `process.env`
+instead of hardcoding Anthropic/Voyage.
+
+**Cache-key fixes (mandatory once providers are swappable).** (1) Synthesis key bumped **v1→v2**:
+`synthesis/v2/{provider}/{model}/{commitSha}/{sha256(prompt)}` — previously lacked provider/model, so
+switching providers served a completion from the wrong model (poisoning); now a switch misses + re-runs.
+(2) Embedding key now `embed/{provider}/{model}/{dim}/v1/{sha256(text)}` — 768-d vs 1024-d (or two
+providers') vectors are different spaces and must not collide on the same content hash.
+
+**Index homogeneity (no mixing vector spaces).** New `StageEmbeddingTarget` (shared-types): the RAG
+stage exposes `embeddingTarget = { model, dim }` (from its client). In the P10 `decideCacheAction`, a
+new `aiStageReusable` helper treats `rag` as covered only if `have.has("rag")` AND cached
+`result.ai.rag.embeddingModel`+`embeddingDim` == the selected target; on mismatch ⇒ uncovered ⇒
+ai-retry re-embeds. `coveredStageIdSet` uses the same helper, and `seedSlicesFromResult` now gates AI
+slices on coverage (computed BEFORE seeding) so a mismatched/uncovered RAG slice is NOT hydrated — a
+failed re-embed never returns the stale foreign-space slice. Derived from existing fields — no new
+`cacheReusable` flag (one-canonical-field rule). Synthesis needs no analogous check (provider/model is
+in its key).
+
+**Tests** (hermetic — stubbed `fetch`, mocked clients, in-memory cache; zero real calls). New
+`providers.test.ts` (19): chat + embedding selection matrices (explicit wins / infer single key /
+both-set throws / invalid throws / null); `createLlmClientFromEnv`+`createEmbeddingClientFromEnv`
+(gemini default model+dim, overrides, selected-but-no-key ⇒ undefined, single GEMINI_API_KEY powers
+both); adapter conformance + happy-path (Anthropic/Gemini chat, Voyage/Gemini embeddings — URLs,
+headers, body shape, Gemini temp-0+json-mime+systemInstruction determinism, Voyage index reorder,
+Gemini >100-text re-chunking). `synthesize.test.ts` +1 (v2 provider-scoped key misses across
+providers). `rag.test.ts` +3 (embedding key provider-scoped + dim-scoped; index-homogeneity rebuild
+via orchestrator — cached voyage slice under a gemini selection ⇒ RAG re-embeds, no clone, no det
+stage, result model/dim are the new selection). Workspace green: shared-types 3, web 4, analyzers
+131, graph 16, parsers 10, api 17, worker 14.
+
+**Ledger:** Gemini adapters are integration-only (extends the Anthropic/Voyage real-key smoke-run
+item). Next session: **P13 — eval harness** (built against a mock; real scored run deferred to the
+consolidated manual phase).
+
+## 2026-06-10 (c) — P3: Eval harness (`@codeflow/eval`) — hermetic; real scored run deferred to P7
+
+Branch: `codeflow-cleanup`. Build the harness that scores the pipeline's AI output against authored
+ground truth — proves the AI catches the RIGHT files, not just well-formed JSON. Built + unit-tested
+ENTIRELY against a synthetic mock fixture: no keys, no real run, no pipeline execution in the suite.
+The real scored run + threshold tuning on a chosen repo is a P7 data task.
+
+**Module location.** New package `packages/eval` (`@codeflow/eval`), depends on
+`@codeflow/shared-types` + `@codeflow/analyzers`, NodeNext like the worker. Root `pnpm eval` script →
+`@codeflow/eval run eval` → `tsx src/cli.ts`. `pre*` hooks build shared-types/parsers/graph/analyzers
+(so tsc paths + vitest runtime resolve the dist of the deps).
+
+**Dataset contract** (`dataset.ts`, plain serializable, `EVAL_SCHEMA_VERSION`). `EvalDataset`
+{ evalSchemaVersion, repoUrl, commitSha (pinned), embeddingModel, embeddingDim, synthesis:
+{ expectedEntryPoints }, questions: RagEvalQuestion[] }; `RagEvalQuestion` { id, question,
+expectedFiles, expectedLines? }. Ships the schema + ONE `TEMPLATE_DATASET` (REPLACE_* placeholders) —
+NO fabricated ground truth (unverified guesses are worse than none; the dataset is authored in P7).
+`assertDatasetShape` rejects un-authored templates.
+
+**Retrieval primitive** (`retrieve.ts`). `retrieve(chunks, queryVector, k)` — pure cosine top-k over
+`Rag.chunks`, deterministic tie-break by chunk `id`, safe for `k > chunkCount` and `k ≤ 0`; zero-norm
+vectors score 0 (no NaN). The ONLY new runtime-ish piece. The Q&A answer + citation + API path is
+**P18** — deliberately not built.
+
+**Scoring** (`score.ts`, pure deterministic). Synthesis: `readingOrderRecall@k` over (top-k reading
+order ∪ top-k keyFiles), citation-resolution rate (steps ∈ graph.nodes), droppedCitations rate
+(surfaced, not hidden). RAG: per-question `recall@k` (file match, or line-range overlap when
+`expectedLines` authored) + reciprocal rank → mean recall + MRR. Per-question hits/misses reported,
+not just aggregates.
+
+**Runner** (`runEval.ts`). `runEval(dataset, analysisResult, embeddingClient) → EvalReport` (plain
+serializable: synthesisScores / ragScores|null / perQuestion[] / thresholds {passed, failures[]} /
+summary). Questions embedded on the QUERY side (`input_type: "query"`). **Homogeneity guard
+(mandatory — same trap as P12):** `assertHomogeneity` throws if the embedding client's model/dim OR
+the stored index's `embeddingModel`/`embeddingDim` ≠ the dataset's — cosine across spaces is
+meaningless, fail loud rather than silently score garbage. Throws clearly if the graded slice
+(synthesis, or rag when questions exist) is absent.
+
+**Thresholds** (`thresholds.ts`) — `EVAL_THRESHOLDS` are NAMED CONSTANTS flagged for **P7 tuning**
+(placeholders: readingOrderRecall@5 ≥ 0.6, ragRecall@5 ≥ 0.6, droppedCitations ≤ 0.1 — can't pick
+real bars against a mock). The report computes pass/fail, but the eval is **NOT wired into CI
+gating**: CI stays hermetic + fast; the gating run needs real keys ⇒ P7.
+
+**CLI** (`cli.ts`). `pnpm eval <dataset.json> <result.json>` loads a dataset + a stored
+`AnalysisResult`, builds the embedding client from env (the worker's provider selection), prints the
+report, exits non-zero on threshold failure. Needs a real key to embed questions ⇒ a P7 tool, NOT in
+the hermetic suite; never runs the real pipeline (it grades a result you already produced).
+
+**Tests** (hermetic — mock embedding client, fixtures only, zero real calls). `retrieve.test.ts` (5):
+cosine, top-k order, tie-break by id, k>count / k≤0 / empty safe. `score.test.ts` (8): synthesis
+recall (full/partial/k-bounded), citation-resolution + droppedCitations, RAG file hit / rank-2 RR /
+miss / expectedLines overlap-vs-disjoint, aggregate mean+MRR. `runEval.test.ts` (10): full fixture
+run (synthesis + per-question RAG hits/misses, query-side embed), threshold pass + raised-bar fail,
+plain-serializable round-trip, run-twice determinism, synthesis-only (no questions ⇒ ragScores null,
+no embed call), homogeneity guard throws on client-dim / client-model / index-space mismatch, and
+missing-slice errors. Synthetic 3-d fixture (auth/db/util basis) with authored query vectors → known
+nearest neighbours. Workspace green: shared-types 3, web 4, analyzers 131, eval 23, graph 16, parsers
+10, api 17, worker 14.
+
+**Ledger:** eval built but NOT scored / NOT in CI gating — P7 authors a real dataset, runs the real
+pipeline + `pnpm eval` with real keys, tunes the placeholder thresholds from measured scores; any
+gate stays out-of-band (the scored run needs keys + costs money). Next session: **P14 — P4 scale
+guardrails** (parsing concurrency, per-file timeouts, repo-size cap — hermetic).
+
+## 2026-06-10 (d) — P4: scale + cost guardrails (all five, hermetic)
+
+Branch: `codeflow-cleanup`. Add CodeFlow's resource + cost guardrails so a pathological repo or
+abusive caller can't blow up the pipeline or the owner's wallet. Five orthogonal, additive,
+independently-revertible guards in one feature commit; fully hermetic (in-memory stores, mocked
+clients, zero real services/spend). The MEASURED large-repo run ("tested to N files in Y sec") is
+P7, not this session.
+
+**Named limits → `@codeflow/config`** (all PLACEHOLDERS flagged for P7 tuning): `MAX_FILES` /
+`MAX_BYTES`, `PARSE_CONCURRENCY`, `FILE_TIMEOUT_MS`, `RATE_WINDOW_MS` / `RATE_MAX`, `DAILY_LLM_BUDGET`.
+analyzers + api now depend on `@codeflow/config` (added to deps + tsconfig paths + pre* build chains).
+
+**Guard 1 — repo-size cap (Ingest).** Authoritative cap POST-CLONE, BEFORE parsing. Ingest gains an
+injectable `measureRepoSize(repoPath) → { fileCount, totalBytes }`; over `MAX_FILES`/`MAX_BYTES` ⇒ a
+typed `RepoTooLargeError` ⇒ orchestrator `"failed"` + `pipeline.statusReason = "repo-too-large"`,
+dependents skipped (clean refusal, not a crash). Worker wires a real fs walk (`measureRepoSize.ts`,
+skips `.git`/symlinks; integration-only); omitting the dep skips the cap (back-compat).
+
+**Guard 2 — parsing concurrency (Inventory).** Per-file read+parse runs through a bounded
+`createLimiter(PARSE_CONCURRENCY)` (tiny p-limit equivalent, no dep). Each file returns a RESULT
+object (no shared-state mutation); results applied in `structure.files` order after all settle ⇒
+deterministic regardless of completion order. Asserted: in-flight never exceeds the limit.
+
+**Guard 3 — per-file parse timeout (Inventory).** Each file's read+parse wrapped in
+`withTimeout(FILE_TIMEOUT_MS)`; a timeout ⇒ recorded in `inventory.unparsedFiles`, run continues. A
+late-finishing timed-out parse can't corrupt results (result discarded). Bounds ASYNC stalls;
+CPU-bound sync hangs need worker-thread isolation (P7 ledger).
+
+**Guard 4 — per-IP rate limit (API).** `createRateLimitMiddleware` on `POST /api/analyze` only;
+per-IP fixed window (`RATE_WINDOW_MS`/`RATE_MAX`) ⇒ **429 `RATE_LIMITED`** + `Retry-After`. Injectable
+`RateLimitStore` (in-memory default + tested; Redis-backed shared store is the prod swap — ledger).
+`createApp({ rateLimit })` lets tests inject a tiny limit + fresh store. New `RATE_LIMITED` error code.
+
+**Guard 5 — global daily LLM spend ceiling (the wallet guard).** New `BudgetHandle` (mirrors
+`AnalysisCacheHandle`): `check(estimatedTokens) → ok`, `record(actualTokens)`, reset per UTC day
+(keyed on date). Threaded via `ctx.budget`; checked at the provider-call boundary for BOTH AI stages.
+**CACHE BEFORE BUDGET (load-bearing):** the Synthesize completion cache + the RAG embedding cache are
+checked FIRST — a hit spends nothing and never touches the budget; only on a MISS do we check → call →
+record. Estimate before (chars/4 chat; summed chunk tokenCount embeddings), record after. Per the
+session fork decision, `record` uses the deterministic ESTIMATE for now — wiring the provider's real
+`usage.total_tokens` (widening `LlmClient.complete`/`EmbeddingClient.embed` to return usage; touches
+all 4 adapters + mocks) is the P7 refinement (ledger). Over ceiling ⇒ `BudgetExceededError` ⇒ graceful
+`"partial"` (deterministic + other AI slices intact) + `statusReason = "budget-exhausted"` (distinct
+from a plain ai-fail), no provider call. In-memory handle (default/tests) + Mongo-backed
+`createMongoBudgetHandle` (one doc per UTC day) wired in the worker. SEPARATE from Guard 4.
+
+**statusReason plumbing.** `PipelineRunSummary.statusReason?: PipelineStatusReason`
+(`"repo-too-large" | "budget-exhausted"`), set by the orchestrator from a thrown `PipelineReasonError`
+(`statusReasonOf`); worker surfaces it onto the job (`runStatusReason`, added to `JobProgress`,
+`WorkerJobPatch`, and the Mongo job schema). Machine-readable cause vs the human `warnings[]`.
+
+**Tests** (hermetic — in-memory stores, mocked clients, zero real calls/spend). New
+`analyzers/guards.test.ts` (9): size cap over files/bytes ⇒ failed + repo-too-large + dependents
+skipped, within-cap ok; concurrency never exceeds the limit; slow file ⇒ unparsed + run completes;
+limiter + withTimeout primitives; budget check/record + UTC-day reset. `synthesize.test.ts` +3 (cache
+hit spends 0; miss checks+records; over-ceiling ⇒ partial + budget-exhausted via orchestrator).
+`rag.test.ts` +3 (full embedding-cache hit spends 0; miss checks+records; over-ceiling ⇒ throws
+without embedding). `api/app.test.ts` +1 (3rd request from one IP ⇒ 429 RATE_LIMITED + Retry-After).
+Workspace green: shared-types 3, web 4, analyzers 146, eval 23, graph 16, parsers 10, api 18, worker 14.
+
+**Ledger:** P4 real values + the measured large-repo run + Guard 5 real-usage wiring + Guard 4 Redis
+store + Guard 3 worker-thread isolation + the integration-only fs/Mongo helpers are all P7. Next
+session: **P5 — live pipeline panel + SSE replay + the #19 SSE/runStatus leftovers** (frontend,
+against mock data).
+
+## 2026-06-10 (e) — P5: live pipeline panel + SSE replay (#20) + REST terminal state (#19)
+
+Branch: `codeflow-cleanup`. The live, replayable pipeline stream — the USP centerpiece — built
+against MOCK data: SSE replay buffer + stores injectable, in-memory in tests, no Redis/Mongo/live
+services in the suite (real-wire smoke is P7). Not the dashboard (P16); not Ask-the-repo (later).
+
+**Part A — wire correctness.**
+- **SSE replay (#20).** New `EventLogStore` contract (shared-types): append-only per-job log of
+  ProgressMessages. The worker appends every emitted message (each per-stage ProgressEvent + the
+  terminal done) via `pipelineJobProcessor`. `streamProgress` now REPLAYS the buffered log in order,
+  then TAILS live: it subscribes FIRST (queuing live messages so nothing emitted during the read is
+  lost), replays the log, drains the queue, then continues live — deduping the replay/live boundary
+  on the monotonic `stageIndex` (one authoritative event per stage, P1 contract) + the terminal
+  `done`. A late connection sees every stage exactly once, from Ingest. With no `EventLogStore` it
+  falls back to the original live-only stream (back-compat). In-memory store (`createInMemoryEventLogStore`,
+  test default + single-process fallback) + Mongo-backed (`jobevents`, seq-ordered) for prod — the
+  worker writes, the API reads the same collection. `getEventLogStore()` + `setEventLogStoreForTests()`.
+- **REST terminal state (#19).** `GET /api/job/:id` returns `runStatus` + `runStatusReason` (the P14
+  fields): added to the API JobModel schema, `AnalysisJobRecord`, `CreateAnalysisJobInput`,
+  `updateAnalysisJob` patch, and `getAnalysisJobProgress`. SSE is for live watching; REST answers
+  "what happened" on a reconnect after completion.
+
+**Part B — web consumption + the panel.**
+- **`streamJobEvents` (#19)** rewritten to parse the REAL `ProgressEvent` shape per stage
+  (`onStageEvent`) + the terminal `{ jobId, status }` frame (`onDone`), replacing the stale
+  `ApiJobProgress` shape. `ApiJobProgress` gained `runStatus`/`runStatusReason`.
+- **Normalizer (#19)** derives from `graph` + `inventory` (the empty `dependencies`/`symbols`/
+  `entryPoints` projections are intentionally ignored): per-file imports from `graph.edges`,
+  functions/exports from `inventory.symbols`, entry points from `inventory.entryPoints`, languages
+  from node languages.
+- **`mockAnalysis.ts` replaced** with current shapes: `mockAnalysisResult()` (faithful AnalysisResult
+  with graph/inventory/metrics/ai.synthesis; a PARTIAL run with `pipeline.statusReason="budget-exhausted"`),
+  `mockProgressEvents()` (8-stage sequence), `mockPipelineState()` (derived, partial+reason).
+- **Live pipeline panel** (`PipelinePanel.tsx`, the centerpiece — NOT a default stepper): a
+  horizontal "reactor rail" of the 8 stages (CSS connector `--fill` advances as stages settle; the
+  running node pulses + spins) above a chain-of-thought FEED that appends one entry per reported
+  stage. Each entry renders `detail` + a GENERIC preview slot (`Object.entries(preview)` → chips,
+  no per-stage hardcoding). Honest terminal banner keyed on `runStatusReason` ("Demo at capacity",
+  "Repository too large", "Partial analysis", …). Status via SVG glyph + word (not color alone);
+  `prefers-reduced-motion` disables motion. Replaced `AnalysisProgress` (deleted). Pipeline state +
+  reducer in `lib/pipeline.ts` (seed-8-pending / upsert-by-stageIndex / terminal); wired through the
+  store; `PublicRepoInput` drives it via SSE with a polling fallback (jsdom has no EventSource).
+
+**Tests** (hermetic — in-memory stores + mock channel + stubbed fetch/EventSource, mock data, no
+live services). API +3: SSE replay (late connect replays 1–5 then tails 6–8+done, dedupes a
+duplicate stage 5, no gaps); finished-run replay (full log + terminal, no live); `GET /api/job/:id`
+returns runStatus+runStatusReason. Web +9: pipeline reducer (seed/upsert-dedupe/terminal); normalizer
+(imports from edges, functions/exports from inventory, graph counts); `streamJobEvents` (fake
+EventSource parses ProgressEvent + done; null without EventSource); PipelinePanel (8 stages from
+Ingest, generic preview incl. an arbitrary key, partial+budget-exhausted banner, failed stage shown).
+Removed the AnalysisProgress test. Workspace green: shared-types 3, web 13, analyzers 146, eval 23,
+graph 16, parsers 10, api 21, worker 14.
+
+**Ledger:** #19 + #20 CLOSED. Remaining P7: the real Redis/BullMQ + Mongo `jobevents` SSE-wire smoke
+(cross-process worker-write / API-read) — only the in-memory path is hermetically tested; the
+Mongo `EventLogStore` is integration-only. Next session: **P16 — dashboard** (Start Here / Structure
+map / 2D dependency graph / file drill-down — frontend, against mock).
+
+## 2026-06-10 (f) — P5: dashboard — Start Here / Structure / Drill-down (frontend, against mock)
+
+Branch: `codeflow-cleanup`. The three data-READ dashboard views + the tabbed shell that holds them
+and the P15 pipeline panel. Built against MOCK data, hermetic, no live services. NOT the 2D graph
+(P17 — placeholder slot) and NOT Ask-the-repo (later). Visually consistent with the P15 panel (same
+dark/green language, `.card`/`.badge`/chips, glyphs-not-emoji).
+
+**Read model.** `lib/dashboard.ts` `buildDashboard(result) → DashboardModel`, derived ONCE per the
+P15 rules: imports/importers from `graph.edges` (grounded — every neighbour resolves to a real
+node), symbols from `inventory.symbols`, entry points from `inventory.entryPoints`, metrics from
+`metrics.perFile`, roles from `structure.files`. The views READ this; they never re-derive. The
+model keeps FULL lists — render caps are render-only.
+
+**Store.** Holds `dashboard: DashboardModel | null` (built in `loadAnalysisResult` +
+`loadMockAnalysis`); selected-file context via the existing `selectedFileId`/`selectFile`.
+
+**View 1 — Start Here** (`StartHere.tsx`): renders `ai.synthesis` (summary + ranked reading path +
+key concepts) when present; on a partial / `budget-exhausted` run (synthesis absent) degrades
+HONESTLY to `metrics.keyFiles` as the reading path + an "AI summary unavailable — demo at capacity"
+note — never a blank panel. Reading steps open the file in drill-down.
+
+**View 2 — Structure map** (`StructureMap.tsx`): `structure.layout` badge + file-role counts + the
+file list sorted by path with directory headers, **capped to 20 rows with "Show all (N)"** (the
+underlying model list is never truncated). Files open drill-down.
+
+**View 3 — File drill-down** (`FileDrilldown.tsx`): per-file `centrality`/`fanIn`/`fanOut`/
+`blastRadius` + LOC/symbolCount; **`complexity` as a RELATIVE rank + bar** ("rank #k of N") with an
+explicit "structural proxy (loc + symbols + fan-in/out) — not cyclomatic" note (never a bare
+absolute — the raw score is not surfaced); symbols list; imports + importers as grounded, clickable
+neighbours → drill-down.
+
+**Shell + wiring.** `DashboardShell.tsx` — repo header + `Tabs` (Start here / Structure / Graph
+placeholder / Drill-down) + the selected-file context; opening a file from any view switches to
+Drill-down. The 2D graph is a placeholder slot (P17). `AppShell` now renders `<DashboardShell/>` when
+analysis is loaded (replacing the legacy `dashboard-layout`); `mockAnalysis.ts` gained a `structure`
+slice + `mockBigResult(n)` (render-cap fixture). The legacy P5-era mock panels are no longer rendered
+(superseded — ledger #15).
+
+**Tests** (hermetic — mock data, no live services). Web +13: `dashboard.test.ts` (buildDashboard —
+imports/importers from edges, symbols, complexity rank/relative, structure layout/roles/dirs,
+synthesis Start Here, partial fallback note + key-files path, grounded neighbours);
+`DashboardShell.test.tsx` (opens on Start Here; reading step → drill-down; structure file →
+drill-down; neighbour → drill-down; complexity shown as relative rank + proxy note, NOT a raw
+absolute; partial fallback note; render-cap shows 20 then 30 via "Show all", model list intact at
+30). Updated `App.test` (new shell heading + dashboard assertions). Workspace green: web 26,
+analyzers 146, api 21, eval 23, graph 16, parsers 10, worker 14, shared-types 3.
+
+**Ledger:** added #15 — the legacy P5-era mock panels are dead code (delete in a focused cleanup).
+Next session: **P17 — 2D force-directed dependency graph** (the interactive viz, its own session —
+frontend, against mock).
+
+## 2026-06-10 (g) — P5: 2D force-directed dependency graph (interactive viz, against mock)
+
+Branch: `codeflow-cleanup`. Turned the P16 Graph placeholder into the interactive 2D dependency
+graph. Reads the normalized graph model — NO new analysis. Against MOCK data, hermetic, no live
+services. Integrates with the dashboard selected-file context. Consistent with the P15/P16 design.
+
+**Approach.** Canvas + force sim (SVG doesn't scale past ~1–2k nodes). Added `react-force-graph-2d`
+(canvas force-graph, bundled types). The graph is an ENHANCEMENT, not the only path — the same data
+is reachable via Structure + Drill-down (canvas isn't screen-readable; noted in the UI legend +
+CURRENT_STATE).
+
+**Grounded read-model.** `lib/graphModel.ts` `buildGraphModel(result) → GraphModel`: nodes from
+`graph.nodes` (REAL files only — externals tallied-not-nodes per Connect, never invented); per node
+`role`/`centrality`/`loc`/`inCycle` (from `metrics.cycles`)/size hint; links from `graph.edges` with
+**both endpoints grounded** (dangling dropped — reused guard); `kind` + edge-in-cycle flag.
+Unresolved + external imports surfaced as honest COUNTS, not faked edges. The model is the FULL
+graph; never truncated.
+
+**Render-cap + focus (pure, `lib/graphView.ts`).** `backboneView(model, N)` = top-N by centrality +
+induced edges + honest "N of M"; `focusView(model, id, k)` = k-hop undirected neighbourhood + induced
+edges; `fullView` = "Show all". The caps (`GRAPH_BACKBONE_NODES`=80, `GRAPH_FOCUS_HOPS`=1,
+`GRAPH_PERF_WARN_NODES`=600) are `@codeflow/config` constants, P7-tunable.
+
+**Component (`features/graph/DependencyGraph.tsx`).** Renders `react-force-graph-2d` over the
+selected view: node size by centrality, color by role, cycle nodes/edges highlighted, directed-arrow
+links. Node click → focus its k-hop neighbourhood AND `onSelectNode(id)` (sets the dashboard
+selected-file; stays on the graph). "Show all" raises the cap (perf warning past the threshold) —
+never drops model data; "Open in drill-down" / "Clear focus" controls; legend + "N of M" +
+unresolved/external counts. `prefers-reduced-motion` → warmupTicks + cooldownTicks 0 (settle fast,
+no endless animation); jsdom-safe (matchMedia / ResizeObserver guarded). Empty/degenerate graph →
+graceful empty state, no crash. Wired into the DashboardShell Graph tab; the store holds
+`graph: GraphModel` built alongside `dashboard`.
+
+**Tests** (hermetic — canvas doesn't render in jsdom, so test data + handlers, NOT pixels; mock
+`react-force-graph-2d`). Web +15: `graphModel.test.ts` (grounded nodes/links, dangling dropped,
+externals-not-nodes, cycle flags, honest unresolved/external counts); `graphView.test.ts`
+(top-N backbone + induced edges + N-of-M, k-hop focus 1/2-hop + unknown-id, full, empty);
+`DependencyGraph.test.tsx` (backbone data + "N of M" passed to the mocked force-graph, node-click →
+onSelectNode, "Show all" raises cap without dropping the 100-node model, focus k-hop, degenerate →
+empty state, no force-graph). Workspace green per-package: web 41, analyzers 146, api 21, eval 23,
+worker 14, parsers 10, graph 16, shared-types 3. (`pnpm -r test` parallel can OOM with the heavier
+web env back-to-back — run serially or per-package; all pass in isolation.)
+
+**Ledger:** #15 dead-panel cleanup stays a SEPARATE commit (not folded in). Next session: **P18 — RAG
+query path** (retrieve → answer → cite endpoint + Ask-the-repo UI — the deferred Q&A feature, against
+mock).
+
+## 2026-06-10 (h) — P5: RAG query path (retrieve → answer → cite) + Ask-the-repo UI
+
+Branch: `codeflow-cleanup`. The ask-the-repo runtime feature deferred out of P11 — a RUNTIME path,
+not a pipeline stage. Grounded answers from the already-built index, cited to real file+line. Against
+mock, hermetic, zero real calls/spend. Two commits: core+endpoint, then UI.
+
+**Retrieval hoist (one canonical primitive).** Moved `retrieve` + `cosineSimilarity` from
+`@codeflow/eval` into `@codeflow/analyzers` `rag/retrieve.ts`; eval re-exports + uses it (deleted its
+copy; moved its test to analyzers). Production + eval now share ONE retrieval, so the eval's recall@k
+measures production behaviour. The embedding-space homogeneity guard is likewise one shared helper
+(`rag/homogeneity.ts` `assertEmbeddingSpace`) used by eval + the query path.
+
+**`input_type`-scoped embed cache key.** New shared `rag/embedCache.ts` `embedCacheKey(provider,
+model, dim, inputType, text)` = `embed/{provider}/{model}/{dim}/{inputType}/v1/{sha256(text)}` — a
+query and a document with identical text no longer collide. The RAG stage (document side) was
+refactored onto it (its local key/normalize/sha256 removed); the query path uses the "query" segment.
+Document-side keys change ⇒ a one-time re-embed on the next real run (indexes are rebuilt for real in
+P7).
+
+**`answerQuestion`** (`rag/answer.ts`, pure, injected clients): embed the question (query side, via
+the embed cache) → `retrieve` top-k → **honest no-answer gate** (empty or top cosine <
+`RAG_MIN_SIMILARITY` ⇒ `answered:false`, NO answer-LLM call — never fabricates) → bounded prompt of
+ONLY the retrieved chunks → temp-0 LLM → **ground citations by code** (drop cited chunkIds not in the
+retrieved set, keep grounded ones as `{fileId,startLine,endLine}`, record `droppedCitations`).
+Caching: qa answer cache `qa/v1/{provider}/{model}/{commitSha}/{sha256(question+retrievedChunkIds)}`
+(cache-before-budget: a hit costs zero LLM + no budget); both the query embed and the answer call go
+through the daily budget. `RAG_TOP_K` + `RAG_MIN_SIMILARITY` are P7-tunable `@codeflow/config`
+constants.
+
+**Endpoint** `POST /api/result/:id/ask` (`routes/ask.ts`): loads the result + `ai.rag`, calls an
+injectable `AskHandler` (`setAskHandlerForTests`; production builds clients from env + an in-process
+cache/budget, integration-only). Per-IP rate-limited (shares the analyze store). Honest surfacing:
+no index ⇒ 200 `{unavailable}` (not 500), budget ⇒ 200 `{atCapacity}`, over rate ⇒ 429, unknown job
+⇒ 404, empty question ⇒ 400. Non-streamed JSON.
+
+**Ask-the-repo UI** (`AskRepo.tsx`, the 5th dashboard tab): question → `askRepo(jobId, question)` →
+grounded answer + a Sources list of clickable citations → drill-down (reuses the selected-file
+context). Renders no-answer / no-index / at-capacity / 429 honestly; disabled on the mock-data path
+(no jobId).
+
+**Tests** (hermetic — mock chat+embedding clients, in-memory cache/budget, mock endpoint; zero real
+calls). analyzers +14: retrieve (hoisted) + answerQuestion (prompt isolation/no-leakage, grounding
+drop+record, no-answer below floor / empty index / LLM-refusal with NO LLM call, homogeneity throw,
+cache-before-budget hit=zero-LLM+no-budget / miss=check→record / over-budget throw, embed-key
+query≠document). api +5 (grounded answer, 'Q&A unavailable' not 500, at-capacity, 400/404, 429). web
++6 (AskRepo: answer+clickable citations→drill-down, no-answer, at-capacity, 429, unavailable,
+mock-path disabled). Eval still green (18) on the hoisted retrieve. Per-package: analyzers 160,
+eval 18, api 26, web 47, worker 14, graph 16, parsers 10, shared-types 3.
+
+**Ledger:** #9 (query path) CLOSED. Deferred: answer streaming (token-by-token); the query-path
+answer cache + budget are per-API-process in-memory (share the worker's Mongo/Redis handles in P7);
+production `AskHandler` is integration-only. Next session: **P19 — Dockerfiles + CI** (CI on mocks,
+no secrets).
+
+## 2026-06-10 (i) — P6: ship-prep — service Dockerfiles + GitHub Actions CI (no secrets, no infra)
+
+Branch: `codeflow-cleanup`. Make CodeFlow shippable: three service Dockerfiles + a CI that runs the
+HERMETIC suite on every push/PR — no secrets, no live services, no deploy (that's P7). Two commits:
+Dockerfiles, then CI.
+
+**Dockerfiles (Part A).** pnpm-workspace-aware multi-stage, build context = repo root.
+- api + worker: build stage `pnpm install --frozen-lockfile` + `pnpm -r build`, then
+  `pnpm --filter=<app> deploy --prod /prod` (self-contained, prod-pruned folder with the internal
+  `@codeflow/*` deps copied in — the pnpm-native resolution). Runtime `node:20-slim`, non-root user,
+  built output only. API `EXPOSE 4000` + `/health` `HEALTHCHECK`; worker no port + `git` installed
+  (it `spawn("git")` to clone). Env injected at RUN, never baked.
+- web: vite build → `nginx:1.27-alpine` (SPA fallback). RUNTIME API URL — an entrypoint
+  (`apps/web/docker/40-codeflow-config.sh`, an nginx `/docker-entrypoint.d/` hook) rewrites
+  `/config.js` from `$API_BASE_URL` on start, so ONE image works across environments. `apiClient`
+  reads `window.__CODEFLOW_CONFIG__.apiBaseUrl` (→ VITE → localhost fallback); a default
+  `public/config.js` ships in the build (dev/jsdom fall back; hermetic suite unchanged).
+- `.dockerignore`, `.env.example` (names only — current runtime contract), `.gitignore`
+  `!.env.example`, `.gitattributes` (LF on `*.sh`/`Dockerfile`/`nginx.conf`).
+
+**CI (Part B).** `.github/workflows/ci.yml`, push + PR. `gate` job: pin pnpm 9.15.4 + Node 20
+(store cached) → install → `pnpm -r typecheck` → `pnpm -r lint` → **`pnpm test` (serial,
+`-r --workspace-concurrency=1`** — NOT the parallel `pnpm -r test`, per the documented OOM note) →
+`pnpm -r build` → `node --test tests/*.mjs`. Optional `docker-build` job builds all three images
+(no push, no secrets). Hard rule: no secrets, no Mongo/Redis service containers. Real scored eval +
+cross-process SSE/BullMQ wire smoke stay out of CI (P7).
+
+**Verification.** Every CI GATE command run locally + green: typecheck/lint clean, `pnpm test`
+(serial) green — shared-types 3, web 47, graph 16, parsers 10, analyzers 160, api 26, worker 14,
+eval 18; `pnpm -r build` green (incl. the web vite bundle + `dist/config.js`); legacy `node --test
+tests/*.mjs` 25/25. The only app-code touch was `apiClient`'s runtime-config read (suite unchanged).
+Honest boundary: the in-session Docker daemon was NOT running, so the IMAGE builds are proven by the
+CI `docker-build` job / P7, not this session (the entrypoint `.sh` was `sh -n` syntax-checked + is
+stored LF).
+
+**Before P7 (still pending, deliberately NOT folded into P19):** the dead-code cleanup — ledger #4
+(delete unwired `analysisProcessor.ts` + test) and #15 (dead P5-era mock panels) — and the
+still-uncommitted `PLAN.md` edit. Clean tree + presentable repo for the P7 README pass.
+
+Next: **P7 — Go-live** (keys, local Mongo/Redis, real scored eval + threshold tuning, first big-repo
+end-to-end run + measured limits, BullMQ/SSE wire smoke, deploy with managed Redis + Mongo Atlas,
+live link, README).

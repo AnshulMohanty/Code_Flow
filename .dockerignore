@@ -1,0 +1,18 @@
+# Build context pruning — the build stage runs a fresh `pnpm install`, so never ship local
+# installs/output or secrets into the image.
+**/node_modules
+**/dist
+**/build
+**/.next
+**/coverage
+**/.nyc_output
+**/.turbo
+**/.cache
+.git
+.github
+**/*.log
+**/.DS_Store
+.env
+.env.*
+!.env.example
+**/*.tsbuildinfo
