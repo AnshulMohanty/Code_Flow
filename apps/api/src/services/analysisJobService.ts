@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AnalysisMode, JobProgress, JobStatus, PipelineRunStatus, PipelineStatusReason, RepositoryRef } from "@codeflow/shared-types";
+import type { AnalysisMode, JobProgress, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, RepositoryRef } from "@codeflow/shared-types";
 import { ApiError } from "../middleware/errorHandler.js";
 import { isMongoConnected } from "../db/connectMongo.js";
 import { JobModel } from "../db/models/JobModel.js";
@@ -22,6 +22,8 @@ export interface AnalysisJobRecord {
   error?: string;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  /** Stages the worker reported as never-configured (unconfigured AI providers). */
+  skippedStages?: PipelineStageId[];
   createdAt: string;
   updatedAt: string;
 }
@@ -41,6 +43,7 @@ export interface CreateAnalysisJobInput {
   totalFiles?: number;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  skippedStages?: PipelineStageId[];
 }
 
 const inMemoryJobs = new Map<string, AnalysisJobRecord>();
@@ -66,6 +69,7 @@ export async function createAnalysisJob(input: CreateAnalysisJobInput): Promise<
     cached: input.cached ?? false,
     runStatus: input.runStatus,
     runStatusReason: input.runStatusReason,
+    skippedStages: input.skippedStages,
     createdAt: now,
     updatedAt: now,
   };
@@ -87,6 +91,7 @@ export async function createAnalysisJob(input: CreateAnalysisJobInput): Promise<
     cached: job.cached,
     runStatus: job.runStatus,
     runStatusReason: job.runStatusReason,
+    skippedStages: job.skippedStages,
     repositoryRef: job.repositoryRef,
     mode: job.mode,
     commitSha: job.commitSha,
@@ -101,7 +106,17 @@ export async function updateAnalysisJob(
   patch: Partial<
     Pick<
       AnalysisJobRecord,
-      "status" | "progress" | "currentStep" | "parsedFiles" | "totalFiles" | "analysisId" | "cached" | "error" | "runStatus" | "runStatusReason"
+      | "status"
+      | "progress"
+      | "currentStep"
+      | "parsedFiles"
+      | "totalFiles"
+      | "analysisId"
+      | "cached"
+      | "error"
+      | "runStatus"
+      | "runStatusReason"
+      | "skippedStages"
     >
   >,
 ): Promise<AnalysisJobRecord> {
@@ -164,6 +179,8 @@ export async function getAnalysisJobProgress(jobId: string): Promise<JobProgress
     // #19 — terminal pipeline outcome on REST (SSE is for live watching only).
     ...(job.runStatus ? { runStatus: job.runStatus } : {}),
     ...(job.runStatusReason ? { runStatusReason: job.runStatusReason } : {}),
+    // Never-configured stages, so the UI can settle those rows instead of spinning.
+    ...(job.skippedStages?.length ? { skippedStages: job.skippedStages } : {}),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -192,6 +209,7 @@ function fromMongoDocument(doc: any): AnalysisJobRecord {
     error: doc.error,
     runStatus: doc.runStatus,
     runStatusReason: doc.runStatusReason,
+    skippedStages: doc.skippedStages,
     createdAt: new Date(doc.createdAt).toISOString(),
     updatedAt: new Date(doc.updatedAt).toISOString(),
   };

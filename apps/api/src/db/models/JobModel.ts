@@ -18,6 +18,9 @@ const jobSchema = new Schema(
     // REST answers "what happened" on a reconnect after completion.
     runStatus: { type: String, enum: ["completed", "partial", "failed", "aborted"] },
     runStatusReason: { type: String, enum: ["repo-too-large", "budget-exhausted"] },
+    // Stages that produced no output because they were never configured (unconfigured AI
+    // providers) — the UI renders these as an honest terminal "skipped", not "pending".
+    skippedStages: { type: [String], default: undefined },
     repositoryRef: { type: Schema.Types.Mixed, required: true },
     mode: { type: String, enum: ["public_hosted"], required: true },
     commitSha: { type: String, required: true },

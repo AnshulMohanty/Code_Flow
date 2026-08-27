@@ -127,7 +127,11 @@ export function PublicRepoInput() {
     settledRef.current = true;
     stopPolling();
     setJobProgress(progress);
-    setPipelineTerminal(progress.runStatus ?? (progress.status === "failed" ? "failed" : "completed"), progress.runStatusReason);
+    setPipelineTerminal(
+      progress.runStatus ?? (progress.status === "failed" ? "failed" : "completed"),
+      progress.runStatusReason,
+      progress.skippedStages,
+    );
 
     if (progress.status === "failed") {
       setApiError("CodeFlow analysis failed.");

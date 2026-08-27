@@ -29,6 +29,13 @@ export interface JobProgress {
   /** Distinct, typed reason for a non-clean outcome (e.g. repo-too-large, budget-exhausted)
    *  so the UI can say "at capacity" / "too large" rather than a generic failure. */
   runStatusReason?: PipelineStatusReason;
+  /**
+   * Stages that were NOT part of this run and produced no output — today, the AI stages
+   * that never registered because their provider key is absent. Without this the UI has no
+   * way to tell "still working" from "never going to run" and leaves those rows spinning
+   * forever. An empty/absent list means every configured stage reported.
+   */
+  skippedStages?: PipelineStageId[];
   createdAt?: string;
   updatedAt: string;
 }

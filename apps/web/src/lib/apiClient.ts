@@ -3,6 +3,7 @@ import type {
   AnalysisResult,
   JobStatus,
   PipelineRunStatus,
+  PipelineStageId,
   PipelineStatusReason,
   ProgressEvent,
 } from "@codeflow/shared-types";
@@ -49,6 +50,9 @@ export interface ApiJobProgress {
   /** Terminal pipeline outcome (the #19 fix) — REST answers "what happened" on reconnect. */
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  /** Stages that never ran because they were not configured (unconfigured AI providers).
+   *  Without this the panel cannot tell "still working" from "never going to run". */
+  skippedStages?: PipelineStageId[];
   createdAt: string;
   updatedAt: string;
 }

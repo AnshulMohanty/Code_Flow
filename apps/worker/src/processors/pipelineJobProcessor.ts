@@ -17,12 +17,14 @@ import {
 import type {
   AnalysisCacheHandle,
   AnalysisJobPayload,
+  AnalysisResult,
   BudgetHandle,
   EventLogStore,
   JobStatus,
   PipelineInput,
   PipelineRunStatus,
   PipelineStage,
+  PipelineStageId,
   ProgressPublisher,
 } from "@codeflow/shared-types";
 import type { WorkerAnalysisService } from "../services/workerAnalysisService.js";
@@ -62,6 +64,31 @@ export interface PipelineJobOutcome {
   analysisId?: string;
   cached: boolean;
   status: PipelineRunStatus;
+  /** AI stages that never ran because no provider was configured (see skippedAiStages). */
+  skippedStages: PipelineStageId[];
+}
+
+/** Human-readable note per skippable AI stage, appended to result.warnings. */
+const AI_STAGE_NOTES: Record<"synthesize" | "rag", string> = {
+  synthesize:
+    'AI stage "synthesize" was skipped: no chat provider configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY). The onboarding guide is unavailable; the deterministic analysis is complete.',
+  rag: 'AI stage "rag" was skipped: no embedding provider configured (set VOYAGE_API_KEY or GEMINI_API_KEY). Ask-the-repo Q&A is unavailable; the deterministic analysis is complete.',
+};
+
+/**
+ * Which AI stages produced nothing because their provider was never configured?
+ *
+ * A stage counts as skipped only when BOTH its client is absent AND the final result
+ * carries no output for it — so a cache hit that already holds an AI slice is never
+ * mislabelled "skipped". This is the signal the UI needs to distinguish "still working"
+ * from "never going to run"; without it stages 7-8 sit at "pending" forever while the run
+ * reports "completed".
+ */
+function skippedAiStages(deps: PipelineJobDependencies, result: AnalysisResult): PipelineStageId[] {
+  const skipped: PipelineStageId[] = [];
+  if (!deps.synthesisClient && !result.ai?.synthesis) skipped.push("synthesize");
+  if (!deps.embeddingClient && !result.ai?.rag) skipped.push("rag");
+  return skipped;
 }
 
 /**
@@ -135,7 +162,7 @@ export async function runAnalysisJob(
     if (deps.embeddingClient) {
       stages.push(createRagStage({ client: deps.embeddingClient, readFile: deps.readFile, now }));
     }
-    const { result, cached } = await runPipeline(stages, input, {
+    const { result: ranResult, cached } = await runPipeline(stages, input, {
       emit: (event) => {
         void deps.publisher.publishProgress(payload.jobId, event);
         // Persist to the replay buffer (#20) so a late connection still sees this stage.
@@ -146,6 +173,20 @@ export async function runAnalysisJob(
       budget: deps.budget,
       now,
     });
+
+    // An unconfigured AI stage is recorded on the result itself (warnings, persisted with
+    // the analysis) as well as on the job record below, so the omission survives a reload
+    // and a cache hit instead of living only in this process's stdout.
+    const skippedStages = skippedAiStages(deps, ranResult);
+    // `warnings` is required by the contract but a cached document persisted by an older
+    // analyzer may predate it, so treat it as optional here rather than trusting the type.
+    const existingWarnings = ranResult.warnings ?? [];
+    const notes = skippedStages
+      .map((stage) => AI_STAGE_NOTES[stage as "synthesize" | "rag"])
+      .filter((note) => note && !existingWarnings.includes(note));
+    const result: AnalysisResult = notes.length
+      ? { ...ranResult, warnings: [...existingWarnings, ...notes] }
+      : ranResult;
 
     const status: PipelineRunStatus = cached ? "completed" : result.pipeline?.status ?? "completed";
     let analysisId = cached ? result.id : undefined;
@@ -168,6 +209,7 @@ export async function runAnalysisJob(
       status: toJobStatus(status),
       runStatus: status,
       ...(statusReason ? { runStatusReason: statusReason } : {}),
+      ...(skippedStages.length ? { skippedStages } : {}),
       progress: 1,
       currentStep: cached ? "Cached analysis returned." : `Analysis ${status}.`,
       analysisId,
@@ -177,7 +219,7 @@ export async function runAnalysisJob(
 
     await deps.eventLog?.append(payload.jobId, { kind: "done", jobId: payload.jobId, status });
     await deps.publisher.publishDone(payload.jobId, status);
-    return { analysisId, cached, status };
+    return { analysisId, cached, status, skippedStages };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown analysis error.";
     await deps.service.updateJob(payload.jobId, {

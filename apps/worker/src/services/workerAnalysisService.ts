@@ -1,4 +1,4 @@
-import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, BudgetHandle, EventLogStore, JobStatus, PipelineRunStatus, PipelineStatusReason, ProgressMessage } from "@codeflow/shared-types";
+import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, BudgetHandle, EventLogStore, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressMessage } from "@codeflow/shared-types";
 import path from "node:path";
 import { DAILY_LLM_BUDGET } from "@codeflow/config";
 import dotenv from "dotenv";
@@ -32,6 +32,7 @@ export interface WorkerJobPatch {
   commitSha?: string;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  skippedStages?: PipelineStageId[];
 }
 
 export interface SavedWorkerAnalysis {
@@ -111,6 +112,9 @@ const jobSchema = new Schema(
     error: { type: String },
     runStatus: { type: String, enum: ["completed", "partial", "failed", "aborted"] },
     runStatusReason: { type: String, enum: ["repo-too-large", "budget-exhausted"] },
+    // Stages that produced no output because they were never configured (unconfigured AI
+    // providers). Lets the UI render an honest terminal state instead of eternal "pending".
+    skippedStages: { type: [String], default: undefined },
     repositoryRef: { type: Schema.Types.Mixed, required: true },
     mode: { type: String, enum: ["public_hosted"], required: true },
     commitSha: { type: String, required: true },

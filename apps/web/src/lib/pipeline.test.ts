@@ -1,6 +1,6 @@
 import type { ProgressEvent } from "@codeflow/shared-types";
 import { describe, expect, it } from "vitest";
-import { applyDoneEvent, applyProgressEvent, initialPipelineState, PIPELINE_STAGES } from "./pipeline";
+import { applyDoneEvent, applyProgressEvent, initialPipelineState, PIPELINE_STAGES, SKIPPED_NO_AI_DETAIL } from "./pipeline";
 
 function event(stageIndex: number, status: ProgressEvent["status"], detail?: string): ProgressEvent {
   return {
@@ -42,5 +42,36 @@ describe("pipeline reducer", () => {
     const state = applyDoneEvent(initialPipelineState(), "partial", "budget-exhausted");
     expect(state.runStatus).toBe("partial");
     expect(state.runStatusReason).toBe("budget-exhausted");
+  });
+
+  it("settles never-configured stages as 'skipped' instead of leaving them pending", () => {
+    const state = applyDoneEvent(initialPipelineState(), "completed", undefined, ["synthesize", "rag"]);
+
+    const synthesize = state.stages.find((s) => s.stage === "synthesize")!;
+    const rag = state.stages.find((s) => s.stage === "rag")!;
+    expect(synthesize.status).toBe("skipped");
+    expect(rag.status).toBe("skipped");
+    expect(synthesize.detail).toBe(SKIPPED_NO_AI_DETAIL);
+    expect(state.skippedStages).toEqual(["synthesize", "rag"]);
+    // No stage is left pending behind a finished run.
+    expect(state.stages.some((s) => s.status === "pending")).toBe(true); // stages 1-6 never reported here
+    expect(state.stages.filter((s) => s.status === "pending").map((s) => s.stage)).not.toContain("rag");
+  });
+
+  it("never overwrites a stage that actually reported", () => {
+    let state = initialPipelineState();
+    state = applyProgressEvent(state, event(7, "completed", "wrote the guide"));
+    state = applyDoneEvent(state, "completed", undefined, ["synthesize", "rag"]);
+
+    const synthesize = state.stages.find((s) => s.stage === "synthesize")!;
+    expect(synthesize.status).toBe("completed");
+    expect(synthesize.detail).toBe("wrote the guide");
+    expect(state.stages.find((s) => s.stage === "rag")!.status).toBe("skipped");
+  });
+
+  it("is a no-op when nothing was skipped", () => {
+    const state = applyDoneEvent(initialPipelineState(), "completed");
+    expect(state.stages.every((s) => s.status === "pending")).toBe(true);
+    expect(state.skippedStages).toBeUndefined();
   });
 });

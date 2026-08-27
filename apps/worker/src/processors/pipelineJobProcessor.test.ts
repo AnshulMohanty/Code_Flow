@@ -110,6 +110,57 @@ describe("runAnalysisJob", () => {
     expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "completed" });
   });
 
+  it("no AI providers: reports the skipped stages on the job + result warnings", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+
+    // No synthesisClient / embeddingClient — exactly the deterministic-only deployment.
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: channel,
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+    });
+
+    // The run is genuinely fine — it just did not include the AI stages.
+    expect(outcome.status).toBe("completed");
+    expect(outcome.skippedStages).toEqual(["synthesize", "rag"]);
+
+    // Surfaced on the job record, so REST (and therefore the UI) can settle those rows.
+    expect(updates.at(-1)).toMatchObject({ runStatus: "completed", skippedStages: ["synthesize", "rag"] });
+
+    // ...and persisted onto the result itself, so the omission survives a reload.
+    const saved = vi.mocked(service.saveAnalysis).mock.calls[0][0];
+    expect(saved.result.warnings).toEqual([
+      expect.stringContaining('AI stage "synthesize" was skipped'),
+      expect.stringContaining('AI stage "rag" was skipped'),
+    ]);
+    expect(saved.result.warnings.join(" ")).toContain("GEMINI_API_KEY");
+  });
+
+  it("configured AI providers: nothing is reported as skipped", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: channel,
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      // Stage factories only need these to register; the stages themselves are unit-tested
+      // elsewhere and fail softly (AI failure => "partial"), which is not what we assert here.
+      synthesisClient: { provider: "anthropic", model: "test", complete: vi.fn(async () => "{}") },
+      embeddingClient: { provider: "voyage", model: "test", dimension: 3, embed: vi.fn(async () => [[0, 0, 0]]) },
+    });
+
+    expect(outcome.skippedStages).toEqual([]);
+    expect(updates.at(-1)).not.toHaveProperty("skippedStages");
+  });
+
   it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {
     const { service, updates } = fakeService(null);
     const channel = createChannel();

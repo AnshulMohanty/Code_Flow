@@ -735,6 +735,18 @@ pre {
   box-shadow: 0 0 0 0 rgba(91, 168, 255, 0.55);
   animation: pipeline-pulse 1.5s ease-out infinite;
 }
+/* Skipped: a TERMINAL state (never going to run) — reads as settled-but-inactive, and is
+   deliberately distinct from `pending`, which still implies work in flight. */
+.pipeline-node.is-skipped .pipeline-node__glyph {
+  color: #f0c274;
+  border-color: rgba(224, 168, 74, 0.55);
+  background: rgba(224, 168, 74, 0.1);
+  border-style: dashed;
+}
+.pipeline-node.is-skipped .pipeline-node__label,
+.pipeline-node.is-skipped .pipeline-node__meta {
+  color: #98a6b8;
+}
 .pipeline-spin {
   animation: pipeline-spin 1s linear infinite;
 }
@@ -763,6 +775,10 @@ pre {
 }
 .pipeline-feed__item.is-running {
   border-left-color: #5ba8ff;
+}
+.pipeline-feed__item.is-skipped {
+  border-left-color: #e0a84a;
+  border-left-style: dashed;
 }
 .pipeline-feed__line {
   display: flex;

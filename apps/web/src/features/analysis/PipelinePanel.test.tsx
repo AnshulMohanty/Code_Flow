@@ -2,7 +2,7 @@ import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { PipelinePanel } from "./PipelinePanel";
 import { mockPipelineState } from "../../lib/mockAnalysis";
-import { applyProgressEvent, initialPipelineState } from "../../lib/pipeline";
+import { applyDoneEvent, applyProgressEvent, initialPipelineState, PIPELINE_STAGES } from "../../lib/pipeline";
 
 afterEach(cleanup);
 
@@ -41,6 +41,44 @@ describe("PipelinePanel", () => {
     expect(within(banner).getByText(/skipped to stay within today's budget/i)).toBeInTheDocument();
     // The failed RAG stage is shown as failed, not hidden.
     expect(screen.getAllByText("failed").length).toBeGreaterThan(0);
+  });
+
+  it("shows unconfigured AI stages as a terminal 'skipped', never an eternal spinner", () => {
+    // A deterministic-only run: all six deterministic stages reported, no AI provider
+    // configured, so stages 7-8 never emitted a single event.
+    let state = initialPipelineState(8);
+    for (let stageIndex = 1; stageIndex <= 6; stageIndex++) {
+      state = applyProgressEvent(state, {
+        jobId: "j",
+        stage: PIPELINE_STAGES[stageIndex - 1].stage,
+        stageIndex,
+        stageCount: 6,
+        kind: "deterministic",
+        status: "completed",
+        label: PIPELINE_STAGES[stageIndex - 1].label,
+        progress: stageIndex / 6,
+        startedAt: "",
+        emittedAt: "",
+      });
+    }
+    state = applyDoneEvent(state, "completed", undefined, ["synthesize", "rag"]);
+
+    render(<PipelinePanel state={state} />);
+
+    // The banner tells the truth instead of claiming every stage finished.
+    const banner = screen.getByRole("status");
+    expect(within(banner).getByText("Deterministic analysis complete")).toBeInTheDocument();
+    expect(within(banner).getByText(/No AI provider is configured/i)).toBeInTheDocument();
+    expect(within(banner).getByText(/Synthesize and Index for Q&A did not run/i)).toBeInTheDocument();
+
+    // Both AI stages read as "skipped" (terminal) in the rail...
+    expect(screen.getByTitle("Synthesize: skipped")).toBeInTheDocument();
+    expect(screen.getByTitle("Index for Q&A: skipped")).toBeInTheDocument();
+    // ...and both appear in the feed carrying the reason (rail meta + feed badge = 2 each).
+    expect(screen.getAllByText("skipped")).toHaveLength(4);
+    expect(screen.getAllByText(/no AI provider configured/i)).toHaveLength(2);
+    // Nothing is left claiming it is still pending.
+    expect(screen.queryByText("pending")).not.toBeInTheDocument();
   });
 
   it("renders an arbitrary preview key without per-stage hardcoding", () => {

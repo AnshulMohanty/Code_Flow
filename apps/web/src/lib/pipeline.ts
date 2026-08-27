@@ -22,6 +22,8 @@ export interface PipelineState {
   runStatus: PipelineRunStatus | null;
   /** Distinct terminal reason (the #19/P14 field) — drives the honest banner copy. */
   runStatusReason?: PipelineStatusReason;
+  /** Stages that were never configured to run (unconfigured AI providers). */
+  skippedStages?: PipelineStageId[];
   stageCount: number;
 }
 
@@ -74,11 +76,38 @@ export function applyProgressEvent(state: PipelineState, event: ProgressEvent): 
   return { ...state, stages };
 }
 
-/** Fold the terminal `done` event: record the honest run status + reason. */
+/** Copy shown on a stage that was never configured to run. */
+export const SKIPPED_NO_AI_DETAIL = "Skipped — no AI provider configured for this deployment.";
+
+/**
+ * Fold the terminal `done` event: record the honest run status + reason, and SETTLE any
+ * stage the run reported as never-configured.
+ *
+ * A stage that produced no event is indistinguishable from one still working, so without
+ * this an unconfigured AI stage sits at "pending" forever behind a finished run. Stages
+ * named in `skippedStages` that never reported are moved to the terminal "skipped" state
+ * with an explicit reason; a stage that DID report keeps whatever it actually reported.
+ */
 export function applyDoneEvent(
   state: PipelineState,
   status: PipelineRunStatus,
   reason?: PipelineStatusReason,
+  skippedStages?: PipelineStageId[],
 ): PipelineState {
-  return { ...state, runStatus: status, runStatusReason: reason };
+  const skipped = new Set(skippedStages ?? []);
+  const stages = skipped.size
+    ? state.stages.map((view) =>
+        skipped.has(view.stage) && view.status === "pending"
+          ? { ...view, status: "skipped" as const, detail: SKIPPED_NO_AI_DETAIL }
+          : view,
+      )
+    : state.stages;
+
+  return {
+    ...state,
+    stages,
+    runStatus: status,
+    runStatusReason: reason,
+    ...(skippedStages?.length ? { skippedStages } : {}),
+  };
 }

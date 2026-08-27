@@ -1,6 +1,6 @@
 import { Card } from "../../components/ui/Card";
-import type { PipelineRunStatus, PipelineStatusReason, StageStatus } from "@codeflow/shared-types";
-import type { PipelineState, StageView } from "../../lib/pipeline";
+import type { PipelineRunStatus, PipelineStageId, PipelineStatusReason, StageStatus } from "@codeflow/shared-types";
+import { PIPELINE_STAGES, type PipelineState, type StageView } from "../../lib/pipeline";
 
 interface PipelinePanelProps {
   state: PipelineState;
@@ -19,7 +19,7 @@ export function PipelinePanel({ state, jobId }: PipelinePanelProps) {
   const settled = stages.filter((s) => isSettled(s.status)).length;
   const runningIndex = stages.findIndex((s) => s.status === "running");
   const fillPct = runStatus ? 100 : Math.round((settled / stageCount) * 100);
-  const banner = terminalBanner(runStatus, runStatusReason);
+  const banner = terminalBanner(runStatus, runStatusReason, state.skippedStages);
   const activity = stages.filter((s) => s.status !== "pending");
 
   return (
@@ -142,9 +142,29 @@ interface Banner {
   body: string;
 }
 
+/** "Synthesize" / "Synthesize and Index for Q&A" — reuses the canonical stage labels. */
+function listStages(stages: PipelineStageId[]): string {
+  const labels = stages.map((id) => PIPELINE_STAGES.find((entry) => entry.stage === id)?.label ?? id);
+  if (labels.length <= 1) return labels[0] ?? "an AI stage";
+  return `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`;
+}
+
 /** Honest terminal copy keyed on the typed reason — never a silent stall. */
-function terminalBanner(status: PipelineRunStatus | null, reason?: PipelineStatusReason): Banner | null {
+function terminalBanner(
+  status: PipelineRunStatus | null,
+  reason?: PipelineStatusReason,
+  skippedStages?: PipelineStageId[],
+): Banner | null {
   if (!status) return null;
+  // A run with unconfigured AI stages still reports "completed" — say so plainly rather
+  // than claiming every stage finished.
+  if (skippedStages?.length) {
+    return {
+      tone: "warning",
+      title: "Deterministic analysis complete",
+      body: `No AI provider is configured, so ${listStages(skippedStages)} did not run. Everything below is the full deterministic analysis; the onboarding guide and Ask-the-repo need a provider key.`,
+    };
+  }
   if (status === "completed") {
     return { tone: "success", title: "Analysis complete", body: "All stages finished. Explore the results below." };
   }
@@ -179,12 +199,14 @@ function isSettled(status: StageStatus | "pending"): boolean {
   return status === "completed" || status === "failed" || status === "skipped";
 }
 
-/** Collapse to the four visual buckets the CSS styles. */
-function visualStatus(status: StageStatus | "pending"): "done" | "running" | "failed" | "pending" {
+/** Collapse to the visual buckets the CSS styles. `skipped` is DISTINCT from `pending`:
+ *  one is a terminal "this will never run", the other is "not yet". */
+function visualStatus(status: StageStatus | "pending"): "done" | "running" | "failed" | "skipped" | "pending" {
   if (status === "completed") return "done";
   if (status === "running") return "running";
   if (status === "failed") return "failed";
-  return "pending"; // pending + skipped read as inactive
+  if (status === "skipped") return "skipped";
+  return "pending";
 }
 
 function statusWord(status: StageStatus | "pending"): string {
