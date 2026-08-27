@@ -1,3 +1,16 @@
+/**
+ * The analyzer's version — the third component of the Mongo analysis cache key
+ * ({repoFullName, commitSha, analyzerVersion}). It namespaces every cached analysis, so
+ * BUMP IT whenever a change to the deterministic stages would make previously-cached
+ * results wrong; that invalidates the cache without a manual purge.
+ *
+ * It lives here (not package.json) because it is a cache-correctness contract shared by
+ * the API and worker, not a published artifact version: it must change when analyzer
+ * OUTPUT changes, which is not the same cadence as a release. `ANALYZER_VERSION` in the
+ * environment still overrides it for ad-hoc cache namespacing.
+ */
+export const ANALYZER_VERSION = "1.0.0";
+
 export const DEFAULT_API_PORT = 4000;
 export const DEFAULT_WEB_PORT = 5173;
 export const DEFAULT_LOCAL_API_PORT = 3001;

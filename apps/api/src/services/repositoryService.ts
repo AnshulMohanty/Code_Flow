@@ -16,7 +16,11 @@ export function normalizeRepositoryForCache(repository: RepositoryRef): Normaliz
   const name = repository.name;
   const branch = repository.branch ?? "main";
   const fullName = `${owner}/${name}`;
-  const commitSha = `mock-${sanitizeCachePart(owner)}-${sanitizeCachePart(name)}-${sanitizeCachePart(branch)}`;
+  // A PLACEHOLDER until Ingest clones and resolves the real HEAD SHA (the worker then
+  // stamps the resolved value onto the job). Deliberately not a valid hex SHA so it can
+  // never be mistaken for one, and stable per owner/name/branch so repeat submissions of
+  // the same ref produce the same job payload.
+  const commitSha = `pending-${sanitizeCachePart(owner)}-${sanitizeCachePart(name)}-${sanitizeCachePart(branch)}`;
 
   return {
     repository: {

@@ -7,6 +7,7 @@ import { createInMemoryRateLimitStore } from "./middleware/rateLimit.js";
 import { setAnalysisQueueEnqueueForTests } from "./queues/analysisQueue.js";
 import { setProgressSubscriberForTests } from "./queues/progressChannel.js";
 import { BudgetExceededError } from "@codeflow/analyzers";
+import { ANALYZER_VERSION } from "@codeflow/config";
 import { streamProgress } from "./routes/jobs.js";
 import { createInMemoryEventLogStore } from "./queues/eventLogStore.js";
 import { setAskHandlerForTests } from "./services/ragQaService.js";
@@ -193,10 +194,20 @@ describe("codeflow api", () => {
       expect.objectContaining({
         jobId: response.body.jobId,
         mode: "public_hosted",
-        commitSha: "mock-facebook-react-main",
-        analyzerVersion: "mock-v1",
+        // Placeholder SHA until Ingest resolves the real HEAD; the cache-key namespace is
+        // a real version, never "mock-*".
+        commitSha: "pending-facebook-react-main",
+        analyzerVersion: ANALYZER_VERSION,
       }),
     ]);
+  });
+
+  it("namespaces the analysis cache with a real version, never a 'mock' placeholder", () => {
+    // analyzerVersion is the third component of the Mongo analysis_cache_key, so a "mock-*"
+    // default silently namespaced every real cached analysis under a fake version.
+    expect(env.analyzerVersion).not.toMatch(/mock/i);
+    expect(env.analyzerVersion).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(ANALYZER_VERSION).toBe(env.analyzerVersion);
   });
 
   it("GET /api/job/:id returns queued progress before a worker completes it", async () => {

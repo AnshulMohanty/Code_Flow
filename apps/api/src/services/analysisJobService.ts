@@ -60,9 +60,11 @@ export async function createAnalysisJob(input: CreateAnalysisJobInput): Promise<
     mode: input.mode,
     status,
     progress,
-    currentStep: input.currentStep ?? (status === "completed" ? "Mock analysis completed" : "Analysis job queued."),
-    parsedFiles: input.parsedFiles ?? (status === "completed" ? 42 : 0),
-    totalFiles: input.totalFiles ?? 42,
+    currentStep: input.currentStep ?? (status === "completed" ? "Analysis completed." : "Analysis job queued."),
+    // File counts are only known once the worker has walked the tree; 0 until then rather
+    // than a fabricated placeholder.
+    parsedFiles: input.parsedFiles ?? 0,
+    totalFiles: input.totalFiles ?? 0,
     commitSha: input.commitSha,
     analyzerVersion: input.analyzerVersion,
     analysisId: input.analysisId,

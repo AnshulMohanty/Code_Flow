@@ -9,7 +9,7 @@ const jobSchema = new Schema(
     progress: { type: Number, required: true, default: 0 },
     currentStep: { type: String, required: true, default: "Analysis job queued." },
     parsedFiles: { type: Number, required: true, default: 0 },
-    totalFiles: { type: Number, required: true, default: 42 },
+    totalFiles: { type: Number, required: true, default: 0 },
     repoFullName: { type: String, required: true },
     analysisId: { type: String },
     cached: { type: Boolean, default: false },
