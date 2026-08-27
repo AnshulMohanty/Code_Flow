@@ -16,6 +16,7 @@ export {
   type RepoCloner,
   type RepoSize,
 } from "./stages/ingest.js";
+export { deriveSummary, scoreHealth, type HealthVerdict } from "./pipeline/summary.js";
 export {
   PipelineReasonError,
   RepoTooLargeError,

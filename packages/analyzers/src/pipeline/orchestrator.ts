@@ -3,7 +3,6 @@ import type {
   AnalysisResult,
   AnalysisResultSlices,
   AnalysisSliceKey,
-  AnalysisSummary,
   AnalysisCacheHandle,
   BudgetHandle,
   PipelineContext,
@@ -20,6 +19,7 @@ import type {
   StageStatus,
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
+import { deriveSummary } from "./summary.js";
 
 /** A sink for progress events (e.g. the SSE writer in the worker). */
 export type PipelineEmitter = (event: ProgressEvent) => void;
@@ -468,7 +468,9 @@ function assembleResult(
     producedBy: producedStageIds(pipeline),
 
     // deterministic slices (empty defaults when not yet produced)
-    summary: slices.summary ?? defaultSummary(input),
+    // `summary` is DERIVED from the other slices at assembly (no stage owns it) — see
+    // deriveSummary. An explicit slice, if a stage ever produces one, still wins.
+    summary: slices.summary ?? deriveSummary(input, slices),
     // `files` is a DERIVED view of the graph's nodes (single FileNode[] home — Connect
     // owns `graph`, not a separate `files` slice). Falls back to any explicit slice.
     files: slices.graph?.nodes ?? slices.files ?? [],
@@ -509,18 +511,6 @@ function emptyMetrics(): AnalysisResultSlices["metrics"] {
     hotspots: [],
     cycles: [],
     summary: { fileCount: 0, edgeCount: 0, cycleCount: 0, isolatedFileCount: 0, maxBlastRadius: 0 },
-  };
-}
-
-function defaultSummary(input: PipelineInput): AnalysisSummary {
-  return {
-    repository: input.repositoryRef,
-    mode: input.mode,
-    files: 0,
-    functions: 0,
-    connections: 0,
-    healthScore: null,
-    healthGrade: null,
   };
 }
 
