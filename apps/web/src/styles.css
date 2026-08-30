@@ -260,19 +260,6 @@ pre {
   word-break: break-all;
 }
 
-.dashboard-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
-  gap: 24px;
-  align-items: start;
-}
-
-.dashboard-main,
-.dashboard-side {
-  display: grid;
-  gap: 18px;
-}
-
 .section-heading {
   display: flex;
   align-items: start;
@@ -286,9 +273,7 @@ pre {
 }
 
 .badge-row,
-.button-row,
-.graph-toolbar,
-.graph-legend {
+.button-row {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -440,41 +425,6 @@ pre {
   background: #ffbf69;
 }
 
-.graph-legend {
-  margin-top: 14px;
-  color: #9aa8ba;
-}
-
-.legend-dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  margin-right: 6px;
-}
-
-.legend-ui {
-  background: #6ea8fe;
-}
-
-.legend-api {
-  background: #55d6a4;
-}
-
-.legend-data {
-  background: #ffbf69;
-}
-
-.legend-risk {
-  background: #ff6b82;
-}
-
-.file-drawer,
-.health-panel {
-  position: sticky;
-  top: 16px;
-}
-
 .tabs {
   display: flex;
   flex-wrap: wrap;
@@ -521,30 +471,9 @@ pre {
   padding: 28px;
 }
 
-.state-error {
-  border-color: #ff6b82;
-}
-
-.loading-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: #55d6a4;
-}
-
 @media (max-width: 1100px) {
-  .shell-header,
-  .dashboard-layout {
+  .shell-header {
     grid-template-columns: 1fr;
-  }
-
-  .dashboard-side {
-    grid-row: auto;
-  }
-
-  .file-drawer,
-  .health-panel {
-    position: static;
   }
 }
 
