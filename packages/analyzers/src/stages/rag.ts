@@ -15,8 +15,11 @@ import type {
 } from "@codeflow/shared-types";
 import {
   assertEmbeddingSpace,
+  deriveEnrichment,
+  embedTextFor,
   retrievalNamespace,
   type ChunkTextStore,
+  type SymbolSpan,
   type VectorRecord,
   type VectorStore,
 } from "@codeflow/retrieval";
@@ -69,7 +72,9 @@ const MAX_BATCH_TEXTS = 128;
 const MAX_BATCH_TOKENS = 120_000;
 // Chunk-plan cache-key version — manual cache-bust (bump on a chunking-algorithm change).
 // The embedding-cache key lives in ../rag/embedCache.ts (shared with the query path).
-const PLAN_CACHE_VERSION = "v1";
+// v2 (V3-P2): plan entries now carry `enrichment`, so a v1 cached plan would produce
+// un-enriched chunks on the no-disk retry path — silently worse retrieval, not a crash.
+const PLAN_CACHE_VERSION = "v2";
 
 /**
  * The deterministic chunk plan entry: the persisted metadata PLUS the text, which is what
@@ -319,14 +324,38 @@ async function buildChunkPlan(args: BuildChunkPlanArgs): Promise<{ chunks: Chunk
     const lineCount = lines.length;
     if (lineCount === 0 || (lineCount === 1 && lines[0] === "")) continue; // empty file
 
+    const fileSymbols = symbolsByFile.get(file.path) ?? [];
     const planned =
       mode === "source"
-        ? planSourceFile(file.path, lines, symbolsByFile.get(file.path) ?? [], args)
+        ? planSourceFile(file.path, lines, fileSymbols, args)
         : planWindowFile(file.path, lines, args.windowLines, args.maxChunkTokens);
+
+    // V3-P2 AST ENRICHMENT — a POST-PASS over the planned ranges, deliberately.
+    //
+    // Running it after planning rather than threading symbol context down through
+    // planSourceFile → windowChunks → splitByTokens → makeChunk keeps the interval-cover and
+    // gap-sweep code exactly as V3-P1 left it, which is what guarantees the acceptance
+    // condition "chunk id unchanged": ids are `fileId#start-end`, the ranges are computed by
+    // untouched code, so enrichment cannot move a boundary even by accident.
+    //
+    // Note `spansFor` passes EVERY symbol in the file, not just the top-level ones the interval
+    // cover selected — the nested ones are precisely what makes a scope chain possible.
+    const spans = spansFor(fileSymbols, lineCount);
+    const enriched = planned.map((chunk) => {
+      const enrichment = deriveEnrichment({
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...(chunk.symbolName ? { symbolName: chunk.symbolName } : {}),
+        symbols: spans,
+        lines,
+        language: file.language,
+      });
+      return enrichment ? { ...chunk, enrichment } : chunk;
+    });
 
     // GROUNDING (enforced by code, never trusted): drop chunks whose fileId is not a
     // graph node or whose range falls outside the file.
-    for (const chunk of planned) {
+    for (const chunk of enriched) {
       const grounded =
         args.nodeIds.has(chunk.fileId) &&
         chunk.startLine >= 1 &&
@@ -370,6 +399,23 @@ interface Span {
   start: number;
   end: number;
   name: string;
+}
+
+/**
+ * Every symbol in the file as a resolved `[startLine, endLine]` span, for enrichment.
+ *
+ * Distinct from the interval-cover spans in `planSourceFile`: that function selects
+ * NON-OVERLAPPING top-level spans (a method inside a selected class is subsumed), because it is
+ * deciding chunk boundaries. Enrichment wants the opposite — the overlaps are the scope chain.
+ * A symbol with no `endLine` is given a zero-width span rather than a guessed one, so it can
+ * still supply a signature but can never be claimed to enclose anything.
+ */
+function spansFor(symbols: InventorySymbol[], lineCount: number): SymbolSpan[] {
+  return symbols.map((symbol) => {
+    const start = clamp(symbol.line, 1, lineCount);
+    const end = symbol.endLine === undefined ? start : clamp(symbol.endLine, start, lineCount);
+    return { name: symbol.name, startLine: start, endLine: end, ...(symbol.signature ? { signature: symbol.signature } : {}) };
+  });
 }
 
 /**
@@ -498,9 +544,16 @@ async function embedChunks(
   client: EmbeddingClient,
   maxAttempts: number,
 ): Promise<number[][]> {
-  // Document-side embedding-cache keys (shared helper): scoped by provider/model/dim AND
-  // input_type, so a chunk and a query with identical text never collide.
-  const keys = plan.map((chunk) => embedCacheKey(client.provider, client.model, client.dimension, "document", chunk.text));
+  // V3-P2: what gets EMBEDDED is the enriched text (path + scope + signature + docstring,
+  // then the raw bytes) — see `embedTextFor`. What gets STORED stays byte-exact for the line
+  // range, because that is what a citation resolves to.
+  //
+  // The cache key hashes the embedded text, so turning enrichment on invalidates every
+  // document-side entry exactly once. That is correct rather than unfortunate: the old vectors
+  // describe different text, and serving them would mean the index disagreed with itself.
+  const embedTexts = plan.map((chunk) => embedTextFor(chunk));
+  const embedTokens = embedTexts.map((text) => estimateTokens(text));
+  const keys = embedTexts.map((text) => embedCacheKey(client.provider, client.model, client.dimension, "document", text));
   const embeddings: (number[] | null)[] = new Array(plan.length).fill(null);
 
   // 1) Embedding cache READ (wallet defense) — an unchanged repo costs ZERO API.
@@ -517,14 +570,15 @@ async function embedChunks(
   // hit ⇒ missing.length === 0 ⇒ budget untouched, free). Pre-check the daily budget with
   // a deterministic estimate (summed chunk tokenCount); if exhausted, degrade gracefully
   // (throw budget-exhausted ⇒ orchestrator "partial") WITHOUT calling the provider.
-  const estimatedTokens = missing.reduce((sum, i) => sum + plan[i].tokenCount, 0);
+  // Estimated on the EMBED text (what is actually sent), not the raw chunk text.
+  const estimatedTokens = missing.reduce((sum, i) => sum + embedTokens[i], 0);
   if (missing.length > 0 && ctx.budget && !(await ctx.budget.check(estimatedTokens, "embedding"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; RAG embedding skipped (demo at capacity).");
   }
 
   const usageParts: TokenUsage[] = [];
-  for (const batch of batchIndices(missing, plan)) {
-    const texts = batch.map((i) => plan[i].text);
+  for (const batch of batchIndices(missing, embedTokens)) {
+    const texts = batch.map((i) => embedTexts[i]);
     const { vectors, usage } = await embedWithRetry(client, texts, maxAttempts, ctx);
     usageParts.push(usage);
     for (let j = 0; j < batch.length; j++) {
@@ -554,13 +608,14 @@ async function embedChunks(
   });
 }
 
-/** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS. */
-function batchIndices(indices: number[], plan: ChunkPlan[]): number[][] {
+/** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS.
+ *  Sized by the EMBED-text token estimate — the payload the provider limits are about. */
+function batchIndices(indices: number[], tokensPerIndex: number[]): number[][] {
   const batches: number[][] = [];
   let current: number[] = [];
   let tokens = 0;
   for (const i of indices) {
-    const t = plan[i].tokenCount;
+    const t = tokensPerIndex[i];
     if (current.length > 0 && (current.length >= MAX_BATCH_TEXTS || tokens + t > MAX_BATCH_TOKENS)) {
       batches.push(current);
       current = [];

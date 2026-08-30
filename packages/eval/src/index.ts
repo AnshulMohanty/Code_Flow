@@ -56,6 +56,24 @@ export {
   type EvalIndexFile,
   type HydratedEvalIndex,
 } from "./evalIndex.js";
+// V3-P2 task 2: the hermetic enrichment A/B. Measures the MECHANISM (see enrichmentAb.ts for
+// exactly what it does and does not establish); the real-model number on the golden set needs
+// a key and is deferred.
+export {
+  AB_EMBED_DIM,
+  AB_EMBED_MODEL,
+  AB_FILES,
+  AB_QUESTIONS,
+  buildAbChunks,
+  hashingEmbed,
+  runEnrichmentAb,
+  summarizeAb,
+  type AbArm,
+  type AbArmScores,
+  type AbFile,
+  type AbQuestion,
+  type AbReport,
+} from "./enrichmentAb.js";
 export {
   scoreSynthesis,
   scoreQuestion,

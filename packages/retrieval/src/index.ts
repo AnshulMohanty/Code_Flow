@@ -26,6 +26,18 @@ export type {
 export { assertEmbeddingSpace, assertVectorDimension } from "./homogeneity.js";
 export { retrievalNamespace } from "./namespace.js";
 export { cosineSimilarity, retrieve, type Embedded } from "./vectorMath.js";
+// The shared code tokenizer — one definition for the lexical index and the eval harness.
+export { tokenizeCode } from "./tokenize.js";
+// V3-P2 AST enrichment: what a chunk's vector SEES (path + scope + signature + docstring),
+// derived deterministically from the spine. Never changes what a citation resolves to.
+export {
+  deriveEnrichment,
+  embedTextFor,
+  isEnriched,
+  type DeriveEnrichmentInput,
+  type EnrichableChunk,
+  type SymbolSpan,
+} from "./enrichment.js";
 export {
   assertIndexHasStore,
   indexById,

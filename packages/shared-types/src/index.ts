@@ -466,6 +466,18 @@ export interface InventorySymbol {
   exported: boolean;
   /** Language label (matches RepoFile.language), e.g. "TypeScript". */
   language: string;
+  /**
+   * The declaration line, trimmed — signature, not body (V3-P2).
+   *
+   * The parser has produced this since V3-P1 (`ParsedSymbol.signature`); Inventory was simply
+   * dropping it on the floor. RAG chunk enrichment needs it: a chunk torn out of the middle of
+   * a large symbol has lost its own signature, and a signature is where a typed language puts
+   * its types, so carrying it is also how "enriched with types" is satisfied without inventing
+   * a types field nothing could fill.
+   *
+   * Absent when the parser could not determine one (a re-export has no declaration line).
+   */
+  signature?: string;
 }
 
 export type EntryPointKind = "main" | "index" | "server" | "app" | "cli-bin";

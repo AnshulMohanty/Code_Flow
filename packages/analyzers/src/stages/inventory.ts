@@ -223,6 +223,10 @@ function collectSymbols(
       ...(parsed.lineEnd !== undefined ? { endLine: parsed.lineEnd } : {}),
       exported: parsed.exported === true,
       language: file.language,
+      // V3-P2: carried through rather than discarded — RAG chunk enrichment reads it, and it
+      // is where a typed language states its types. Only when non-empty: an empty string would
+      // be indistinguishable from "the parser found one and it was blank".
+      ...(parsed.signature ? { signature: parsed.signature } : {}),
     });
   }
 
