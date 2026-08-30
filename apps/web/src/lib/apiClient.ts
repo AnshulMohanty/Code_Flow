@@ -1,11 +1,13 @@
 import type {
   AnalysisMode,
   AnalysisResult,
+  DegradationNotice,
   JobStatus,
   PipelineRunStatus,
   PipelineStageId,
   PipelineStatusReason,
   ProgressEvent,
+  RunMode,
 } from "@codeflow/shared-types";
 
 // API base URL resolution, in priority order:
@@ -53,6 +55,9 @@ export interface ApiJobProgress {
   /** Stages that never ran because they were not configured (unconfigured AI providers).
    *  Without this the panel cannot tell "still working" from "never going to run". */
   skippedStages?: PipelineStageId[];
+  /** V3-P0 honest-degradation signals (see RunMode / DegradationNotice). */
+  runMode?: RunMode;
+  degradations?: DegradationNotice[];
   createdAt: string;
   updatedAt: string;
 }

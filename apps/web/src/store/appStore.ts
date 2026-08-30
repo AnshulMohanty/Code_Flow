@@ -1,4 +1,13 @@
-import type { AnalysisMode, AnalysisResult, PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressEvent } from "@codeflow/shared-types";
+import type {
+  AnalysisMode,
+  AnalysisResult,
+  DegradationNotice,
+  PipelineRunStatus,
+  PipelineStageId,
+  PipelineStatusReason,
+  ProgressEvent,
+  RunMode,
+} from "@codeflow/shared-types";
 import { create } from "zustand";
 import type { ApiJobProgress } from "../lib/apiClient";
 import { normalizeAnalysisResult } from "../lib/analysisNormalizer";
@@ -25,7 +34,12 @@ interface AppState {
   startAnalysis: (jobId: string) => void;
   setJobProgress: (progress: ApiJobProgress | null) => void;
   applyStageEvent: (event: ProgressEvent) => void;
-  setPipelineTerminal: (status: PipelineRunStatus, reason?: PipelineStatusReason, skippedStages?: PipelineStageId[]) => void;
+  setPipelineTerminal: (
+    status: PipelineRunStatus,
+    reason?: PipelineStatusReason,
+    skippedStages?: PipelineStageId[],
+    degradation?: { runMode?: RunMode; degradations?: DegradationNotice[] },
+  ) => void;
   setApiError: (message: string | null) => void;
   loadAnalysisResult: (result: AnalysisResult) => void;
   resetAnalysis: () => void;
@@ -80,8 +94,8 @@ export const useAppStore = create<AppState>((set) => ({
     }),
   setJobProgress: (progress) => set({ jobProgress: progress }),
   applyStageEvent: (event) => set((state) => ({ pipeline: applyProgressEvent(state.pipeline, event) })),
-  setPipelineTerminal: (status, reason, skippedStages) =>
-    set((state) => ({ pipeline: applyDoneEvent(state.pipeline, status, reason, skippedStages) })),
+  setPipelineTerminal: (status, reason, skippedStages, degradation) =>
+    set((state) => ({ pipeline: applyDoneEvent(state.pipeline, status, reason, skippedStages, degradation) })),
   setApiError: (message) => set({ apiError: message, isAnalyzing: false }),
   loadAnalysisResult: (result) => {
     const dashboard = buildDashboard(result);

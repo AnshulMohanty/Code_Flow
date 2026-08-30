@@ -36,6 +36,11 @@ export interface JobProgress {
    * forever. An empty/absent list means every configured stage reported.
    */
   skippedStages?: PipelineStageId[];
+  /** How much of the pipeline this run delivered — see RunMode. Mirrors the result field so
+   *  the UI can render an honest banner from the job alone, before the result is fetched. */
+  runMode?: RunMode;
+  /** Typed degradation reasons, mirrored from the result. */
+  degradations?: DegradationNotice[];
   createdAt?: string;
   updatedAt: string;
 }
@@ -136,6 +141,13 @@ export interface AnalysisResult {
   createdAt: string;
   commitSha?: string;
   warnings: string[];
+  /**
+   * How much of the pipeline this run delivered (V3-P0). Absent on results produced before
+   * the field existed; treat absent as "unknown", not as "full".
+   */
+  runMode?: RunMode;
+  /** Typed reasons the run was degraded, alongside the human `warnings[]` strings. */
+  degradations?: DegradationNotice[];
   /** Bumped when the assembled shape changes in a breaking way. */
   schemaVersion?: number;
   /**
@@ -1046,6 +1058,37 @@ export interface StageRunRecord {
 }
 
 export type PipelineRunStatus = "completed" | "partial" | "failed" | "aborted";
+
+/**
+ * How much of the pipeline this run actually delivered (V3-P0).
+ *
+ * SEPARATE from `PipelineRunStatus` on purpose: a run with no provider key completes
+ * successfully — every stage that existed did its job — so its status is legitimately
+ * "completed". What it is NOT is a full analysis. Conflating the two forced the UI to infer
+ * capability from a status that does not carry it, which is how stages 7-8 ended up sitting
+ * at "pending" behind a finished run.
+ *
+ * Also SEPARATE from `AnalysisMode` ("public_hosted"), which describes how the repository was
+ * ACCESSED. Access mode and delivered scope are different axes; overloading one with the
+ * other would make both unreadable.
+ */
+export type RunMode = "full" | "deterministic-only";
+
+/** Typed causes of degradation. A machine-readable reason next to the human `warnings[]`
+ *  string, so the UI can branch instead of pattern-matching prose. */
+export type DegradationReason =
+  | "no-chat-provider"
+  | "no-embedding-provider"
+  | "mongo-unavailable"
+  | "redis-unavailable"
+  | "budget-exhausted";
+
+/** One reason this run delivered less than a full analysis. */
+export interface DegradationNotice {
+  reason: DegradationReason;
+  /** Human-readable detail, including the env var that would fix it where applicable. */
+  detail: string;
+}
 
 /**
  * Typed, machine-readable reason for a non-clean run outcome (P4 guardrails). Distinct

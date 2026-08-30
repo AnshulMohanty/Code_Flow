@@ -1,5 +1,12 @@
 import { Card } from "../../components/ui/Card";
-import type { PipelineRunStatus, PipelineStageId, PipelineStatusReason, StageStatus } from "@codeflow/shared-types";
+import type {
+  DegradationNotice,
+  DegradationReason,
+  PipelineRunStatus,
+  PipelineStageId,
+  PipelineStatusReason,
+  StageStatus,
+} from "@codeflow/shared-types";
 import { PIPELINE_STAGES, type PipelineState, type StageView } from "../../lib/pipeline";
 
 interface PipelinePanelProps {
@@ -20,6 +27,10 @@ export function PipelinePanel({ state, jobId }: PipelinePanelProps) {
   const runningIndex = stages.findIndex((s) => s.status === "running");
   const fillPct = runStatus ? 100 : Math.round((settled / stageCount) * 100);
   const banner = terminalBanner(runStatus, runStatusReason, state.skippedStages);
+  // V3-P0: degradations the headline banner does NOT already explain (today: the database
+  // being down). These can fire on an otherwise-healthy run, so they get their own notices
+  // rather than being folded into — and hidden by — the terminal banner.
+  const notices = uncoveredDegradations(state.degradations, state.skippedStages, runStatusReason);
   const activity = stages.filter((s) => s.status !== "pending");
 
   return (
@@ -46,6 +57,18 @@ export function PipelinePanel({ state, jobId }: PipelinePanelProps) {
           <span>{banner.body}</span>
         </div>
       ) : null}
+
+      {notices.map((notice) => (
+        <div
+          key={notice.reason}
+          className="pipeline-banner pipeline-banner--warning"
+          role="status"
+          data-degradation={notice.reason}
+        >
+          <strong>{DEGRADATION_TITLES[notice.reason]}</strong>
+          <span>{notice.detail}</span>
+        </div>
+      ))}
 
       {/* Reactor rail — connector fills as stages settle; the running node pulses. */}
       <ol className="pipeline-rail" style={{ ["--fill" as string]: `${fillPct}%` }}>
@@ -140,6 +163,38 @@ interface Banner {
   tone: "success" | "warning" | "danger";
   title: string;
   body: string;
+}
+
+/** Short headline per degradation reason; the `detail` from the server carries the specifics
+ *  (including the env var that would fix it), so this stays a label and never duplicates it. */
+const DEGRADATION_TITLES: Record<DegradationReason, string> = {
+  "no-chat-provider": "Onboarding guide unavailable",
+  "no-embedding-provider": "Ask-the-repo unavailable",
+  "mongo-unavailable": "Results are not being saved",
+  "redis-unavailable": "Shared limits unavailable",
+  "budget-exhausted": "Demo at capacity",
+};
+
+/**
+ * Degradations that still need saying after the terminal banner has spoken.
+ *
+ * The banner already explains unconfigured AI providers and budget exhaustion, so repeating
+ * them would be noise. Anything else — a database that is down, so nothing is persisted — is
+ * NOT covered by it and would otherwise be invisible.
+ */
+export function uncoveredDegradations(
+  degradations: DegradationNotice[] | undefined,
+  skippedStages: PipelineStageId[] | undefined,
+  reason: PipelineStatusReason | undefined,
+): DegradationNotice[] {
+  if (!degradations?.length) return [];
+  const covered = new Set<DegradationReason>();
+  if (skippedStages?.length) {
+    covered.add("no-chat-provider");
+    covered.add("no-embedding-provider");
+  }
+  if (reason === "budget-exhausted") covered.add("budget-exhausted");
+  return degradations.filter((notice) => !covered.has(notice.reason));
 }
 
 /** "Synthesize" / "Synthesize and Index for Q&A" — reuses the canonical stage labels. */

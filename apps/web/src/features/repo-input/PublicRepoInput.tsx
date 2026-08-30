@@ -131,6 +131,7 @@ export function PublicRepoInput() {
       progress.runStatus ?? (progress.status === "failed" ? "failed" : "completed"),
       progress.runStatusReason,
       progress.skippedStages,
+      { runMode: progress.runMode, degradations: progress.degradations },
     );
 
     if (progress.status === "failed") {

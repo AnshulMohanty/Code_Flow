@@ -75,3 +75,37 @@ describe("pipeline reducer", () => {
     expect(state.skippedStages).toBeUndefined();
   });
 });
+
+// ── V3-P0: honest degradation signals ────────────────────────────────────────
+describe("applyDoneEvent — runMode + degradations (V3-P0)", () => {
+  it("carries runMode and the typed degradation list onto the state", () => {
+    const state = applyDoneEvent(initialPipelineState(), "completed", undefined, ["synthesize", "rag"], {
+      runMode: "deterministic-only",
+      degradations: [
+        { reason: "no-chat-provider", detail: "set ANTHROPIC_API_KEY or GEMINI_API_KEY" },
+        { reason: "no-embedding-provider", detail: "set VOYAGE_API_KEY or GEMINI_API_KEY" },
+      ],
+    });
+    expect(state.runMode).toBe("deterministic-only");
+    expect(state.degradations?.map((notice) => notice.reason)).toEqual([
+      "no-chat-provider",
+      "no-embedding-provider",
+    ]);
+  });
+
+  it("omits both fields entirely when the run was not degraded (absent, not empty)", () => {
+    const state = applyDoneEvent(initialPipelineState(), "completed", undefined, undefined, {
+      runMode: "full",
+      degradations: [],
+    });
+    expect(state.runMode).toBe("full");
+    expect(state.degradations).toBeUndefined();
+  });
+
+  it("stays backward compatible when the caller passes no degradation argument", () => {
+    const state = applyDoneEvent(initialPipelineState(), "completed", undefined, ["rag"]);
+    expect(state.runMode).toBeUndefined();
+    expect(state.degradations).toBeUndefined();
+    expect(state.skippedStages).toEqual(["rag"]);
+  });
+});

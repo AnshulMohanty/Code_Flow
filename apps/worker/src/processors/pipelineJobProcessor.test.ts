@@ -138,6 +138,22 @@ describe("runAnalysisJob", () => {
       expect.stringContaining('AI stage "rag" was skipped'),
     ]);
     expect(saved.result.warnings.join(" ")).toContain("GEMINI_API_KEY");
+
+    // V3-P0: the delivered SCOPE, as a machine-readable field. `runStatus: "completed"` is
+    // true and useless here on its own — every stage that existed did run. `runMode` is what
+    // says this was not a full analysis, and `degradations` says why, in typed form.
+    expect(outcome.runMode).toBe("deterministic-only");
+    expect(outcome.degradations.map((notice) => notice.reason)).toEqual([
+      "no-chat-provider",
+      "no-embedding-provider",
+    ]);
+    expect(updates.at(-1)).toMatchObject({ runMode: "deterministic-only" });
+    // Persisted on the RESULT too, so it survives a reload and a later cache hit.
+    expect(saved.result.runMode).toBe("deterministic-only");
+    expect(saved.result.degradations?.map((notice) => notice.reason)).toEqual([
+      "no-chat-provider",
+      "no-embedding-provider",
+    ]);
   });
 
   it("configured AI providers: nothing is reported as skipped", async () => {
@@ -159,6 +175,12 @@ describe("runAnalysisJob", () => {
 
     expect(outcome.skippedStages).toEqual([]);
     expect(updates.at(-1)).not.toHaveProperty("skippedStages");
+
+    // A fully-configured run is "full" and carries no degradations (absent, not empty).
+    expect(outcome.runMode).toBe("full");
+    expect(outcome.degradations).toEqual([]);
+    expect(updates.at(-1)).toMatchObject({ runMode: "full" });
+    expect(updates.at(-1)).not.toHaveProperty("degradations");
   });
 
   it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {

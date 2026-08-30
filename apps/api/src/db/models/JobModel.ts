@@ -21,6 +21,11 @@ const jobSchema = new Schema(
     // Stages that produced no output because they were never configured (unconfigured AI
     // providers) — the UI renders these as an honest terminal "skipped", not "pending".
     skippedStages: { type: [String], default: undefined },
+    runMode: { type: String, default: undefined },
+    degradations: {
+      type: [{ _id: false, reason: { type: String, required: true }, detail: { type: String, required: true } }],
+      default: undefined,
+    },
     repositoryRef: { type: Schema.Types.Mixed, required: true },
     mode: { type: String, enum: ["public_hosted"], required: true },
     commitSha: { type: String, required: true },

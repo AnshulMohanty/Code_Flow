@@ -1,4 +1,12 @@
-import type { PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressEvent, StageStatus } from "@codeflow/shared-types";
+import type {
+  DegradationNotice,
+  PipelineRunStatus,
+  PipelineStageId,
+  PipelineStatusReason,
+  ProgressEvent,
+  RunMode,
+  StageStatus,
+} from "@codeflow/shared-types";
 
 /**
  * One stage's live view in the panel. `status` is the orchestrator's StageStatus once an
@@ -24,6 +32,12 @@ export interface PipelineState {
   runStatusReason?: PipelineStatusReason;
   /** Stages that were never configured to run (unconfigured AI providers). */
   skippedStages?: PipelineStageId[];
+  /** V3-P0: how much of the pipeline actually ran. "deterministic-only" means the AI half
+   *  did not, for a reason listed in `degradations`. */
+  runMode?: RunMode;
+  /** V3-P0: typed degradation reasons. Rendered as honest notices, not swallowed — a run
+   *  held in memory because Mongo is down looks identical to a healthy one otherwise. */
+  degradations?: DegradationNotice[];
   stageCount: number;
 }
 
@@ -93,6 +107,7 @@ export function applyDoneEvent(
   status: PipelineRunStatus,
   reason?: PipelineStatusReason,
   skippedStages?: PipelineStageId[],
+  degradation?: { runMode?: RunMode; degradations?: DegradationNotice[] },
 ): PipelineState {
   const skipped = new Set(skippedStages ?? []);
   const stages = skipped.size
@@ -109,5 +124,7 @@ export function applyDoneEvent(
     runStatus: status,
     runStatusReason: reason,
     ...(skippedStages?.length ? { skippedStages } : {}),
+    ...(degradation?.runMode ? { runMode: degradation.runMode } : {}),
+    ...(degradation?.degradations?.length ? { degradations: degradation.degradations } : {}),
   };
 }

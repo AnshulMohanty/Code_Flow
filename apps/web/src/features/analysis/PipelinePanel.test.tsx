@@ -1,6 +1,6 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { PipelinePanel } from "./PipelinePanel";
+import { PipelinePanel, uncoveredDegradations } from "./PipelinePanel";
 import { mockPipelineState } from "../../lib/mockAnalysis";
 import { applyDoneEvent, applyProgressEvent, initialPipelineState, PIPELINE_STAGES } from "../../lib/pipeline";
 
@@ -93,3 +93,76 @@ describe("PipelinePanel", () => {
     expect(within(feed).getByText("totallyNovelMetric")).toBeInTheDocument();
   });
 });
+
+// ── V3-P0: degradations the terminal banner does not already explain ─────────
+describe("PipelinePanel — degradation notices (V3-P0)", () => {
+  it("shows a notice when the database is down, even on an otherwise-clean run", () => {
+    // The API falls back to in-memory Maps when Mongo is down. That used to be completely
+    // invisible: the user got a job id that would vanish on restart with no indication why.
+    const state = applyDoneEvent(initialPipelineState(8), "completed", undefined, undefined, {
+      runMode: "full",
+      degradations: [
+        { reason: "mongo-unavailable", detail: "The database is unavailable. Check MONGO_URI." },
+      ],
+    });
+
+    render(<PipelinePanel state={state} />);
+    expect(screen.getByText("Results are not being saved")).toBeInTheDocument();
+    expect(screen.getByText(/Check MONGO_URI/)).toBeInTheDocument();
+    // The success banner still renders — the run DID complete; it just was not persisted.
+    // (The title also appears as the panel heading, hence getAllByText.)
+    expect(screen.getAllByText("Analysis complete").length).toBeGreaterThan(0);
+  });
+
+  it("does NOT repeat what the terminal banner already says about missing AI providers", () => {
+    const state = applyDoneEvent(initialPipelineState(8), "completed", undefined, ["synthesize", "rag"], {
+      runMode: "deterministic-only",
+      degradations: [
+        { reason: "no-chat-provider", detail: "set ANTHROPIC_API_KEY or GEMINI_API_KEY" },
+        { reason: "no-embedding-provider", detail: "set VOYAGE_API_KEY or GEMINI_API_KEY" },
+      ],
+    });
+
+    render(<PipelinePanel state={state} />);
+    // The banner covers both, so no duplicate notices.
+    expect(screen.getAllByText("Deterministic analysis complete").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Onboarding guide unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText("Ask-the-repo unavailable")).not.toBeInTheDocument();
+  });
+
+  it("shows an uncovered reason alongside a covered one", () => {
+    const state = applyDoneEvent(initialPipelineState(8), "completed", undefined, ["rag"], {
+      runMode: "deterministic-only",
+      degradations: [
+        { reason: "no-embedding-provider", detail: "no embedding key" },
+        { reason: "mongo-unavailable", detail: "db down" },
+      ],
+    });
+
+    render(<PipelinePanel state={state} />);
+    expect(screen.queryByText("Ask-the-repo unavailable")).not.toBeInTheDocument(); // covered
+    expect(screen.getByText("Results are not being saved")).toBeInTheDocument(); // not covered
+  });
+
+  it("renders nothing extra when the run was not degraded", () => {
+    const state = applyDoneEvent(initialPipelineState(8), "completed");
+    render(<PipelinePanel state={state} />);
+    expect(document.querySelectorAll("[data-degradation]")).toHaveLength(0);
+  });
+});
+
+describe("uncoveredDegradations", () => {
+  it("treats budget-exhausted as covered by the banner", () => {
+    expect(
+      uncoveredDegradations([{ reason: "budget-exhausted", detail: "x" }], undefined, "budget-exhausted"),
+    ).toEqual([]);
+    // ...but NOT covered when the run did not end for that reason.
+    expect(uncoveredDegradations([{ reason: "budget-exhausted", detail: "x" }], undefined, undefined)).toHaveLength(1);
+  });
+
+  it("returns an empty list for no degradations", () => {
+    expect(uncoveredDegradations(undefined, ["rag"], undefined)).toEqual([]);
+    expect(uncoveredDegradations([], ["rag"], undefined)).toEqual([]);
+  });
+});
+

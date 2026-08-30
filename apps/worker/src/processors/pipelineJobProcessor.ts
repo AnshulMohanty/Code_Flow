@@ -19,13 +19,17 @@ import type {
   AnalysisJobPayload,
   AnalysisResult,
   BudgetHandle,
+  DegradationNotice,
+  DegradationReason,
   EventLogStore,
   JobStatus,
   PipelineInput,
   PipelineRunStatus,
   PipelineStage,
   PipelineStageId,
+  PipelineStatusReason,
   ProgressPublisher,
+  RunMode,
 } from "@codeflow/shared-types";
 import type { WorkerAnalysisService } from "../services/workerAnalysisService.js";
 
@@ -66,6 +70,10 @@ export interface PipelineJobOutcome {
   status: PipelineRunStatus;
   /** AI stages that never ran because no provider was configured (see skippedAiStages). */
   skippedStages: PipelineStageId[];
+  /** How much of the pipeline this run delivered (V3-P0). */
+  runMode: RunMode;
+  /** Typed reasons for a degraded run, mirrored onto the result + job. */
+  degradations: DegradationNotice[];
 }
 
 /** Human-readable note per skippable AI stage, appended to result.warnings. */
@@ -89,6 +97,42 @@ function skippedAiStages(deps: PipelineJobDependencies, result: AnalysisResult):
   if (!deps.synthesisClient && !result.ai?.synthesis) skipped.push("synthesize");
   if (!deps.embeddingClient && !result.ai?.rag) skipped.push("rag");
   return skipped;
+}
+
+/** The typed reason behind each skippable AI stage, paired with the human note above. */
+const AI_STAGE_DEGRADATION: Record<"synthesize" | "rag", DegradationReason> = {
+  synthesize: "no-chat-provider",
+  rag: "no-embedding-provider",
+};
+
+/**
+ * Classify the run's delivered SCOPE (V3-P0).
+ *
+ * A no-key run legitimately reports status "completed" — every stage that existed ran. What
+ * it is not is a full analysis, and `runStatus` has no way to say that. `runMode` does, in a
+ * form the UI can branch on rather than inferring from prose in `warnings[]`.
+ *
+ * `budget-exhausted` is included as a degradation reason because the wallet guard produces
+ * exactly the same user-visible shape (AI slices missing) from a different cause, and a
+ * banner that cannot tell them apart cannot tell the user what to do about it.
+ */
+function classifyRun(
+  skippedStages: PipelineStageId[],
+  statusReason: PipelineStatusReason | undefined,
+): { runMode: RunMode; degradations: DegradationNotice[] } {
+  const degradations: DegradationNotice[] = skippedStages
+    .filter((stage): stage is "synthesize" | "rag" => stage === "synthesize" || stage === "rag")
+    .map((stage) => ({ reason: AI_STAGE_DEGRADATION[stage], detail: AI_STAGE_NOTES[stage] }));
+
+  if (statusReason === "budget-exhausted") {
+    degradations.push({
+      reason: "budget-exhausted",
+      detail:
+        "The daily LLM budget was exhausted, so the AI stages were skipped. The deterministic analysis is complete; AI output returns when the budget resets (UTC midnight).",
+    });
+  }
+
+  return { runMode: degradations.length ? "deterministic-only" : "full", degradations };
 }
 
 /**
@@ -184,11 +228,22 @@ export async function runAnalysisJob(
     const notes = skippedStages
       .map((stage) => AI_STAGE_NOTES[stage as "synthesize" | "rag"])
       .filter((note) => note && !existingWarnings.includes(note));
-    const result: AnalysisResult = notes.length
+    const withWarnings: AnalysisResult = notes.length
       ? { ...ranResult, warnings: [...existingWarnings, ...notes] }
       : ranResult;
 
-    const status: PipelineRunStatus = cached ? "completed" : result.pipeline?.status ?? "completed";
+    const status: PipelineRunStatus = cached ? "completed" : withWarnings.pipeline?.status ?? "completed";
+    const statusReasonForMode = cached ? undefined : withWarnings.pipeline?.statusReason;
+
+    // V3-P0: classify the delivered SCOPE, not just the status. A no-key run is a legitimate
+    // "completed" that is nonetheless not a full analysis; `runMode` says so in a form the UI
+    // can branch on, and it rides the RESULT so it survives persistence and a later cache hit.
+    const { runMode, degradations } = classifyRun(skippedStages, statusReasonForMode);
+    const result: AnalysisResult = {
+      ...withWarnings,
+      runMode,
+      ...(degradations.length ? { degradations } : {}),
+    };
     let analysisId = cached ? result.id : undefined;
 
     const shouldSave = !cached && (status === "completed" || status === "partial");
@@ -204,12 +259,14 @@ export async function runAnalysisJob(
 
     // A guardrail outcome (repo-too-large / budget-exhausted) carries a distinct typed
     // reason so the UI can say "too large" / "at capacity" rather than a generic failure.
-    const statusReason = cached ? undefined : result.pipeline?.statusReason;
+    const statusReason = statusReasonForMode;
     await deps.service.updateJob(payload.jobId, {
       status: toJobStatus(status),
       runStatus: status,
       ...(statusReason ? { runStatusReason: statusReason } : {}),
       ...(skippedStages.length ? { skippedStages } : {}),
+      runMode,
+      ...(degradations.length ? { degradations } : {}),
       progress: 1,
       currentStep: cached ? "Cached analysis returned." : `Analysis ${status}.`,
       analysisId,
@@ -219,7 +276,7 @@ export async function runAnalysisJob(
 
     await deps.eventLog?.append(payload.jobId, { kind: "done", jobId: payload.jobId, status });
     await deps.publisher.publishDone(payload.jobId, status);
-    return { analysisId, cached, status, skippedStages };
+    return { analysisId, cached, status, skippedStages, runMode, degradations };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown analysis error.";
     await deps.service.updateJob(payload.jobId, {
