@@ -99,3 +99,36 @@ export const RRF_K = 60;
  *  leans relevant: aggressive diversification starts returning weakly-relevant chunks from
  *  unrelated files, which reads to a user as retrieval getting worse. */
 export const MMR_LAMBDA = 0.7;
+
+// -- Agentic Q&A + memory (V3-P3; P5-tunable) --------------------------------
+// The two loop bounds are the wallet and latency guard for the agent. An unbounded
+// tool-calling loop is the single most expensive failure mode in this codebase: each turn is a
+// paid call, and a model that keeps deciding "one more search" spends indefinitely. Both are
+// HARD caps enforced in code, never suggestions in a prompt.
+/** Max LLM turns per question, including the final answering turn. */
+export const AGENT_MAX_TURNS = 6;
+/** Max tool invocations per question, across all turns. Lower than turns x tools on purpose:
+ *  the interesting questions need 2-3 lookups, and 10 is already generous for a bad case. */
+export const AGENT_MAX_TOOL_CALLS = 10;
+/** Max characters of any single tool observation fed back into the prompt. A tool that returns
+ *  800 files must not be able to blow the context window; it is truncated with the count stated,
+ *  so the model knows it saw a prefix rather than silently believing it saw everything. */
+export const AGENT_MAX_TOOL_RESULT_CHARS = 4_000;
+/** Max consecutive unparseable model outputs before the agent gives up and refuses honestly. */
+export const AGENT_MAX_PARSE_RETRIES = 2;
+/** Max tool DESCRIPTIONS included in one prompt. Descriptions are the fixed per-call cost of
+ *  having tools at all, so curating them is the main context-budget lever (V3-P3 task 3). */
+export const AGENT_MAX_TOOLS_PER_STEP = 4;
+
+// Memory bounds. Memory feeds the prompt, so unbounded memory is a context-budget bug that
+// grows silently until requests cost several times what they used to.
+/** Turns kept per session. Older turns are dropped oldest-first. */
+export const SESSION_MAX_TURNS = 8;
+/** Resolved entities kept per session (most recent first). */
+export const SESSION_MAX_ENTITIES = 20;
+/** Retrieved chunk ids remembered per session. */
+export const SESSION_MAX_CHUNK_IDS = 200;
+/** Characters of an answer kept in memory. Memory is a prompt input, not an archive. */
+export const SESSION_MAX_ANSWER_CHARS = 600;
+/** Snapshots kept per repository. "What changed recently", not a full history. */
+export const REPO_MAX_SNAPSHOTS = 10;

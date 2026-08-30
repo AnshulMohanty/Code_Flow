@@ -23,12 +23,18 @@ importers:
 
   apps/api:
     dependencies:
+      '@codeflow/agents':
+        specifier: workspace:*
+        version: link:../../packages/agents
       '@codeflow/analyzers':
         specifier: workspace:*
         version: link:../../packages/analyzers
       '@codeflow/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@codeflow/memory':
+        specifier: workspace:*
+        version: link:../../packages/memory
       '@codeflow/retrieval':
         specifier: workspace:*
         version: link:../../packages/retrieval
@@ -154,6 +160,27 @@ importers:
         specifier: ^22.9.0
         version: 22.19.17
 
+  packages/agents:
+    dependencies:
+      '@codeflow/analyzers':
+        specifier: workspace:*
+        version: link:../analyzers
+      '@codeflow/config':
+        specifier: workspace:*
+        version: link:../config
+      '@codeflow/graph':
+        specifier: workspace:*
+        version: link:../graph
+      '@codeflow/memory':
+        specifier: workspace:*
+        version: link:../memory
+      '@codeflow/retrieval':
+        specifier: workspace:*
+        version: link:../retrieval
+      '@codeflow/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
+
   packages/analyzers:
     dependencies:
       '@codeflow/config':
@@ -210,6 +237,15 @@ importers:
 
   packages/graph:
     dependencies:
+      '@codeflow/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
+
+  packages/memory:
+    dependencies:
+      '@codeflow/config':
+        specifier: workspace:*
+        version: link:../config
       '@codeflow/shared-types':
         specifier: workspace:*
         version: link:../shared-types
