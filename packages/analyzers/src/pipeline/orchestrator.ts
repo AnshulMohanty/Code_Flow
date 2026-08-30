@@ -19,6 +19,7 @@ import type {
   StageStatus,
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
+import { deriveIssues } from "./issues.js";
 import { deriveSummary } from "./summary.js";
 
 /** A sink for progress events (e.g. the SSE writer in the worker). */
@@ -426,11 +427,11 @@ function seedSlicesFromResult(
   if (result.graph) slices.graph = result.graph;
   if (result.metrics) slices.metrics = result.metrics;
   if (result.summary) slices.summary = result.summary;
-  if (result.issues) slices.issues = result.issues;
-  // Orient's AI summary rides its (deterministic) stage; the true AI stages are seeded
-  // ONLY when covered, so an uncovered slice (e.g. a vector-space-mismatched RAG) is NOT
-  // hydrated — it must be rebuilt by the re-run, never returned stale if that re-run fails.
-  if (result.ai?.projectSummary) slices.aiProjectSummary = result.ai.projectSummary;
+  if (result.issues?.length) slices.issues = result.issues;
+  // The AI stages are seeded ONLY when covered, so an uncovered slice (e.g. a
+  // vector-space-mismatched RAG) is NOT hydrated — it must be rebuilt by the re-run, never
+  // returned stale if that re-run fails.
+  // (V3-P0 removed `aiProjectSummary`: it had no producer and no consumer — see AiAnalysis.)
   if (covered.has("synthesize") && result.ai?.synthesis) slices.aiSynthesis = result.ai.synthesis;
   if (covered.has("rag") && result.ai?.rag) slices.aiRag = result.ai.rag;
 }
@@ -476,7 +477,10 @@ function assembleResult(
     files: slices.graph?.nodes ?? slices.files ?? [],
     symbols: slices.symbols ?? [],
     dependencies: slices.dependencies ?? [],
-    issues: slices.issues ?? [],
+    // `issues` is DERIVED from Analyze's metrics at assembly (no stage owns it), the same
+    // pattern `summary` uses. Before V3-P0 it was an always-empty list that the web read in
+    // four places — an absent producer rendered as a finding of "no problems".
+    issues: slices.issues ?? deriveIssues(slices),
     metrics: slices.metrics ?? emptyMetrics(),
     graph: slices.graph,
     orientation: slices.orientation,
@@ -492,12 +496,11 @@ function assembleResult(
 }
 
 function buildAi(slices: Partial<AnalysisResultSlices>): AiAnalysis | undefined {
-  const { aiProjectSummary, aiSynthesis, aiRag } = slices;
-  if (!aiProjectSummary && !aiSynthesis && !aiRag) {
+  const { aiSynthesis, aiRag } = slices;
+  if (!aiSynthesis && !aiRag) {
     return undefined;
   }
   return {
-    projectSummary: aiProjectSummary,
     synthesis: aiSynthesis,
     rag: aiRag,
   };

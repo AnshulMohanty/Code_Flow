@@ -1,4 +1,5 @@
 import type { AnalysisResultSlices, AnalysisSummary, PipelineInput } from "@codeflow/shared-types";
+import { countIssues, deriveIssues } from "./issues.js";
 
 /**
  * Derive the `summary` slice at assembly time.
@@ -32,6 +33,11 @@ export function deriveSummary(input: PipelineInput, slices: Partial<AnalysisResu
 
   const health = metrics ? scoreHealth(metrics.summary) : null;
 
+  // V3-P0: `securityIssues`/`architectureViolations` were declared-but-never-set. They now
+  // come from the derived `issues` list, so the web reads real counts instead of undefined.
+  // securityIssues is structurally always 0 — no security analysis is performed (see issues.ts).
+  const issueCounts = metrics ? countIssues(deriveIssues({ metrics, graph: slices.graph })) : null;
+
   return {
     repository: input.repositoryRef,
     mode: input.mode,
@@ -42,6 +48,7 @@ export function deriveSummary(input: PipelineInput, slices: Partial<AnalysisResu
     healthGrade: health?.grade ?? null,
     ...(languages.length ? { languages } : {}),
     ...(metrics ? { circularDependencies: metrics.cycles.length } : {}),
+    ...(issueCounts ?? {}),
   };
 }
 

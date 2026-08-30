@@ -47,20 +47,34 @@ const orientStub: PipelineStage<"orientation"> = {
   },
 };
 
-// 2) A no-op stage that owns MULTIPLE slices (Orient also emits the AI 3-liner) —
-//    proves `owns` and the generic stay in lock-step across more than one key.
-const orientFull: PipelineStage<"orientation" | "aiProjectSummary"> = {
-  id: "orient",
+// 2) A no-op stage that owns MULTIPLE slices (Connect owns the graph plus the fileId-keyed
+//    projections) — proves `owns` and the generic stay in lock-step across more than one key.
+const connectFull: PipelineStage<"graph" | "entryPoints"> = {
+  id: "connect",
   kind: "deterministic",
-  label: "Orienting",
-  owns: ["orientation", "aiProjectSummary"],
-  async run(): Promise<StageResult<"orientation" | "aiProjectSummary">> {
+  label: "Connecting",
+  owns: ["graph", "entryPoints"],
+  async run(): Promise<StageResult<"graph" | "entryPoints">> {
     return {
       partial: {
-        orientation: { languages: ["TypeScript"], frameworks: [], projectType: "monorepo", manifests: [], readme: null },
-        aiProjectSummary: { text: "A TypeScript monorepo.", citations: [] },
+        graph: {
+          nodes: [
+            {
+              id: "apps/api/src/index.ts",
+              path: "apps/api/src/index.ts",
+              name: "index.ts",
+              layer: "source",
+              language: "TypeScript",
+              lines: 12,
+              symbolCount: 1,
+            },
+          ],
+          edges: [],
+          resolution: { resolved: 0, external: 0, unresolved: 0, externalModules: [], unresolvedImports: [] },
+        },
+        entryPoints: [{ fileId: "apps/api/src/index.ts", reason: "index" }],
       },
-      event: makeEvent("orient", 2, "ai"),
+      event: makeEvent("connect", 5, "deterministic"),
     };
   },
 };
@@ -98,11 +112,8 @@ type Envelope = Pick<
 >;
 
 function assemble(envelope: Envelope, slices: Partial<AnalysisResultSlices>): AnalysisResult {
-  const { aiProjectSummary, aiSynthesis, aiRag, ...deterministic } = slices;
-  const ai: AiAnalysis | undefined =
-    aiProjectSummary || aiSynthesis || aiRag
-      ? { projectSummary: aiProjectSummary, synthesis: aiSynthesis, rag: aiRag }
-      : undefined;
+  const { aiSynthesis, aiRag, ...deterministic } = slices;
+  const ai: AiAnalysis | undefined = aiSynthesis || aiRag ? { synthesis: aiSynthesis, rag: aiRag } : undefined;
   return { ...envelope, ...deterministic, ai };
 }
 
@@ -161,7 +172,7 @@ describe("pipeline stage contract", () => {
   });
 
   it("a couple of partials assemble into a valid AnalysisResult (det slice + AI slice)", async () => {
-    const det = await orientFull.run(
+    const det = await connectFull.run(
       { jobId: "job-1", repositoryRef: envelope.repository, mode: "public_hosted", analyzerVersion: "v1" },
       { repoPath: "/tmp/repo", commitSha: "abc1234", prior: {}, cache: { async get() { return null; }, async set() {} }, logger: { info() {}, warn() {}, error() {} }, signal: new AbortController().signal },
     );
@@ -173,9 +184,13 @@ describe("pipeline stage contract", () => {
     // Per-key assignment — deterministic keys onto the result, ai* keys under `ai`.
     const assembled: AnalysisResult = assemble(envelope, { ...det.partial, ...aiPart.partial });
 
-    expect(assembled.orientation?.projectType).toBe("monorepo");
-    expect(assembled.ai?.projectSummary?.text).toContain("TypeScript");
+    // Both keys the multi-slice stage owns landed on the result...
+    expect(connectFull.owns).toEqual(["graph", "entryPoints"]);
+    expect(assembled.graph?.nodes[0].id).toBe("apps/api/src/index.ts");
+    expect(assembled.entryPoints?.[0].fileId).toBe("apps/api/src/index.ts");
+    // ...and the ai* key nested under `ai` instead.
     expect(assembled.ai?.synthesis?.summary).toContain("apps/api");
+    expect(assembled.ai).not.toHaveProperty("projectSummary"); // removed in V3-P0
     // Untouched deterministic core stays intact and the shape is a full AnalysisResult.
     expect(assembled.summary.healthScore).toBeNull();
   });

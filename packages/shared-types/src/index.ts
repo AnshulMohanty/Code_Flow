@@ -166,7 +166,10 @@ export interface AnalysisResult {
   files: FileNode[]; // DERIVED view of graph.nodes at assembly (single FileNode[] home; not a stored slice)
   symbols: SymbolNode[]; // connect (fileId-keyed projection of inventory.symbols — deferred)
   dependencies: DependencyEdge[]; // connect (fileId-keyed; deferred — graph.edges is the edge home)
-  issues: Issue[]; // analyze
+  /** Deterministic structural findings DERIVED from `metrics` at assembly (cycles, blast
+   *  radius, coupling, isolation). Never AI, and never `category: "security"` — no security
+   *  analysis is performed, so a security finding here would be fabricated. */
+  issues: Issue[]; // derived (assembly)
   /** Deterministic graph metrics — centrality/key files, blast radius, cycles, coupling,
    *  complexity proxy (Analyze). Numbers only; no prose. */
   metrics: RepoMetrics; // analyze
@@ -840,9 +843,18 @@ export interface Rag {
   droppedChunks?: { count: number; fileIds: string[] };
 }
 
-/** The single AI slice. Each field is owned by exactly one AI stage. */
+/**
+ * The single AI slice. Each field is owned by exactly one AI stage.
+ *
+ * V3-P0 REMOVED `projectSummary` (and the `aiProjectSummary` slice key). It was a
+ * producerless slice: PLAN §4 sketched an "AI 3-line summary" for Orient, but Orient only
+ * ever owned `["orientation"]`, nothing wrote the field, and nothing read it. Meanwhile
+ * `Synthesis.summary` already answers "what is this project" — from the full deterministic
+ * fact set rather than the README alone — so the slot was redundant as well as empty.
+ * Reinstate it WITH its producer if Orient ever grows an AI step; a declared-but-unwritten
+ * field is worse than an absent one, because consumers cannot tell the difference.
+ */
 export interface AiAnalysis {
-  projectSummary?: ProjectSummary; // orient
   synthesis?: Synthesis; // synthesize
   rag?: Rag; // rag (stage 8 — RAG index)
 }
@@ -868,10 +880,12 @@ export interface AnalysisResultSlices {
   entryPoints: EntryPoint[]; // connect (deferred)
   dependencies: DependencyEdge[]; // connect (deferred)
   metrics: AnalysisResult["metrics"]; // analyze
-  issues: Issue[]; // analyze
-  summary: AnalysisSummary; // analyze
+  // `issues` and `summary` are DERIVED at assembly from the deterministic slices — no
+  // stage owns either. An explicit slice still wins if a stage ever produces one.
+  issues: Issue[]; // derived (assembly) from metrics
+  summary: AnalysisSummary; // derived (assembly) from graph + inventory + metrics
   // AI (assembled under result.ai.*)
-  aiProjectSummary: ProjectSummary;
+  // NOTE: `aiProjectSummary` was removed in V3-P0 — see AiAnalysis.
   aiSynthesis: Synthesis;
   aiRag: Rag;
 }

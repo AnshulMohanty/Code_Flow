@@ -17,6 +17,7 @@ export {
   type RepoSize,
 } from "./stages/ingest.js";
 export { deriveSummary, scoreHealth, type HealthVerdict } from "./pipeline/summary.js";
+export { countIssues, deriveIssues, type DeriveIssuesInput } from "./pipeline/issues.js";
 export {
   PipelineReasonError,
   RepoTooLargeError,
