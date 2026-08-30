@@ -1254,3 +1254,220 @@ aggregation bounds it, but it should be measured on a large repo alongside #8. A
 Next session: **V3 Phase 2 — retrieval** (real vector store + AST-aware chunks + hybrid/rerank), which
 needs infra (vector store + object storage) to be stood up first. Phase 0's §0.1/§0.4/§0.5 gaps
 (cost control plane, golden set, Arena) are still open and gate the Phase 1 eval claim.
+
+## 2026-08-30 — V3-P0 (BACKFILL): Foundations + Arena (branch `v3/p0-backfill-foundations-arena`)
+
+Phase 0 ran **AFTER** Phase 1 — out of plan order, deliberately. P1 (tree-sitter CPG + communities)
+did not depend on anything P0 builds, so it shipped first; the only thing that cost was P1's eval
+acceptance, which had no golden set to measure against and was carried as ledger #17. This session
+pays that back and builds the rest of the foundation. Branched off `v3/p1-treesitter-cpg` so it
+builds ON the shipped tree-sitter work rather than diverging from it. Five commits, one per task.
+
+**AUDIT FIRST (§0.2/§0.3 were partially done on Aug 28 — kept and finished, not redone).**
+
+*§0.3 — `summary` already had a real producer.* Commit `0ae0821` added `pipeline/summary.ts`
+(`deriveSummary` + `scoreHealth`), wired at assembly, with a 208-line test: `result.summary` derives
+files / functions / connections / languages / circularDependencies / healthScore from graph +
+inventory + metrics. Untouched. What was left was the plan's other half — `issues` and
+`aiProjectSummary`, both producerless.
+
+*§0.2 — the worst version of the trap was already gone.* Commit `fc3cfdf` had already killed
+"stages 7–8 sit at pending forever behind a run reporting completed": `skippedStages` on
+`JobProgress`, the worker's cache-hit-safe `skippedAiStages()`, env-var-naming notes appended to
+`result.warnings`, a `"skipped"` visual bucket in `PipelinePanel`, and honest banner copy. All kept.
+The gaps were (a) no machine-readable "this run was deterministic-only" — the UI had to infer
+capability from `runStatus`, which does not carry it, and (b) the Mongo fallback was **completely
+silent**. Also confirmed absent: a Redis `RateLimitStore` (interface + in-memory only), any usage
+read-back, prompt caching, and `packages/arena`.
+
+**Task 0.1 — cost as a control plane.** Four changes, all serving "no `Math.ceil(text.length/4)` on
+any paid path".
+
+*One token utility* (`analyzers/src/util/tokens.ts`). Deleted the three identical `estimateTokens`
+copies (synthesize.ts, rag.ts, rag/answer.ts). The module draws the line that mattered:
+`estimateTokens` is ADMISSION CONTROL only (you must guess a call's size before making it) and also
+drives the deterministic chunk plan; `TokenUsage` is the real cost read back after the call and the
+only thing a paid path hands `budget.record()`. The 4-chars/token rate is deliberately **unchanged** —
+`estimateTokens` moves RAG chunk boundaries, so tuning it would change every embedding and invalidate
+the index; that is a measured decision, not a refactor. **Judgment call:** did NOT add a local BPE
+tokenizer. This talks to Anthropic, Gemini and Voyage, whose vocabularies differ, so any single local
+tokenizer is precisely *wrong* for at least two of the three — and the provider bills us and reports
+what it billed. Grep confirms no `length / 4` outside the one utility.
+
+*Usage read-back (resolves ledger 14(b)).* `LlmClient.complete` now returns `{text, usage}` and
+`EmbeddingClient.embed` returns `{vectors, usage}`. All four fetch adapters read the real counters:
+Anthropic `input_tokens`/`output_tokens` + `cache_read`/`cache_creation`, Gemini
+`usageMetadata.promptTokenCount`/`candidatesTokenCount`/`cachedContentTokenCount`, Voyage
+`usage.total_tokens`. Parsed defensively (`usageNumber`) so a missing or string counter cannot record
+0 or NaN against the wallet. `TokenUsage.measured` is the honest half: **the Gemini batch-embed
+endpoint reports no usage today**, so that path is an ESTIMATE, says so, and the caller logs it —
+rather than being indistinguishable from a provider number.
+
+*Shared Redis budget (resolves the #9/14 split).* The worker counted in Mongo and the API counted in
+process memory, so "the global daily ceiling" was two ceilings that could not see each other's spend.
+Both now decrement one Redis counter keyed per (UTC day, billing unit) — per-unit because chat and
+embedding tokens are priced differently and exhaust independently. `check` **fails OPEN** on a Redis
+error with the error retrievable: a cache blip taking the whole AI surface down is worse than briefly
+overspending a margin, and the choice is explicit rather than accidental. The Mongo handle was
+**deleted** rather than left as a second persistent implementation of one counter.
+`@codeflow/analyzers` stays dependency-free — it declares a minimal `BudgetRedisLike` and the apps
+inject their own `ioredis`.
+
+*Redis rate limit (resolves ledger 14(c)).* `createRedisRateLimitStore` is the prod swap the
+interface's comment has promised since Guard 4 landed; the limit now holds across replicas and
+survives a restart. The window is derived arithmetically from `floor(now/windowMs)`, which keeps
+INCR+EXPIRE atomic with no Lua. Also fails open.
+
+*Prompt caching.* `LlmCompletionRequest.cachePrefix`; Anthropic gets an explicit `cache_control`
+breakpoint on a two-block system field, Gemini gets the prefix leading `systemInstruction` (it caches
+implicitly on a byte-identical prefix). A hit is READ BACK as `cacheReadTokens`, never assumed. Only
+SYSTEM_PROMPT is marked, and the code says why: the per-repo facts are already covered by the
+SHA-keyed completion cache, which is strictly cheaper than a provider cache hit (zero tokens vs
+discounted ones). Narrower than it looks, on purpose.
+
+**Task 0.2 — kill the in-process fallbacks (prod), keep tests hermetic.** New `RunMode`
+("full" | "deterministic-only") + `DegradationNotice[]` with typed `DegradationReason`s, computed by
+the worker's `classifyRun` and written to BOTH the job record and the RESULT, so the scope survives a
+reload and a later cache hit. **Judgment call:** deliberately NOT a value on `AnalysisMode`
+("public_hosted") — access mode and delivered scope are different axes, and overloading one makes
+both unreadable. `budget-exhausted` is a degradation reason too, because it produces the same
+user-visible shape (AI slices missing) from a different cause, and a banner that cannot tell them
+apart cannot tell the user what to do.
+
+New `apps/api/src/services/persistenceHealth.ts` surfaces `mongo-unavailable` naming MONGO_URI,
+merged into the job-progress projection at READ time — it is a property of the process right now, not
+of the job record, so a stored flag would go stale the moment Mongo came back. The web plumbs
+`runMode`/`degradations` through to `PipelineState`; the existing terminal banner is unchanged and a
+new `uncoveredDegradations` filter renders only what the banner does not already explain, so missing
+keys and budget exhaustion are not said twice while a dead database gets its own notice.
+
+**Task 0.3 — producerless slices.** Opposite verdicts, because the deciding question is whether
+anything CONSUMES them. `issues` — **PRODUCED**: it was read in four places by
+`apps/web/src/lib/analysisNormalizer.ts`, so an always-empty list was rendering as a finding of "no
+problems", and removing it would have meant ripping out working UI to hide a missing producer. New
+`pipeline/issues.ts` derives it from Analyze's metrics at assembly (same no-stage-owns-it pattern as
+`summary`): cycles by length, structural hubs as a SHARE of the repo and only once the repo is big
+enough for a share to mean anything, high coupling by absolute degree, and a mostly-disconnected
+graph collapsed into ONE dependency issue. **Deliberately no `category: "security"` issues, ever** —
+no security analysis is performed, so `summary.securityIssues` is now a real count that is
+structurally always 0, which is the honest answer. `aiProjectSummary` — **REMOVED**: no producer, no
+consumer, and `Synthesis.summary` already answers "what is this project" from the full fact set. A
+declared-but-unwritten field is worse than an absent one, because consumers cannot tell the
+difference; the intent to reinstate it *with* a producer is recorded on `AiAnalysis`. The
+shared-types contract test used `aiProjectSummary` as its multi-slice-ownership example and was
+re-pointed at a real multi-key stage (Connect owning `graph` + `entryPoints`).
+
+**Task 0.4 — eval-driven development (closes the dataset half of #17).** Answer-path scoring
+(`answerScore.ts`): the eval graded the INDEX only, so recall@k said the right chunks were *found*
+and nothing about whether the answer was grounded. Three new measures, two decided by code with no
+model: `citationValidity` (does each citation's file+line span sit inside a chunk the answer actually
+retrieved — an independent check that production grounding held), `citationRelevance` (cited real
+code, but the RIGHT real code?), and refusals split into JUSTIFIED vs UNJUSTIFIED, counted separately
+because an honest refusal and a real miss are different outcomes and one "answer rate" hides both.
+
+*Calibrated judge* (`judge.ts`). Faithfulness is the one measure string matching cannot decide, so it
+goes to an LLM judge — and the module's job is making sure that judge cannot quietly become the
+quality bar. `calibrateJudge` reports Cohen's **kappa**, not just raw agreement: with 19 of 20 labels
+"faithful", a judge that always says faithful scores 95% agreement while carrying zero information,
+and kappa scores it 0 (directly tested). `judgeIsGateable` requires sample size AND kappa AND a
+confidence-interval lower bound. `runEval` reports judge scores always and **refuses to fail a
+threshold on an uncalibrated one** — tested with a judge scoring 0 that still cannot fail the build.
+
+*Real golden set.* `datasets/chalk.json` (JS, 8q) and `datasets/requests.json` (Python, 10q), 14 with
+line-range truth. Both repos were **cloned at the pinned SHA and read** — every expectedFile and
+every line range verified against the actual file, nothing recalled. chalk exercises the JS grammar
+plus the subpath-imports case our resolver deliberately leaves unresolved; requests exercises Python
+with real mixins and inheritance, i.e. V3-P1's CPG edges. Each dataset records PROVENANCE, including
+that these numbers measure the V3-P1 tree-sitter pipeline and are **not** comparable against a
+pre-V3-P1 regex-parsed run.
+
+Both include a **negative control** — a question the repo cannot answer — and that exposed a real
+scoring bug: `aggregateRag` would have scored a zero-target question as recall 0, penalising exactly
+the refusal behaviour the control tests. Negative controls are now excluded from recall/MRR (and
+counted, so their presence stays visible) and genuinely scored on the answer path.
+
+*Validation.* `assertDatasetShape` is now real runtime validation at an untrusted file boundary (per
+the amended contract rule): full-40-hex commit pinning, schema version, duplicate ids, POSIX-relative
+paths, non-inverted 1-based ranges. Every check exists because getting it wrong yields a silently
+WRONG SCORE rather than a crash — an impossible line range can never be hit, so it reads as a
+permanent retrieval failure instead of the authoring mistake it is.
+
+*CI split.* `ci.yml` gains a keyless `eval check` step (validation + determinism + coverage of both
+parser families) beside P1's parity step. The scored run moved to a separate manual-dispatch
+`eval-scored.yml` with an approval environment, a concurrency lock (two concurrent runs double the
+spend for no extra information), and `fail-on-threshold` defaulting to **false** — the thresholds are
+still placeholders and gating on uncalibrated numbers is what this phase exists to stop.
+`EVAL_THRESHOLDS` gained the answer-path values, all marked PLACEHOLDER with a TODO naming what
+calibrates them.
+
+**Task 0.5 — Arena skeleton (`@codeflow/arena`).** `TaskSpec` / `Sandbox` / `AgentHarness` /
+`Verifier` / `Reward` as typed interfaces + a contract test (repo convention; no zod, and no runtime
+validation — a sandbox built in-process from an already-validated result is not an untrusted
+boundary). A `Sandbox` is a frozen result at a pinned SHA exposing only reads; loading is injected so
+production reuses the existing SHA-keyed cache, a null means "not cached" rather than "analyze on
+demand", and a SHA mismatch is refused rather than silently compared.
+
+The **graph oracle** answers five kinds exactly with zero LLM calls: imports-of, who-calls,
+blast-radius, entry-points, cycle-through. `who-calls` is only possible because of V3-P1 — before the
+CPG there were no call edges, so the only honest answer was "we know who imports it"; the tests pin
+the distinction with a file that is imported but never called through. `blast-radius` reuses
+`@codeflow/graph`'s own traversal so the oracle and the product cannot drift on what "affected"
+means. The oracle also implements `AgentHarness`, which makes it **self-checkable**: run it as the
+agent, grade it with itself, 1.0 on every kind is the minimum bar — if that round trip ever fails,
+derivation and comparison have drifted and every Arena score is suspect.
+
+The **three grounding passes** are wrapped as reusable verifiers. They stay enforced in production
+where they belong (grounding must be enforced at the point of production, not merely measured after);
+what was missing was a way for the eval and the Arena to apply the same rule without a fourth copy
+drifting. `runArenaTask` requires EVERY applicable verifier to pass, not the mean to clear a bar: a
+correct answer citing a file that does not exist is not 80% correct, it is ungrounded. No verifier ran
+⇒ NOT a pass; silence is not success.
+
+**Contract / type changes.** `TokenUsage`, `BudgetUnit`; `BudgetHandle.check/record` take a unit and
+`record` accepts a `TokenUsage`; `LlmCompletionResult`, `EmbeddingResult`,
+`LlmCompletionRequest.cachePrefix`; `RunMode`, `DegradationReason`, `DegradationNotice`;
+`AnalysisResult.runMode?`/`degradations?` and the same on `JobProgress`; `DatasetProvenance` +
+`EvalDataset.provenance?`; `PerQuestionResult.negativeControl`, `RagScores.negativeControlCount`;
+`EvalThresholds` + 3 answer-path fields; `AiAnalysis.projectSummary` and the `aiProjectSummary` slice
+key **removed**. New deps: `ioredis` (apps/api, apps/worker — explicit, not BullMQ's transitive),
+`@codeflow/config` (packages/eval), and the new `@codeflow/arena` package.
+
+**Verification — all gates green.** `pnpm -r typecheck`, `pnpm -r lint`, `pnpm test` (serial),
+`pnpm -r build`, `node --test tests/*.mjs` (25/25), the keyless `pnpm --filter @codeflow/eval run
+parity` and `run check`, `docker compose config --quiet`, and the worker + api images rebuilt to
+confirm the `ioredis` addition did not break the `node:20-slim` runtime.
+
+Per-package tests — **380 → 526 (+146)**: analyzers **231** (+33), eval **76** (+49),
+**arena 43 (new package)**, api **39** (+12), web **60** (+9), worker 13 (unchanged count, +4
+assertions inside existing tests), graph 33, parsers 28, shared-types 3. Legacy 25/25. Everything
+stayed hermetic: no test touches Redis, Mongo, a provider, or the network — the Redis stores are
+driven by injected fakes and in-memory remains the default everywhere.
+
+**Judgment calls flagged.** (1) No local tokenizer — argued above; provider usage is authoritative
+and a single local vocabulary would be wrong for two of three providers. (2) Both Redis stores FAIL
+OPEN; explicit, logged, and defended in comments rather than being a silent default. (3) `runMode` is
+a new field, not a new `AnalysisMode` value. (4) `issues` produced, `aiProjectSummary` removed —
+opposite verdicts on the same class of problem, decided by whether a consumer exists. (5) No
+`category: "security"` issue is ever emitted. (6) The scored-eval runner grades a result you already
+produced rather than cloning and analyzing itself: the cloner/queue/provider wiring lives in
+apps/worker and the run needs the owner's key, so duplicating that machinery in `@codeflow/eval`
+would be worse than an explicit input contract — it fails with the exact instruction. (7) The judge
+ships with **no** human labels, so it is advisory by construction; authoring labels is what promotes
+it to a gate.
+
+**Ledger.** **RESOLVED: 14(b)** (real provider usage replaces the estimate), **14(c)** (Redis
+rate-limit store), **#9's remaining sub-item** (the Q&A budget is now shared with the worker — the
+answer CACHE is still per-API-process, carried below), **#19** (the zod invariant was amended, and
+this phase followed it: typed interfaces + contract tests, with runtime validation only at untrusted
+boundaries — the dataset loader). **#17 PARTIALLY resolved**: the golden set now exists and is
+CI-validated; the SCORED comparison is still owed and is a manual step (needs the owner's key). New
+carries: **#21** the Q&A answer cache is still per-API-process (only the budget is shared); **#22** the
+Gemini batch-embed endpoint reports no usage, so that one path is an honest estimate flagged
+`measured: false` — revisit if Google adds `usageMetadata`; **#23** no human judge labels exist yet,
+so faithfulness cannot gate; **#24** `EVAL_THRESHOLDS` are placeholders pending the scored run;
+**#25** the Redis budget/rate-limit stores and `redisClient.ts` are integration-only (hermetically
+tested against fakes, never against a real server).
+
+Next session: **V3 Phase 2 — retrieval** (real vector store + AST-aware chunks + hybrid/rerank).
+It needs infra stood up first (vector store + object storage); Phase 0 and Phase 1 are now both
+complete, so Phase 2's entry gate is satisfied on the code side.
