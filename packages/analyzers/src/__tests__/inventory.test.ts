@@ -231,6 +231,52 @@ describe("inventory — entry-point detection", () => {
   });
 });
 
+describe("inventory — tree-sitter engine (V3-P1)", () => {
+  // Guards the integration, not the parser: Inventory must actually load the grammars
+  // (`registry.ready()`) so the pipeline gets tree-sitter accuracy rather than silently
+  // falling back to regex. Each assertion below is something regex parsing cannot produce.
+  it("surfaces class methods as symbols (regex parsing never produced these for TS)", async () => {
+    const source = `export class Repo {
+  find(id: string) {
+    return id;
+  }
+
+  save(row: string) {
+    return row;
+  }
+}
+`;
+    const inv = await inventory([{ path: "src/repo.ts", content: source }]);
+    const byName = Object.fromEntries(inv.symbols.map((symbol) => [symbol.name, symbol]));
+
+    expect(byName.Repo).toMatchObject({ kind: "class", line: 1, exported: true });
+    expect(byName.find).toMatchObject({ kind: "method", line: 2, exported: false });
+    expect(byName.save).toMatchObject({ kind: "method", line: 6 });
+  });
+
+  it("gives symbols a real endLine, which tightens the RAG chunk plan", async () => {
+    const source = `export function wide() {
+  return 1;
+}
+`;
+    const inv = await inventory([{ path: "src/wide.ts", content: source }]);
+    expect(inv.symbols[0]).toMatchObject({ name: "wide", line: 1, endLine: 3 });
+  });
+
+  it("records unexported top-level values", async () => {
+    const inv = await inventory([{ path: "src/consts.ts", content: `const LIMIT = 10;\n` }]);
+    expect(inv.symbols).toEqual([expect.objectContaining({ name: "LIMIT", kind: "variable", exported: false })]);
+  });
+
+  it("does not fabricate a symbol from a commented-out declaration", async () => {
+    const source = `// export function ghost() {}
+export function real() {}
+`;
+    const inv = await inventory([{ path: "src/quiet.ts", content: source }]);
+    expect(inv.symbols.map((symbol) => symbol.name)).toEqual(["real"]);
+  });
+});
+
 describe("inventory — completeness & resilience", () => {
   it("returns the FULL symbol list uncapped", async () => {
     const lines: string[] = [];

@@ -45,6 +45,12 @@ jobs:
       - name: Build
         run: pnpm -r build
 
+      # V3-P1 acceptance gate: grades the tree-sitter engine against the regex baseline on
+      # AUTHORED ground truth. Hermetic (local grammar wasm, no keys, no clone), so unlike
+      # the scored `pnpm eval` it belongs in CI. Prints the report and fails on a regression.
+      - name: Parser parity (tree-sitter vs regex)
+        run: pnpm --filter @codeflow/eval run parity
+
       - name: Legacy root tests
         run: node --test tests/*.mjs
 

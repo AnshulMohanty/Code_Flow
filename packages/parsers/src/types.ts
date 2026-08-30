@@ -35,4 +35,12 @@ export interface ParseRepositoryOptions {
   maxFileSizeKB?: number;
 }
 
+/** Regex/line-scanning parsers (the fallback engine). */
 export const PARSER_VERSION = "parser-v1";
+
+/**
+ * tree-sitter (WASM) parsers — the default engine for every language with a loaded
+ * grammar. `ParsedFile.parserVersion` therefore says which engine produced a result,
+ * so a silent fallback to regex is always visible in the output.
+ */
+export const TREE_SITTER_PARSER_VERSION = "treesitter-v1";

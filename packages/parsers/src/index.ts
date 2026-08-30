@@ -7,6 +7,19 @@ export { genericParser } from "./parsers/genericParser.js";
 export { javascriptParser } from "./parsers/javascriptParser.js";
 export { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 export { pythonParser } from "./parsers/pythonParser.js";
+export { createTreeSitterParser, parseTreeSitterFile } from "./treesitter/parseTreeSitter.js";
+export {
+  hasGrammar,
+  initTreeSitter,
+  resetTreeSitterForTests,
+  treeSitterStatus,
+  TREE_SITTER_LANGUAGES,
+  type InitTreeSitterOptions,
+  type TreeSitterLanguageId,
+  type TreeSitterStatus,
+  type WasmLocator,
+} from "./treesitter/runtime.js";
+export { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "./types.js";
 export type {
   DiscoveredSourceFile,
   ParseFileInput,

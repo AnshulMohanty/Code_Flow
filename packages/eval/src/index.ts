@@ -29,3 +29,20 @@ export {
   type EvalReport,
   type RunEvalOptions,
 } from "./runEval.js";
+// Parser parity (V3-P1): grades the tree-sitter engine against the regex baseline on
+// AUTHORED ground truth. Hermetic — no keys, no clone — so unlike `runEval` it gates in CI.
+export { PARITY_CORPUS, type ParityCase } from "./parity/corpus.js";
+export {
+  createRegexRegistry,
+  createTreeSitterRegistry,
+  metric,
+  PARITY_GATES,
+  runParserParity,
+  type ParityCaseResult,
+  type ParityDimension,
+  type ParityEngine,
+  type ParityEngineSummary,
+  type ParityMeasure,
+  type ParityMetric,
+  type ParityReport,
+} from "./parity/parserParity.js";

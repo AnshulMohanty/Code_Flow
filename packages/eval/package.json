@@ -19,10 +19,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
     "test": "vitest run --passWithNoTests",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "preparity": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "parity": "tsx src/parity/cli.ts"
   },
   "dependencies": {
     "@codeflow/analyzers": "workspace:*",
+    "@codeflow/parsers": "workspace:*",
     "@codeflow/shared-types": "workspace:*"
   },
   "devDependencies": {

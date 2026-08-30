@@ -9,7 +9,7 @@
  * OUTPUT changes, which is not the same cadence as a release. `ANALYZER_VERSION` in the
  * environment still overrides it for ad-hoc cache namespacing.
  */
-export const ANALYZER_VERSION = "1.0.0";
+export const ANALYZER_VERSION = "1.1.0";
 
 export const DEFAULT_API_PORT = 4000;
 export const DEFAULT_WEB_PORT = 5173;
@@ -30,6 +30,14 @@ export const MAX_BYTES = 512 * 1024 * 1024; // 512 MB
 // Guard 2 — parsing concurrency (Inventory).
 /** Max files parsed concurrently (bounds memory + CPU on a big repo). */
 export const PARSE_CONCURRENCY = 8;
+
+// Guard 2b — tree-sitter file-size ceiling (parsers).
+/**
+ * Files larger than this are parsed by the REGEX fallback instead of tree-sitter. A byte
+ * ceiling, deliberately not a clock: a time-based bail-out would make the deterministic
+ * spine non-deterministic (the same file could parse on one run and fall back on the next).
+ */
+export const TREE_SITTER_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 
 // Guard 3 — per-file parse timeout (Inventory).
 /** A single file's read+parse is abandoned (recorded unparsed) after this many ms. */
