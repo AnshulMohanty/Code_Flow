@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AskRepo } from "./AskRepo";
 import { askRepo, ApiClientError, type AskResponse } from "../../lib/apiClient";

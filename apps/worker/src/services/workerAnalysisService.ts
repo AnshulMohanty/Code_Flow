@@ -1,6 +1,5 @@
-import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, BudgetHandle, DegradationNotice, EventLogStore, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressMessage, RunMode } from "@codeflow/shared-types";
+import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, DegradationNotice, EventLogStore, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressMessage, RunMode } from "@codeflow/shared-types";
 import path from "node:path";
-import { DAILY_LLM_BUDGET } from "@codeflow/config";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 
@@ -142,16 +141,6 @@ const llmCacheSchema = new Schema(
   { strict: true, timestamps: { createdAt: true, updatedAt: false } },
 );
 
-// Global daily LLM budget (Guard 5, the wallet ceiling). One doc per UTC day; a new day
-// gets a fresh doc (spent 0) — that IS the reset. Shared across worker instances.
-const llmBudgetSchema = new Schema(
-  {
-    day: { type: String, required: true, unique: true, index: true }, // UTC YYYY-MM-DD
-    spent: { type: Number, required: true, default: 0 },
-  },
-  { strict: true, timestamps: true },
-);
-
 // SSE replay buffer (#20): one doc per emitted ProgressMessage; `seq` preserves emit order.
 // The API reads this same "jobevents" collection to replay a job from Ingest.
 const eventLogSchema = new Schema(
@@ -168,7 +157,6 @@ const RepoModel = models.Repo || model("Repo", repoSchema, "repos");
 const AnalysisModel = models.Analysis || model("Analysis", analysisSchema, "analyses");
 const JobModel = models.Job || model("Job", jobSchema, "jobs");
 const LlmCacheModel = models.LlmCache || model("LlmCache", llmCacheSchema, "llmcache");
-const LlmBudgetModel = models.LlmBudget || model("LlmBudget", llmBudgetSchema, "llmbudget");
 const EventLogModel = models.JobEvent || model("JobEvent", eventLogSchema, "jobevents");
 
 /**

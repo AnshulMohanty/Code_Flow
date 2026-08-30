@@ -74,7 +74,7 @@ describe("Sandbox", () => {
   });
 
   it("a SandboxLoader resolves a repo+sha to a frozen analysis or null", async () => {
-    const loader: SandboxLoader = async (repo, sha) => (sha === result.commitSha ? result : null);
+    const loader: SandboxLoader = async (_repo, sha) => (sha === result.commitSha ? result : null);
     expect(await loader(result.repository, result.commitSha!)).not.toBeNull();
     expect(await loader(result.repository, "b".repeat(40))).toBeNull();
   });

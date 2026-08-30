@@ -1,6 +1,6 @@
 import type { DependencyEdge, ParsedExport, ParsedImport, ParsedSymbol } from "@codeflow/shared-types";
 import { resolvePythonImport } from "../resolution/importResolver.js";
-import type { ParseFileInput, ParserAdapter } from "../types.js";
+import type { ParserAdapter } from "../types.js";
 import { PARSER_VERSION } from "../types.js";
 import { countLoc, indentationOf, lineNumber, splitLines } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
