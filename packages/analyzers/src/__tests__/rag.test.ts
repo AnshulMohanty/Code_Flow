@@ -10,6 +10,12 @@ import type {
   RepoStructure,
   TokenUsage,
 } from "@codeflow/shared-types";
+import {
+  createMemoryChunkTextStore,
+  createMemoryVectorStore,
+  type ChunkTextStore,
+  type VectorStore,
+} from "@codeflow/retrieval";
 import { createRagStage } from "../stages/rag.js";
 import { createSynthesizeStage } from "../stages/synthesize.js";
 import { createIngestStage, type RepoCloner } from "../stages/ingest.js";
@@ -173,14 +179,32 @@ function ctxFor(
   };
 }
 
-function runRag(
+/**
+ * The hermetic store pair, in the CLIENT's embedding space (V3-P2).
+ *
+ * Derived from the client rather than hardcoded so the stage's homogeneity guard is exercised
+ * with matching spaces in the happy path — the mismatch cases construct a deliberately wrong
+ * store instead.
+ */
+function storesFor(client: EmbeddingClient): { vectorStore: VectorStore; textStore: ChunkTextStore } {
+  return {
+    vectorStore: createMemoryVectorStore({ embeddingModel: client.model, embeddingDim: client.dimension }),
+    textStore: createMemoryChunkTextStore(),
+  };
+}
+
+/** Run the stage and hand back the stores it wrote into, so a test can read the heavy fields
+ *  from where they now actually live. */
+async function runRag(
   ctx: PipelineContext,
   readFile: ReturnType<typeof fakeReadFile>,
   client: EmbeddingClient,
   overrides: { maxAttempts?: number; maxChunkTokens?: number; windowLines?: number } = {},
 ) {
-  const stage = createRagStage({ client, readFile, now: () => 1000, ...overrides });
-  return stage.run(input, ctx);
+  const stores = storesFor(client);
+  const stage = createRagStage({ client, ...stores, readFile, now: () => 1000, ...overrides });
+  const run = await stage.run(input, ctx);
+  return { ...run, ...stores };
 }
 
 // ---------------------------------------------------------------------------
@@ -207,13 +231,61 @@ describe("rag — symbol-aligned chunking + window fallback", () => {
     expect(readFile).not.toHaveBeenCalledWith("/repo", "tsconfig.json");
   });
 
-  it("chunk text matches the cited line range, and every chunk carries a vector", async () => {
+  it("chunk text matches the cited line range, and every chunk is stored with a vector", async () => {
+    const { ctx, readFile } = ctxFor();
+    const { partial, vectorStore, textStore } = await runRag(ctx, readFile, mockEmbedClient());
+    const rag = partial.aiRag!;
+    const foo = rag.chunks.find((c) => c.symbolName === "foo")!;
+    const namespace = rag.store!.namespace;
+
+    // The TEXT still matches the cited range exactly — it just lives in the text store now.
+    const texts = await textStore.get(namespace, [foo.id]);
+    expect(texts.get(foo.id)).toBe(["export function foo() {", "  return 1;", "}"].join("\n"));
+    expect(foo.tokenCount).toBeGreaterThan(0);
+    // Every chunk got a vector, and the vector store holds exactly the plan.
+    expect(await vectorStore.count(namespace)).toBe(rag.chunkCount);
+  });
+
+  it("the PERSISTED slice carries no text and no embeddings (the 16MB-BSON fix, asserted)", async () => {
+    // This is V3-P2's acceptance criterion, and it is asserted structurally rather than
+    // trusted: the whole point of the change is that what goes into Mongo grows with the
+    // chunk COUNT and not with the embedding dimension. A regression here would be invisible
+    // until a real repo blew the document limit.
     const { ctx, readFile } = ctxFor();
     const { partial } = await runRag(ctx, readFile, mockEmbedClient());
-    const foo = partial.aiRag!.chunks.find((c) => c.symbolName === "foo")!;
-    expect(foo.text).toBe(["export function foo() {", "  return 1;", "}"].join("\n"));
-    expect(foo.embedding).toHaveLength(4);
-    expect(foo.tokenCount).toBeGreaterThan(0);
+    const rag = partial.aiRag!;
+    for (const chunk of rag.chunks) {
+      const loose = chunk as unknown as Record<string, unknown>;
+      expect(loose.text).toBeUndefined();
+      expect(loose.embedding).toBeUndefined();
+    }
+    // A round trip through JSON is what persistence actually does; no vector may survive it.
+    expect(JSON.stringify(rag)).not.toContain("embedding\"");
+    // And the slice names WHERE the heavy fields went, so a mismatch is diagnosable.
+    expect(rag.store).toEqual({
+      namespace: expect.stringContaining("acme/repo@sha-1"),
+      vectorStoreId: "memory-vector-store",
+      textStoreId: "memory-chunk-text-store",
+    });
+  });
+
+  it("re-indexing the same SHA replaces the namespace rather than accumulating in it", async () => {
+    // Without the drop-before-upsert, a chunking change would leave the previous run's chunk
+    // ids behind — still searchable, still citing ranges the current plan never produced.
+    const client = mockEmbedClient();
+    const stores = storesFor(client);
+    const stage = createRagStage({ client, ...stores, readFile: fakeReadFile(), now: () => 1000 });
+
+    const first = await stage.run(input, ctxFor().ctx);
+    const namespace = first.partial.aiRag!.store!.namespace;
+    const countAfterFirst = await stores.vectorStore.count(namespace);
+
+    // Second pass with a much smaller window ⇒ a DIFFERENT (larger) chunk set for the docs
+    // file, i.e. new ids alongside the old ones if nothing dropped them.
+    const narrow = createRagStage({ client, ...stores, readFile: fakeReadFile(), now: () => 1000, windowLines: 1 });
+    const second = await narrow.run(input, ctxFor().ctx);
+    expect(await stores.vectorStore.count(namespace)).toBe(second.partial.aiRag!.chunkCount);
+    expect(second.partial.aiRag!.chunkCount).not.toBe(countAfterFirst);
   });
 });
 
@@ -259,6 +331,23 @@ describe("rag — grounding (enforced by code)", () => {
     const struct: RepoStructure = { layout: "flat", fileCount: 1, files: [{ path: "src/orphan.ts", ext: ".ts", role: "source", language: "TypeScript", sizeBytes: 40 }] };
     const { ctx, readFile } = ctxFor({ graphIds: ["src/a.ts"], structure: struct });
     await expect(runRag(ctx, readFile, mockEmbedClient())).rejects.toThrow(/no grounded chunks/);
+  });
+});
+
+describe("rag — store homogeneity guard", () => {
+  it("throws when the vector store is in a different embedding space than the client", async () => {
+    const client = mockEmbedClient(4);
+    const { ctx, readFile } = ctxFor();
+    const stage = createRagStage({
+      client,
+      // 8-dim store, 4-dim client: cosine would still return numbers, so nothing downstream
+      // would ever notice. Caught at the write boundary instead.
+      vectorStore: createMemoryVectorStore({ embeddingModel: "mock-embed", embeddingDim: 8 }),
+      textStore: createMemoryChunkTextStore(),
+      readFile,
+      now: () => 1000,
+    });
+    await expect(stage.run(input, ctx)).rejects.toThrow(/vector store/);
   });
 });
 
@@ -365,12 +454,17 @@ describe("rag — determinism", () => {
 });
 
 describe("rag — plain-serializable", () => {
-  it("JSON.stringify(result.ai.rag) round-trips (no live vector object)", async () => {
+  it("JSON.stringify(result.ai.rag) round-trips, carrying the store reference", async () => {
+    // Pre-V3-P2 this test also asserted `chunks[0].embedding` was an array — the point then
+    // being "a plain number[], not a live vector object". P2 removed the field entirely, so the
+    // property worth pinning is now the other half: the slice still survives persistence, and
+    // it still says WHERE the heavy fields went. (That no vector remains is asserted directly
+    // in "the PERSISTED slice carries no text and no embeddings".)
     const { ctx, readFile } = ctxFor();
     const { partial } = await runRag(ctx, readFile, mockEmbedClient());
     const roundTripped = JSON.parse(JSON.stringify(partial.aiRag));
     expect(roundTripped).toEqual(partial.aiRag);
-    expect(Array.isArray(roundTripped.chunks[0].embedding)).toBe(true);
+    expect(roundTripped.store.namespace).toBe(partial.aiRag!.store!.namespace);
   });
 });
 
@@ -446,7 +540,7 @@ describe("rag — AI error contract (via orchestrator)", () => {
     const ingest = createIngestStage({ cloner, now: () => 1 });
     const synth = createSynthesizeStage({ client: goodLlm(), now: () => 1 });
     const failing: EmbeddingClient = { provider: "voyage", model: "mock-embed", dimension: 4, async embed() { throw new Error("voyage down"); } };
-    const rag = createRagStage({ client: failing, readFile: fakeReadFile(), now: () => 1, maxAttempts: 2 });
+    const rag = createRagStage({ client: failing, ...storesFor(failing), readFile: fakeReadFile(), now: () => 1, maxAttempts: 2 });
 
     const { result } = await runPipeline([ingest, struct.stage, inv.stage, connect.stage, synth, rag], input, { now: makeClock() });
 
@@ -474,7 +568,8 @@ describe("rag — no-clone AI-only retry (via orchestrator)", () => {
     const clone = vi.fn(async () => ({ repoPath: "/repo", commitSha: "sha-1" }));
     const ingest = createIngestStage({ cloner: { clone }, now: () => 1 });
     const retryReadFile = fakeReadFile();
-    const rag = createRagStage({ client: mockEmbedClient(), readFile: retryReadFile, now: () => 1 });
+    const retryClient = mockEmbedClient();
+    const rag = createRagStage({ client: retryClient, ...storesFor(retryClient), readFile: retryReadFile, now: () => 1 });
     const stages: PipelineStage[] = [ingest, connect.stage, analyze.stage, rag];
 
     const cached = {
@@ -529,7 +624,7 @@ describe("rag — index homogeneity (mismatched embedding space ⇒ rebuild, not
     const retryReadFile = fakeReadFile();
     // Current selection is Gemini (different model + dim from the cached voyage slice).
     const gemini = mockEmbedClient(768, "gemini", "gemini-embedding-001");
-    const rag = createRagStage({ client: gemini, readFile: retryReadFile, now: () => 1 });
+    const rag = createRagStage({ client: gemini, ...storesFor(gemini), readFile: retryReadFile, now: () => 1 });
     const stages: PipelineStage[] = [ingest, connect.stage, analyze.stage, rag];
 
     // Cached result CLAIMS rag in producedBy, but its slice was embedded with voyage-code-3/1024.

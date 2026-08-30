@@ -792,14 +792,44 @@ export interface Synthesis {
 }
 
 /**
- * One embedded chunk of repository content (RAG / stage 8). Derived from an inventory
- * symbol (symbol-aware) or a fixed window (docs / uncovered source regions), so every
- * chunk inherits a REAL `fileId` + line range and its citations are grounded by
- * construction. `embedding` is a plain number[] (serializable — no live vector object),
- * needed by the future ask-the-repo query path together with `text`.
+ * V3-P2 AST enrichment for a chunk: what the tree-sitter CPG knows about the code in this
+ * line range, beyond the raw bytes.
+ *
+ * WHY IT EXISTS. A window of lines torn out of the middle of a class embeds badly: the vector
+ * sees a method body with no idea which class it belongs to, what it is called, or what it
+ * documents. Prepending that context to the EMBEDDING INPUT (never to the stored `text` — see
+ * `RagChunk.text`) puts the identifying words into the vector, which is what makes a query
+ * naming the class or the symbol find the chunk at all.
+ *
+ * Every field is DERIVED DETERMINISTICALLY from the deterministic spine (inventory symbols +
+ * the file bytes). No model produces any of it, so the chunk plan stays byte-reproducible.
+ */
+export interface ChunkEnrichment {
+  /** Enclosing symbol chain, outermost first (e.g. ["AuthService"] for one of its methods). */
+  scope?: string[];
+  /** The symbol's declaration line, trimmed — signature, not body. */
+  signature?: string;
+  /** The leading doc comment / docstring, comment markers stripped, truncated. */
+  docstring?: string;
+  /** Language label (matches RepoFile.language), e.g. "TypeScript". */
+  language?: string;
+}
+
+/**
+ * Chunk METADATA (RAG / stage 8). Derived from an inventory symbol (symbol-aware) or a fixed
+ * window (docs / uncovered source regions), so every chunk inherits a REAL `fileId` + line
+ * range and its citations are grounded by construction.
+ *
+ * V3-P2 REMOVED `text` and `embedding` from this type. They were the two heavy fields, and
+ * they lived inside the analysis document: a 1024-dim vector is roughly 8KB of JSON per chunk,
+ * so a mid-sized repo exceeded Mongo's 16MB BSON limit, and every read of an analysis dragged
+ * the whole index across the wire. Both now live in `@codeflow/retrieval`'s stores, keyed by
+ * (namespace, chunk id) — see `Rag.store`. What remains here is exactly what a CITATION needs
+ * (file + line range) plus what a plan/report needs, which is why this slice is still worth
+ * persisting at all. The chunk `id` is UNCHANGED, so it is the join key between the two.
  */
 export interface RagChunk {
-  /** Deterministic: `${fileId}#${startLine}-${endLine}`. */
+  /** Deterministic: `${fileId}#${startLine}-${endLine}`. Also the store key. */
   id: string;
   /** Repo-relative POSIX path; MUST exist in graph.nodes (grounding). */
   fileId: string;
@@ -809,11 +839,24 @@ export interface RagChunk {
   endLine: number;
   /** Set when the chunk aligns to an inventory symbol. */
   symbolName?: string;
-  /** Chunk content (needed by the future query path; uncapped). */
-  text: string;
-  /** The embedding vector (plain serializable; no live vector object). */
-  embedding: number[];
   tokenCount: number;
+  /** V3-P2 AST enrichment, when derivable. Absent is normal (e.g. a docs window). */
+  enrichment?: ChunkEnrichment;
+}
+
+/**
+ * Where an index's heavy fields actually live (V3-P2). Present on every index built from P2
+ * onward; ABSENT on a pre-P2 index, which is the signal that it was inline and is therefore
+ * unreadable by the current query path and must be rebuilt.
+ */
+export interface RagStoreRef {
+  /** The canonical namespace both stores are keyed by (see `retrievalNamespace`). */
+  namespace: string;
+  /** Which vector store holds the vectors, e.g. "pgvector:codeflow_vectors_1024". Recorded
+   *  so a mismatch between the index and the configured store is diagnosable, not mysterious. */
+  vectorStoreId: string;
+  /** Which text store holds the chunk text, e.g. "postgres:codeflow_chunk_text". */
+  textStoreId: string;
 }
 
 /**
@@ -822,9 +865,15 @@ export interface RagChunk {
  * come from an injectable client (cached, content-addressed). Lives under
  * `result.ai.rag`. Index-build only — the retrieve/answer/cite query path is a separate
  * runtime path.
+ *
+ * V3-P2: this slice is now LIGHTWEIGHT METADATA. The vectors and the chunk text were moved
+ * out to `@codeflow/retrieval`'s stores (see `RagChunk` and `RagStoreRef`), so the size of
+ * this slice grows with the chunk COUNT and no longer with the embedding dimension — which is
+ * what took the 16MB BSON ceiling off the index.
  */
 export interface Rag {
-  /** Sorted by (fileId, startLine) — deterministic. */
+  /** Chunk METADATA, sorted by (fileId, startLine) — deterministic. Text + vectors live in
+   *  the stores named by `store`; this list is the plan and the citation keyspace. */
   chunks: RagChunk[];
   chunkCount: number;
   /** e.g. "voyage-code-3". */
@@ -834,6 +883,8 @@ export interface Rag {
   /** Chunks dropped by grounding (fileId not a node, or line range out of file).
    *  Omitted entirely when none (absent ≠ empty) — a non-zero count is a quality signal. */
   droppedChunks?: { count: number; fileIds: string[] };
+  /** V3-P2: where the vectors + text for these chunks live. Absent ⇒ a pre-P2 inline index. */
+  store?: RagStoreRef;
 }
 
 /**

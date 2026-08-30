@@ -1,13 +1,30 @@
 import { createHash } from "node:crypto";
 import { RAG_MIN_SIMILARITY, RAG_TOP_K } from "@codeflow/config";
-import type { AnalysisCacheHandle, BudgetHandle, Rag, RagChunk } from "@codeflow/shared-types";
+import {
+  assertEmbeddingSpace,
+  vectorRetrieve,
+  type ChunkTextStore,
+  type RetrievedChunk,
+  type VectorStore,
+} from "@codeflow/retrieval";
+import type { AnalysisCacheHandle, BudgetHandle, Rag } from "@codeflow/shared-types";
 import type { LlmClient } from "../llm/llmClient.js";
 import type { EmbeddingClient } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { estimateTokens } from "../util/tokens.js";
 import { embedCacheKey, type CachedEmbedding } from "./embedCache.js";
-import { assertEmbeddingSpace } from "./homogeneity.js";
-import { cosineSimilarity, retrieve } from "./retrieve.js";
+
+/**
+ * The minimum a chunk must expose to be CITED: an id to match the model's claim against, and
+ * the real coordinates to resolve it to. Deliberately narrower than `RetrievedChunk` so the
+ * grounding step cannot accidentally depend on a score or on the chunk text.
+ */
+export interface CitableChunk {
+  id: string;
+  fileId: string;
+  startLine: number;
+  endLine: number;
+}
 
 /** A grounded citation — resolves to a RETRIEVED chunk's real file + line range. */
 export interface RagAnswerCitation {
@@ -29,8 +46,13 @@ export interface RagAnswer {
 
 export interface AnswerQuestionDeps {
   question: string;
-  /** The already-built index (`result.ai.rag`) — its chunks carry embeddings. */
+  /** The already-built index (`result.ai.rag`) — chunk METADATA + a `store` reference. Since
+   *  V3-P2 the vectors and text live in the two stores below, not in this slice. */
   ragIndex: Rag;
+  /** Where the index's vectors live. Injected: memory in the suite, pgvector in production. */
+  vectorStore: VectorStore;
+  /** Where the index's chunk text lives. Same injection rule. */
+  textStore: ChunkTextStore;
   chatClient: LlmClient;
   embeddingClient: EmbeddingClient;
   cache: AnalysisCacheHandle;
@@ -66,12 +88,22 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
 
   // Guard 1 — the question MUST be embedded in the index's space.
   assertEmbeddingSpace(embeddingClient, ragIndex, "RAG index");
+  // Guard 1b (V3-P2) — and the STORE holding that index must be in the same space too. Two
+  // separate checks because they catch two different mistakes: a client/index mismatch is a
+  // stale analysis, a client/store mismatch is a misconfigured deployment.
+  assertEmbeddingSpace(embeddingClient, deps.vectorStore.space, `vector store ${deps.vectorStore.id}`);
 
   const queryVector = await embedQuery(deps);
 
-  const retrieved = retrieve(ragIndex.chunks, queryVector, k);
+  const found = await vectorRetrieve(
+    { ragIndex, vectorStore: deps.vectorStore, textStore: deps.textStore },
+    { queryVector, k },
+  );
+  const retrieved = found.chunks;
   const retrievedChunkIds = retrieved.map((c) => c.id);
-  const topScore = retrieved.length ? cosineSimilarity(queryVector, retrieved[0].embedding) : 0;
+  // The floor is compared against a real COSINE from the store, exactly as before — never
+  // against a fused or reranked score, which are ordinal and have no absolute meaning.
+  const topScore = found.topScore;
 
   // Honest no-answer: empty or below the floor ⇒ refuse, do NOT call the answer LLM.
   if (retrieved.length === 0 || topScore < minSimilarity) {
@@ -128,7 +160,7 @@ async function embedQuery(deps: AnswerQuestionDeps): Promise<number[]> {
 }
 
 /** Bounded prompt of the RETRIEVED chunks ONLY — never the full index. */
-function buildAnswerPrompt(question: string, retrieved: RagChunk[]): string {
+function buildAnswerPrompt(question: string, retrieved: readonly RetrievedChunk[]): string {
   const lines: string[] = ["## Retrieved code chunks"];
   for (const chunk of retrieved) {
     lines.push(`\n### Chunk ${chunk.id}  (file ${chunk.fileId}, lines ${chunk.startLine}-${chunk.endLine})`);
@@ -140,7 +172,11 @@ function buildAnswerPrompt(question: string, retrieved: RagChunk[]): string {
 }
 
 /** Parse the completion, then GROUND citations: keep only those mapping to a retrieved chunk. */
-export function deriveAnswer(raw: string, retrieved: RagChunk[], retrievedChunkIds: string[]): RagAnswer {
+export function deriveAnswer(
+  raw: string,
+  retrieved: readonly CitableChunk[],
+  retrievedChunkIds: string[],
+): RagAnswer {
   const byId = new Map(retrieved.map((c) => [c.id, c]));
   let parsed: { answer?: unknown; answered?: unknown; citations?: unknown } | null = null;
   try {

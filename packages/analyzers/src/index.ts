@@ -57,15 +57,30 @@ export {
   type SynthesizeDependencies,
 } from "./stages/synthesize.js";
 export { createRagStage, type RagDependencies } from "./stages/rag.js";
-export { cosineSimilarity, retrieve } from "./rag/retrieve.js";
 export { embedCacheKey, normalizeEmbedText, type CachedEmbedding } from "./rag/embedCache.js";
-export { assertEmbeddingSpace, type EmbeddingSpace, type EmbeddingClientLike } from "./rag/homogeneity.js";
+// V3-P2: the retrieval primitive and the homogeneity guard MOVED DOWN to @codeflow/retrieval
+// (the stores and MMR need them, and analyzers depends on retrieval, not the reverse). They
+// are re-exported here so there is still exactly ONE definition of each and every existing
+// import path keeps resolving. `retrieve` is now generic over `{ id, embedding }`, because
+// `RagChunk` no longer carries a vector.
+export {
+  assertEmbeddingSpace,
+  assertVectorDimension,
+  cosineSimilarity,
+  retrieve,
+  retrievalNamespace,
+  vectorRetrieve,
+  type Embedded,
+  type EmbeddingClientLike,
+  type EmbeddingSpace,
+} from "@codeflow/retrieval";
 export {
   answerQuestion,
   deriveAnswer,
+  type AnswerQuestionDeps,
+  type CitableChunk,
   type RagAnswer,
   type RagAnswerCitation,
-  type AnswerQuestionDeps,
 } from "./rag/answer.js";
 export {
   createAnthropicClient,

@@ -1,6 +1,5 @@
-import type { RagChunk, Synthesis } from "@codeflow/shared-types";
+import type { Synthesis } from "@codeflow/shared-types";
 import type { RagEvalQuestion } from "./dataset.js";
-import { retrieve } from "@codeflow/analyzers";
 
 // All scoring is PURE + deterministic given fixed inputs (the mock embeddings are
 // deterministic). Per-question detail is reported, not just aggregates — a single number
@@ -115,16 +114,38 @@ function targetsFor(question: RagEvalQuestion): Target[] {
   return question.expectedFiles.map((fileId) => ({ fileId, label: fileId }));
 }
 
+/**
+ * The coordinates a scorer needs from a retrieved chunk. Deliberately NOT `RagChunk` or
+ * `RetrievedChunk`: scoring must not be able to read a chunk's text or its scores, or a future
+ * change could quietly start grading the retrieval by something other than what it found.
+ * (V3-P2: this is also all that survives in the analysis document, so the narrow type and the
+ * persisted one now say the same thing.)
+ */
+export interface ScoredCoords {
+  id: string;
+  fileId: string;
+  startLine: number;
+  endLine: number;
+}
+
 /** Does a retrieved chunk satisfy a target (file match, or line-range overlap when tighter)? */
-function chunkHitsTarget(chunk: RagChunk, target: Target): boolean {
+function chunkHitsTarget(chunk: ScoredCoords, target: Target): boolean {
   if (chunk.fileId !== target.fileId) return false;
   if (target.startLine === undefined || target.endLine === undefined) return true;
   return chunk.startLine <= target.endLine && chunk.endLine >= target.startLine;
 }
 
-/** Score one question: retrieve top-k for its query vector, then recall@k + reciprocal rank. */
-export function scoreQuestion(question: RagEvalQuestion, chunks: RagChunk[], queryVector: number[], k: number): PerQuestionResult {
-  const top = retrieve(chunks, queryVector, k);
+/**
+ * Score one question from its ALREADY-RETRIEVED top-k: recall@k + reciprocal rank.
+ *
+ * V3-P2 moved the retrieval call OUT of here. Before, this function embedded the retrieval
+ * primitive itself (`retrieve(chunks, queryVector, k)`), which was fine while the index was an
+ * array of vectors and became wrong the moment retrieval acquired a store, a fusion step and a
+ * reranker: the eval would have kept scoring a brute-force cosine scan while production served
+ * something else. The caller now performs the real retrieval and hands the ranking in, so this
+ * is a pure, order-sensitive scorer over whatever production actually returned.
+ */
+export function scoreQuestion(question: RagEvalQuestion, top: readonly ScoredCoords[], k: number): PerQuestionResult {
   const targets = targetsFor(question);
 
   const hitTargets = targets.filter((target) => top.some((chunk) => chunkHitsTarget(chunk, target)));

@@ -17,6 +17,7 @@
       "@codeflow/config": ["packages/config/src/index.ts"],
       "@codeflow/graph": ["packages/graph/src/index.ts"],
       "@codeflow/parsers": ["packages/parsers/src/index.ts"],
+      "@codeflow/retrieval": ["packages/retrieval/src/index.ts"],
       "@codeflow/shared-types": ["packages/shared-types/src/index.ts"]
     },
     "resolveJsonModule": true,

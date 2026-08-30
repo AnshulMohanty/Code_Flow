@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import { Worker } from "bullmq";
 import type { AnalysisJobPayload } from "@codeflow/shared-types";
 import { createEmbeddingClientFromEnv, createLlmClientFromEnv, createRedisBudgetHandle } from "@codeflow/analyzers";
+import { createRetrievalStores, type RetrievalStores } from "@codeflow/retrieval";
 import { Redis } from "ioredis";
 import { ANALYSIS_QUEUE_NAME, createRedisConnectionOptions, env } from "./services/workerAnalysisService.js";
 import { createMongoCacheHandle, createMongoEventLogStore, createMongoWorkerAnalysisService } from "./services/workerAnalysisService.js";
@@ -73,6 +74,25 @@ async function main() {
       : "RAG (AI) disabled: no embedding provider key configured.",
   );
 
+  // V3-P2 — the retrieval stores. Resolved ONCE at boot, in the embedding client's space, so
+  // the pgvector table is created at the right dimension and every job writes to the same
+  // index. Skipped entirely with no embedding client: there would be no vectors to store.
+  let retrieval: RetrievalStores | null = null;
+  if (embeddingClient) {
+    retrieval = await createRetrievalStores({
+      space: { embeddingModel: embeddingClient.model, embeddingDim: embeddingClient.dimension },
+      postgresUrl: env.postgresUrl,
+    });
+    console.log(
+      `Retrieval index: ${retrieval.vectorStore.id} + ${retrieval.textStore.id} (mode ${retrieval.mode}).`,
+    );
+    if (retrieval.degradation) {
+      // Honest degradation, not a shrug: an in-memory index is invisible to the API, so the
+      // Q&A endpoint will refuse for every analysis this worker builds.
+      console.warn(`[worker] RETRIEVAL DEGRADED — ${retrieval.degradation}`);
+    }
+  }
+
   const worker = new Worker<AnalysisJobPayload>(
     ANALYSIS_QUEUE_NAME,
     async (job) => {
@@ -87,6 +107,7 @@ async function main() {
         cleanupRepo: cleanupRepoPath,
         synthesisClient,
         embeddingClient,
+        ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
         cache,
         budget,
         eventLog,
@@ -106,6 +127,7 @@ async function main() {
   const shutdown = async () => {
     console.log("Stopping CodeFlow worker.");
     await worker.close();
+    await retrieval?.sql?.end().catch(() => undefined);
     await mongoose.disconnect();
     process.exit(0);
   };

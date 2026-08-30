@@ -31,6 +31,7 @@ import type {
   ProgressPublisher,
   RunMode,
 } from "@codeflow/shared-types";
+import type { ChunkTextStore, VectorStore } from "@codeflow/retrieval";
 import type { WorkerAnalysisService } from "../services/workerAnalysisService.js";
 
 export interface PipelineJobDependencies {
@@ -57,6 +58,14 @@ export interface PipelineJobDependencies {
    *  registered and `configured.ai` simply omits it (the P10 coverage partition stays
    *  correct — an ANTHROPIC-only setup runs Synthesize but not RAG). */
   embeddingClient?: EmbeddingClient;
+  /**
+   * Where the RAG index's vectors + chunk text go (V3-P2). BOTH are required alongside
+   * `embeddingClient`: without them there is nowhere to put an index, so RAG is not
+   * registered and the run is deterministic-only-plus-synthesis rather than silently
+   * building an index nobody can query. Injected, so the suite passes the in-memory pair.
+   */
+  vectorStore?: VectorStore;
+  textStore?: ChunkTextStore;
   /** Persistent cache for AI completions (LLM-output cache). Defaults to the orchestrator's
    *  per-run in-memory cache when omitted. */
   cache?: AnalysisCacheHandle;
@@ -203,8 +212,16 @@ export async function runAnalysisJob(
     // RAG (AI, stage 8) registers only when an embedding client is configured. It reuses
     // the same readFile abstraction (disk path) and the same cache handle (both the
     // embedding cache and the SHA-keyed chunk-plan cache live there, namespaced).
-    if (deps.embeddingClient) {
-      stages.push(createRagStage({ client: deps.embeddingClient, readFile: deps.readFile, now }));
+    if (deps.embeddingClient && deps.vectorStore && deps.textStore) {
+      stages.push(
+        createRagStage({
+          client: deps.embeddingClient,
+          vectorStore: deps.vectorStore,
+          textStore: deps.textStore,
+          readFile: deps.readFile,
+          now,
+        }),
+      );
     }
     const { result: ranResult, cached } = await runPipeline(stages, input, {
       emit: (event) => {

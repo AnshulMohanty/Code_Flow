@@ -27,6 +27,7 @@ export {
   type AnswerScores,
   type PerAnswerResult,
 } from "./answerScore.js";
+export type { JudgeChunk } from "./judge.js";
 export {
   buildJudgePrompt,
   calibrateJudge,
@@ -42,9 +43,19 @@ export {
   type JudgeRequest,
   type JudgeVerdict,
 } from "./judge.js";
-// Retrieval is the ONE production primitive (hoisted to @codeflow/analyzers in P18) — re-exported
-// here so existing eval consumers keep working and eval measures the SAME retrieval as production.
+// Retrieval is the ONE production primitive (hoisted to @codeflow/analyzers in P18, moved
+// down to @codeflow/retrieval in V3-P2) — re-exported here so existing eval consumers keep
+// working and eval measures the SAME retrieval as production.
 export { cosineSimilarity, retrieve } from "@codeflow/analyzers";
+// V3-P2: the index sidecar. The vectors left the AnalysisResult, so a scored run loads them
+// from a companion file and hydrates the in-memory stores the harness retrieves through.
+export {
+  assertEvalIndexShape,
+  hydrateEvalIndex,
+  EVAL_INDEX_SCHEMA_VERSION,
+  type EvalIndexFile,
+  type HydratedEvalIndex,
+} from "./evalIndex.js";
 export {
   scoreSynthesis,
   scoreQuestion,
@@ -52,6 +63,7 @@ export {
   type SynthesisScores,
   type RagScores,
   type PerQuestionResult,
+  type ScoredCoords,
 } from "./score.js";
 export { EVAL_THRESHOLDS, type EvalThresholds } from "./thresholds.js";
 export {
@@ -59,6 +71,7 @@ export {
   assertHomogeneity,
   type AnswerRunner,
   type EvalReport,
+  type EvalRetrieval,
   type RunEvalOptions,
 } from "./runEval.js";
 // Parser parity (V3-P1): grades the tree-sitter engine against the regex baseline on

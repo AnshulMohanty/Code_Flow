@@ -12,6 +12,7 @@
       "@codeflow/config": ["packages/config/dist/index.d.ts"],
       "@codeflow/graph": ["packages/graph/dist/index.d.ts"],
       "@codeflow/parsers": ["packages/parsers/dist/index.d.ts"],
+      "@codeflow/retrieval": ["packages/retrieval/dist/index.d.ts"],
       "@codeflow/shared-types": ["packages/shared-types/dist/index.d.ts"]
     }
   },

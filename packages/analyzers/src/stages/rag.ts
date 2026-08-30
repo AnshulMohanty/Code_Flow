@@ -13,6 +13,13 @@ import type {
   StageResult,
   TokenUsage,
 } from "@codeflow/shared-types";
+import {
+  assertEmbeddingSpace,
+  retrievalNamespace,
+  type ChunkTextStore,
+  type VectorRecord,
+  type VectorStore,
+} from "@codeflow/retrieval";
 import type { EmbeddingClient, EmbeddingResult } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { embedCacheKey, type CachedEmbedding } from "../rag/embedCache.js";
@@ -21,6 +28,14 @@ import { estimateTokens, sumUsage } from "../util/tokens.js";
 export interface RagDependencies {
   /** Injectable embedding client — tests mock it (no real API calls). */
   client: EmbeddingClient;
+  /**
+   * Where the VECTORS go (V3-P2). Injected, never constructed here: the hermetic suite passes
+   * `createMemoryVectorStore`, production passes the pgvector adapter, and this stage does not
+   * know or care which. Its `space` is checked against `client` before a single write.
+   */
+  vectorStore: VectorStore;
+  /** Where the chunk TEXT goes (V3-P2). Same injection rule as `vectorStore`. */
+  textStore: ChunkTextStore;
   /**
    * Reads repo-relative file CONTENTS (same shape Inventory/Orient use). Resolves null
    * when unreadable. Only called on the DISK path (ctx.repoPath present); on a no-disk
@@ -56,8 +71,12 @@ const MAX_BATCH_TOKENS = 120_000;
 // The embedding-cache key lives in ../rag/embedCache.ts (shared with the query path).
 const PLAN_CACHE_VERSION = "v1";
 
-/** The deterministic chunk plan entry (a RagChunk WITHOUT its vector). */
-type ChunkPlan = Omit<RagChunk, "embedding">;
+/**
+ * The deterministic chunk plan entry: the persisted metadata PLUS the text, which is what
+ * gets embedded and then written to the text store. `RagChunk` itself no longer carries
+ * `text` (V3-P2), so the plan states the extra field explicitly rather than subtracting one.
+ */
+type ChunkPlan = RagChunk & { text: string };
 
 /** What the chunk-plan cache stores (plain serializable; NO vectors). */
 interface CachedChunkPlan {
@@ -77,6 +96,14 @@ interface CachedChunkPlan {
  * fileId is not a graph node (recorded in `droppedChunks`); empty-after-grounding throws.
  * Unlike Synthesize there is NO retry on grounding — chunking is deterministic, so
  * re-running cannot change the outcome.
+ *
+ * V3-P2 — WHERE THE OUTPUT GOES. The vectors are written to an injected `VectorStore` and
+ * the chunk text to an injected `ChunkTextStore`, both keyed by (namespace, chunk id); the
+ * `aiRag` slice keeps only metadata + a `store` reference. Writes are ordered TEXT FIRST, then
+ * VECTORS, and that order is not arbitrary: the vector store is what a search reads, so if the
+ * process dies between the two, the worst case is text nobody can find (harmless, overwritten
+ * on retry) rather than searchable hits whose text is missing (a retrieved chunk with no
+ * content, which would reach a prompt as a citation of code the model never saw).
  *
  * Two caches (via ctx.cache, namespaced keys):
  *   1. Embedding cache (content-addressed) — re-embedding unchanged text costs zero API.
@@ -161,9 +188,53 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
       // --- Embed (embedding cache → batch the misses, transient retry) --------
       const embeddings = await embedChunks(plan, ctx, client, maxAttempts);
 
-      const chunks: RagChunk[] = plan
-        .map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }))
-        .sort((a, b) => (a.fileId === b.fileId ? a.startLine - b.startLine : a.fileId.localeCompare(b.fileId)));
+      // GUARD (V3-P2): the store must live in the SAME embedding space as the client that
+      // just produced these vectors. Checked here rather than at wiring time because the
+      // client is chosen from env at runtime and a mismatch would otherwise surface as
+      // plausible-looking but meaningless cosine scores forever after.
+      assertEmbeddingSpace(client, deps.vectorStore.space, `vector store ${deps.vectorStore.id}`);
+
+      const ordered = plan
+        .map((chunk, i) => ({ chunk, embedding: embeddings[i] }))
+        .sort((a, b) =>
+          a.chunk.fileId === b.chunk.fileId
+            ? a.chunk.startLine - b.chunk.startLine
+            : a.chunk.fileId.localeCompare(b.chunk.fileId),
+        );
+
+      const namespace = retrievalNamespace({
+        repoFullName: repoFullNameOf(input),
+        commitSha: ctx.commitSha ?? "no-sha",
+        embeddingModel: client.model,
+        embeddingDim: client.dimension,
+      });
+
+      // Drop first, so the namespace ends up holding EXACTLY this chunk set. Without it a
+      // chunking-algorithm change would leave the previous run's chunk ids behind, still
+      // searchable, still citing line ranges the current plan says nothing about.
+      await deps.vectorStore.drop(namespace);
+      await deps.textStore.drop(namespace);
+
+      await deps.textStore.put(
+        namespace,
+        ordered.map(({ chunk }) => ({ id: chunk.id, text: chunk.text })),
+      );
+      const records: VectorRecord[] = ordered.map(({ chunk, embedding }) => ({
+        id: chunk.id,
+        vector: embedding,
+        fileId: chunk.fileId,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...(chunk.symbolName ? { symbolName: chunk.symbolName } : {}),
+      }));
+      await deps.vectorStore.upsert(namespace, records);
+
+      // The persisted slice: metadata only. `text` is stripped here — that strip IS the
+      // 16MB-BSON fix, so it is done by construction rather than by remembering to omit it.
+      const chunks: RagChunk[] = ordered.map(({ chunk }) => {
+        const { text: _text, ...metadata } = chunk;
+        return metadata;
+      });
 
       const rag: Rag = {
         chunks,
@@ -171,6 +242,11 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
         embeddingModel: client.model,
         embeddingDim: client.dimension,
         ...(droppedChunks ? { droppedChunks } : {}),
+        store: {
+          namespace,
+          vectorStoreId: deps.vectorStore.id,
+          textStoreId: deps.textStore.id,
+        },
       };
 
       const event: ProgressEvent = {
@@ -181,9 +257,11 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
         kind: "ai",
         status: "completed",
         label: "Indexing for Q&A",
-        detail: `Indexed ${chunks.length} chunks (${client.model}, dim ${client.dimension})${
-          droppedChunks ? `, ${droppedChunks.count} ungrounded dropped` : ""
-        }${fromCache ? ", plan reused from cache" : ""}.`,
+        detail: `Indexed ${chunks.length} chunks (${client.model}, dim ${client.dimension}) into ${
+          deps.vectorStore.id
+        }${droppedChunks ? `, ${droppedChunks.count} ungrounded dropped` : ""}${
+          fromCache ? ", plan reused from cache" : ""
+        }.`,
         progress: 0,
         startedAt: new Date(startedAt).toISOString(),
         durationMs: now() - startedAt,
@@ -192,6 +270,7 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
           embeddingModel: client.model,
           droppedChunks: droppedChunks?.count ?? 0,
           planFromCache: fromCache,
+          vectorStore: deps.vectorStore.id,
         },
         emittedAt: new Date(now()).toISOString(),
       };
@@ -531,4 +610,14 @@ async function embedWithRetry(
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * `owner/name` for the retrieval namespace, falling back to the bare name when there is no
+ * owner (a local or zip repo). Only used as a namespace component, so it needs to be stable
+ * and distinguishing, not canonical.
+ */
+function repoFullNameOf(input: PipelineInput): string {
+  const ref = input.repositoryRef;
+  return ref.owner ? `${ref.owner}/${ref.name}` : ref.name;
 }

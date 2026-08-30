@@ -1,4 +1,4 @@
-import type { RagChunk } from "@codeflow/shared-types";
+import type { ScoredCoords } from "./score.js";
 import type { RagAnswer, RagAnswerCitation } from "@codeflow/analyzers";
 import type { RagEvalQuestion } from "./dataset.js";
 
@@ -70,7 +70,7 @@ export interface AggregateAnswerScores {
 export function scoreAnswer(
   question: RagEvalQuestion,
   answer: RagAnswer,
-  retrieved: RagChunk[],
+  retrieved: readonly ScoredCoords[],
 ): PerAnswerResult {
   const expectedFiles = new Set(question.expectedFiles);
   const citations: RagAnswerCitation[] = answer.citations ?? [];
@@ -104,7 +104,7 @@ export function scoreAnswer(
 }
 
 /** Does this citation's file + line span sit inside a chunk the answer actually retrieved? */
-function containedInRetrieved(retrieved: RagChunk[], citation: RagAnswerCitation): boolean {
+function containedInRetrieved(retrieved: readonly ScoredCoords[], citation: RagAnswerCitation): boolean {
   return retrieved.some(
     (chunk) =>
       chunk.fileId === citation.fileId &&

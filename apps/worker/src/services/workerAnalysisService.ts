@@ -17,6 +17,13 @@ export const ANALYSIS_QUEUE_NAME = "codeflow-analysis";
 export const env = {
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017/codeflow",
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  /**
+   * Postgres for the V3-P2 retrieval stores (pgvector + chunk text). NO DEFAULT, unlike the
+   * two above: an absent value means "run the index in-process", which is a real supported
+   * mode for a single-container demo, whereas defaulting to localhost would make every
+   * developer machine without Postgres log a connection failure at boot instead.
+   */
+  postgresUrl: process.env.POSTGRES_URL || "",
 };
 
 export interface WorkerJobPatch {

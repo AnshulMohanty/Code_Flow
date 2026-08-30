@@ -6,8 +6,10 @@
 // relevance, justified vs unjustified refusals) and — advisory until calibrated —
 // faithfulness from an LLM judge.
 //
-// INPUT IT DOES NOT PRODUCE ITSELF: an `AnalysisResult` per dataset, at
-// `packages/eval/results/<dataset>.json`. Producing one means cloning the pinned SHA and
+// INPUTS IT DOES NOT PRODUCE ITSELF: an `AnalysisResult` per dataset at
+// `packages/eval/results/<dataset>.json`, plus (since V3-P2) the index sidecar at
+// `packages/eval/results/<dataset>.index.json` carrying the chunk text + vectors, which no
+// longer travel inside the result. Producing them means cloning the pinned SHA and
 // running the full pipeline including the AI stages, which is a worker concern (the cloner,
 // the queue, the provider wiring all live in apps/worker) and needs the owner's key. Rather
 // than duplicate that machinery here, this CLI fails with the exact instruction — grading a
@@ -23,8 +25,10 @@ import {
   createInMemoryBudgetHandle,
   createLlmClientFromEnv,
 } from "@codeflow/analyzers";
+import type { RetrievedChunk } from "@codeflow/retrieval";
 import { RAG_TOP_K } from "@codeflow/config";
 import { loadGoldenDatasets, type LoadedDataset } from "./datasets.js";
+import { assertEvalIndexShape, hydrateEvalIndex, type HydratedEvalIndex } from "./evalIndex.js";
 import { buildJudgePrompt, parseJudgeVerdict, JUDGE_SYSTEM_PROMPT, type Judge } from "./judge.js";
 import { runEval, type AnswerRunner, type EvalReport } from "./runEval.js";
 
@@ -72,8 +76,10 @@ async function main(): Promise<void> {
   const reports: Array<{ name: string; report: EvalReport }> = [];
   for (const entry of datasets) {
     const result = await loadAnalysisResult(root, entry);
+    const index = await loadEvalIndex(root, entry, result);
     const report = await runEval(entry.dataset, result, embeddingClient, {
-      answer: makeAnswerRunner(entry, result, embeddingClient, chatClient),
+      retrieval: { vectorStore: index.vectorStore, textStore: index.textStore },
+      answer: makeAnswerRunner(entry, result, index, embeddingClient, chatClient),
       judge: makeJudge(chatClient),
       // No human labels are shipped yet, so the judge stays ADVISORY by construction: it is
       // reported and cannot fail a threshold. Authoring labels is what promotes it to a gate.
@@ -122,12 +128,49 @@ async function loadAnalysisResult(root: string, entry: LoadedDataset): Promise<A
 }
 
 /**
+ * Load the index sidecar (V3-P2) and hydrate in-memory stores from it.
+ *
+ * The scored run stays infra-free: the vectors travel in a companion JSON file next to the
+ * result rather than requiring a live pgvector. Validated at the boundary, because a sidecar
+ * from the wrong run scores against the wrong index and every number would be quietly wrong
+ * rather than obviously broken.
+ */
+async function loadEvalIndex(root: string, entry: LoadedDataset, result: AnalysisResult): Promise<HydratedEvalIndex> {
+  const rag = result.ai?.rag;
+  if (!rag) {
+    throw new Error(`${entry.name}: the AnalysisResult has no ai.rag index — the RAG stage did not run.`);
+  }
+  const file = path.join(root, "results", `${entry.name}.index.json`);
+  const raw = await readFile(file, "utf8").catch(() => null);
+  if (raw === null) {
+    throw new Error(
+      `Missing ${path.relative(process.cwd(), file)}.\n` +
+        `Since V3-P2 the chunk vectors + text live in the retrieval stores, not in the\n` +
+        `AnalysisResult, so the scored run needs them alongside it. Export the indexed chunks\n` +
+        `(id, fileId, startLine, endLine, symbolName?, tokenCount, text, embedding) as\n` +
+        `  { "indexSchemaVersion": 1, "embeddingModel": "...", "embeddingDim": N, "chunks": [...] }\n` +
+        `in the dataset's embedding space (${entry.dataset.embeddingModel} / dim ${entry.dataset.embeddingDim}).`,
+    );
+  }
+  const parsed: unknown = JSON.parse(raw);
+  assertEvalIndexShape(parsed);
+  if (parsed.embeddingModel !== rag.embeddingModel || parsed.embeddingDim !== rag.embeddingDim) {
+    throw new Error(
+      `${entry.name}: index sidecar space (${parsed.embeddingModel}/${parsed.embeddingDim}) does not match the ` +
+        `result's index (${rag.embeddingModel}/${rag.embeddingDim}). These are different runs.`,
+    );
+  }
+  return hydrateEvalIndex(rag, parsed.chunks);
+}
+
+/**
  * Drive the PRODUCTION answer path (`answerQuestion`) so the eval grades what users get —
  * same retrieval, same grounding, same refusal floor — rather than a re-implementation.
  */
 function makeAnswerRunner(
   entry: LoadedDataset,
   result: AnalysisResult,
+  index: HydratedEvalIndex,
   embeddingClient: NonNullable<ReturnType<typeof createEmbeddingClientFromEnv>>,
   chatClient: NonNullable<ReturnType<typeof createLlmClientFromEnv>>,
 ): AnswerRunner {
@@ -142,6 +185,8 @@ function makeAnswerRunner(
     const answer = await answerQuestion({
       question,
       ragIndex,
+      vectorStore: index.vectorStore,
+      textStore: index.textStore,
       chatClient,
       embeddingClient,
       cache,
@@ -149,12 +194,18 @@ function makeAnswerRunner(
       commitSha: result.commitSha,
       k: RAG_TOP_K,
     });
-    // Recover the chunk objects the answer was built from, so citation validity is checked
-    // against exactly what the model could legitimately have seen.
+    // Recover the chunk objects the answer was built from, so citation validity AND the judge
+    // are checked against exactly what the model could legitimately have seen. Read back from
+    // the stores (not from the metadata slice) because the judge needs the TEXT too.
+    const texts = await index.textStore.get(index.namespace, answer.retrievedChunkIds);
     const byId = new Map(ragIndex.chunks.map((chunk) => [chunk.id, chunk]));
-    const retrieved = answer.retrievedChunkIds
-      .map((id) => byId.get(id))
-      .filter((chunk): chunk is NonNullable<typeof chunk> => Boolean(chunk));
+    const retrieved: RetrievedChunk[] = [];
+    for (const id of answer.retrievedChunkIds) {
+      const metadata = byId.get(id);
+      const text = texts.get(id);
+      if (!metadata || text === undefined) continue;
+      retrieved.push({ ...metadata, text, fusedScore: 0, sources: ["vector"] });
+    }
     return { answer, retrieved };
   };
 }

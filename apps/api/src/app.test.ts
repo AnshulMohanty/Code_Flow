@@ -312,7 +312,10 @@ describe("codeflow api", () => {
           chunkCount: 1,
           embeddingModel: "mock-embed",
           embeddingDim: 3,
-          chunks: [{ id: "src/index.ts#1-5", fileId: "src/index.ts", startLine: 1, endLine: 5, text: "x", embedding: [1, 0, 0], tokenCount: 2 }],
+          // V3-P2: the persisted slice is metadata + a store reference. The route only needs
+          // ai.rag to EXIST (the ask handler is mocked in this suite), so no store is stood up.
+          chunks: [{ id: "src/index.ts#1-5", fileId: "src/index.ts", startLine: 1, endLine: 5, tokenCount: 2 }],
+          store: { namespace: "facebook/react@sha/mock-embed/3", vectorStoreId: "memory-vector-store", textStoreId: "memory-chunk-text-store" },
         },
       };
     }

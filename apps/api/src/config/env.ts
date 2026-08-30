@@ -13,6 +13,13 @@ export const env = {
   apiPort: Number(process.env.API_PORT || 4000),
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017/codeflow",
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  /**
+   * Postgres for the V3-P2 retrieval stores. NO DEFAULT on purpose (see the worker's copy of
+   * this note): an absent value means the index is per-process, which is a supported
+   * single-container mode, and defaulting to localhost would turn "not configured" into
+   * "configured and broken".
+   */
+  postgresUrl: process.env.POSTGRES_URL || "",
   analyzerVersion: process.env.ANALYZER_VERSION || ANALYZER_VERSION,
   nodeEnv: process.env.NODE_ENV || "development",
 };

@@ -1,5 +1,6 @@
-import type { AnalysisResult, Rag, RagChunk } from "@codeflow/shared-types";
-import { assertEmbeddingSpace, retrieve, type EmbeddingClient, type RagAnswer } from "@codeflow/analyzers";
+import type { AnalysisResult, Rag } from "@codeflow/shared-types";
+import { assertEmbeddingSpace, type EmbeddingClient, type RagAnswer } from "@codeflow/analyzers";
+import { vectorRetrieve, type ChunkTextStore, type RetrievedChunk, type VectorStore } from "@codeflow/retrieval";
 import {
   aggregateAnswers,
   scoreAnswer,
@@ -20,6 +21,7 @@ import {
   scoreSynthesis,
   type PerQuestionResult,
   type RagScores,
+  type ScoredCoords,
   type SynthesisScores,
 } from "./score.js";
 import { EVAL_THRESHOLDS, type EvalThresholds } from "./thresholds.js";
@@ -53,9 +55,26 @@ export interface EvalReport {
 /** Produces a grounded answer for a question — the production `answerQuestion` path, or a
  *  deterministic fake in tests. Returns the answer AND the chunks it was built from, because
  *  citation validity must be checked against what the model could legitimately have seen. */
-export type AnswerRunner = (question: string) => Promise<{ answer: RagAnswer; retrieved: RagChunk[] }>;
+export type AnswerRunner = (question: string) => Promise<{ answer: RagAnswer; retrieved: RetrievedChunk[] }>;
+
+/**
+ * The stores holding the index being graded (V3-P2). REQUIRED once a dataset has questions,
+ * because the vectors are no longer inside the `AnalysisResult`.
+ *
+ * Passing the interfaces rather than raw vectors is what keeps the eval honest: it drives
+ * `vectorRetrieve` — the same function the production Q&A path calls — so recall@k measures
+ * production retrieval and not a re-implementation of it. `hydrateEvalIndex` builds the
+ * in-memory pair from a sidecar file; pointing this at a live pgvector store is the deferred
+ * integration run.
+ */
+export interface EvalRetrieval {
+  vectorStore: VectorStore;
+  textStore: ChunkTextStore;
+}
 
 export interface RunEvalOptions {
+  /** The stores holding the index (V3-P2). Required when the dataset has questions. */
+  retrieval?: EvalRetrieval;
   /** Override the synthesis recall@k (defaults to the threshold's k). */
   synthesisK?: number;
   /** Override the RAG recall@k (defaults to the threshold's k). */
@@ -117,13 +136,29 @@ export async function runEval(
       throw new Error("Cannot grade RAG: result.ai.rag is missing (the RAG stage did not run).");
     }
     assertHomogeneity(embeddingClient, dataset, rag);
+    const retrieval = options.retrieval;
+    if (!retrieval) {
+      throw new Error(
+        "Cannot grade retrieval: no `retrieval` stores were supplied. Since V3-P2 the vectors " +
+          "live outside the AnalysisResult, so the harness needs the VectorStore + ChunkTextStore " +
+          "holding this index (see `hydrateEvalIndex` for the sidecar-file path).",
+      );
+    }
 
     // Embed every question on the QUERY side (matches the document-side index build).
     const { vectors: queryVectors } = await embeddingClient.embed({
       texts: dataset.questions.map((q) => q.question),
       inputType: "query",
     });
-    perQuestion = dataset.questions.map((question, i) => scoreQuestion(question, rag.chunks, queryVectors[i], ragK));
+
+    // Retrieve through the PRODUCTION path, once per question, and keep each ranking so the
+    // answer-path fallback below scores against the same top-k rather than re-retrieving.
+    const rankings: ScoredCoords[][] = [];
+    for (let i = 0; i < dataset.questions.length; i++) {
+      const found = await vectorRetrieve({ ragIndex: rag, ...retrieval }, { queryVector: queryVectors[i], k: ragK });
+      rankings.push(found.chunks);
+    }
+    perQuestion = dataset.questions.map((question, i) => scoreQuestion(question, rankings[i], ragK));
     ragScores = aggregateRag(perQuestion, ragK);
 
     // --- Answer-path scoring (V3-P0) ----------------------------------------
@@ -134,15 +169,16 @@ export async function runEval(
         const produced = await options.answer(question.question);
         // Fall back to the scored top-k when the runner reports no chunk set, so citation
         // validity is still checked against a real retrieval rather than skipped.
-        const retrieved = produced.retrieved.length
-          ? produced.retrieved
-          : retrieve(rag.chunks, queryVectors[i], ragK).map((entry) => entry);
+        const retrieved: readonly ScoredCoords[] = produced.retrieved.length ? produced.retrieved : rankings[i];
         perAnswer.push(scoreAnswer(question, produced.answer, retrieved));
         if (options.judge) {
+          // The judge needs chunk TEXT, which only the answer runner's own retrieval carries
+          // (the fallback ranking is coordinates only). Judging with empty text would score
+          // faithfulness against nothing, so an answer with no retrieved chunks is skipped.
           const verdict = await options.judge({
             question: question.question,
             answer: produced.answer.answer ?? "",
-            chunks: retrieved,
+            chunks: produced.retrieved,
           });
           judgeScores.push(verdict.faithfulness);
         }

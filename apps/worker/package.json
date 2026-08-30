@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",
     "test": "vitest run --passWithNoTests",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
@@ -19,6 +19,7 @@
     "@codeflow/config": "workspace:*",
     "@codeflow/graph": "workspace:*",
     "@codeflow/parsers": "workspace:*",
+    "@codeflow/retrieval": "workspace:*",
     "@codeflow/shared-types": "workspace:*",
     "bullmq": "^5.34.5",
     "dotenv": "^16.4.7",

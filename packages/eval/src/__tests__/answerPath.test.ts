@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RagChunk } from "@codeflow/shared-types";
+import type { ScoredCoords } from "../score.js";
 import type { RagAnswer } from "@codeflow/analyzers";
 import { aggregateAnswers, scoreAnswer } from "../answerScore.js";
 import {
@@ -16,16 +16,11 @@ import type { RagEvalQuestion } from "../dataset.js";
 // V3-P0 §0.4 — the eval now scores the ANSWER, not just the index. Hermetic: fixture chunks
 // and a deterministic fake judge; no provider, no key, no spend.
 
-function chunk(fileId: string, startLine: number, endLine: number, text = "code"): RagChunk {
-  return {
-    id: `${fileId}#${startLine}-${endLine}`,
-    fileId,
-    startLine,
-    endLine,
-    text,
-    embedding: [0, 0, 0],
-    tokenCount: 1,
-  };
+// V3-P2: citation validity is a COORDINATE check, so the fixture is coordinates. It used to
+// carry text + a zero vector, neither of which the scorer ever read — and a zero vector in a
+// fixture is the kind of thing that later gets mistaken for meaningful test data.
+function chunk(fileId: string, startLine: number, endLine: number): ScoredCoords {
+  return { id: `${fileId}#${startLine}-${endLine}`, fileId, startLine, endLine };
 }
 
 function question(expectedFiles: string[]): RagEvalQuestion {

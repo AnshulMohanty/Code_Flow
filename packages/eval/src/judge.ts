@@ -1,4 +1,16 @@
-import type { RagChunk } from "@codeflow/shared-types";
+/**
+ * What the judge needs to see of a chunk: where it came from and what it said. A narrow local
+ * type rather than `RetrievedChunk` — V3-P2 split the persisted metadata from the text, and the
+ * judge is the one consumer that genuinely needs BOTH, so it states that requirement itself
+ * instead of depending on whichever richer type happens to satisfy it today.
+ */
+export interface JudgeChunk {
+  id: string;
+  fileId: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
 
 /**
  * LLM-as-judge for the ONE thing code cannot decide: faithfulness — does the answer's prose
@@ -28,7 +40,7 @@ export interface JudgeVerdict {
 export interface JudgeRequest {
   question: string;
   answer: string;
-  chunks: RagChunk[];
+  chunks: readonly JudgeChunk[];
 }
 
 /** Injectable so the hermetic suite drives a deterministic fake and spends nothing. */

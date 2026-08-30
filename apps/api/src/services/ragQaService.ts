@@ -7,7 +7,9 @@ import {
   type RagAnswer,
 } from "@codeflow/analyzers";
 import { RAG_TOP_K } from "@codeflow/config";
+import { createRetrievalStores, type RetrievalStores } from "@codeflow/retrieval";
 import type { AnalysisCacheHandle, AnalysisResult, BudgetHandle } from "@codeflow/shared-types";
+import { env } from "../config/env.js";
 import { getSharedRedis, isSharedRedisEnabled } from "../queues/redisClient.js";
 
 /** Answers a question against a stored analysis' RAG index. Injectable so tests supply a mock
@@ -61,6 +63,33 @@ async function resolveBudget(): Promise<BudgetHandle> {
 /** Test seam: forget the memoized budget so a suite can re-resolve it. */
 export function resetQaBudgetForTests(): void {
   sharedBudget = null;
+  sharedRetrieval = null;
+}
+
+/**
+ * The retrieval stores for the query path (V3-P2).
+ *
+ * Memoized per process and resolved from the SAME factory + the same `POSTGRES_URL` the worker
+ * uses, because the API must read the index the worker wrote. If these two resolved
+ * differently — one Postgres, one in-memory — every question would come back "no index",
+ * which is exactly the kind of split V3-P0 removed from the budget.
+ *
+ * Resolved LAZILY (per embedding space), not at boot: the space comes from the configured
+ * embedding client, and the pgvector table name carries the dimension.
+ */
+let sharedRetrieval: Promise<RetrievalStores> | null = null;
+
+function resolveRetrieval(space: { embeddingModel: string; embeddingDim: number }): Promise<RetrievalStores> {
+  sharedRetrieval ??= createRetrievalStores({ space, postgresUrl: env.postgresUrl }).then((stores) => {
+    if (stores.degradation) {
+      console.warn(
+        `[codeflow] Q&A retrieval DEGRADED — ${stores.degradation} Questions will only be answerable ` +
+          "for indexes this process built itself, which for the API is none.",
+      );
+    }
+    return stores;
+  });
+  return sharedRetrieval;
 }
 
 // In-process answer cache for the query path. (Sharing the answer CACHE with the worker is
@@ -96,9 +125,15 @@ function createProductionAskHandler(): AskHandler {
     if (!chatClient || !embeddingClient) {
       throw new Error("Q&A requires both a chat and an embedding provider to be configured.");
     }
+    const retrieval = await resolveRetrieval({
+      embeddingModel: embeddingClient.model,
+      embeddingDim: embeddingClient.dimension,
+    });
     return answerQuestion({
       question,
       ragIndex,
+      vectorStore: retrieval.vectorStore,
+      textStore: retrieval.textStore,
       chatClient,
       embeddingClient,
       cache,
