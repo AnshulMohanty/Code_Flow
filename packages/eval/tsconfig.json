@@ -9,6 +9,7 @@
     "types": ["node"],
     "paths": {
       "@codeflow/analyzers": ["packages/analyzers/dist/index.d.ts"],
+      "@codeflow/arena": ["packages/arena/dist/index.d.ts"],
       "@codeflow/config": ["packages/config/dist/index.d.ts"],
       "@codeflow/retrieval": ["packages/retrieval/dist/index.d.ts"],
       "@codeflow/shared-types": ["packages/shared-types/dist/index.d.ts"]

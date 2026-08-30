@@ -120,6 +120,27 @@ export function fixtureResult(overrides: Partial<AnalysisResult> = {}): Analysis
     symbols: [],
     dependencies: [],
     issues: [],
+    // V3-P2: a real graph slice. It was absent before, which was an inconsistency —
+    // `producedBy` claims "connect" ran — and it became load-bearing once the synthetic
+    // flywheel started generating questions FROM the graph: with no graph it generated
+    // nothing, and every assertion about generated questions passed trivially.
+    //
+    // Shape: index.ts -> auth.ts, index.ts -> db.ts, auth.ts -> util.ts. index.ts is the entry
+    // point. Deliberately leaves util.ts importing nobody, so `imports-of util.ts` has an
+    // answer and `imports-of index.ts` is an exact negative control.
+    graph: {
+      nodes: [node("src/index.ts"), node("src/auth.ts"), node("src/db.ts"), node("src/util.ts")],
+      edges: [
+        { from: "src/index.ts", to: "src/auth.ts", kind: "import", specifier: "./auth" },
+        { from: "src/index.ts", to: "src/db.ts", kind: "import", specifier: "./db" },
+        { from: "src/auth.ts", to: "src/util.ts", kind: "import", specifier: "./util" },
+      ],
+      resolution: { resolved: 3, external: 0, unresolved: 0, externalModules: [], unresolvedImports: [] },
+      cpgEdges: [{ from: "src/index.ts", to: "src/auth.ts", kind: "call", symbol: "login", count: 2, line: 4 }],
+      routes: [],
+      cpg: { treeSitterFiles: 4, fallbackFiles: 0, enriched: true },
+    },
+    entryPoints: [{ fileId: "src/index.ts", reason: "index" }],
     metrics: {
       perFile: [],
       keyFiles: ["src/index.ts", "src/auth.ts", "src/db.ts", "src/util.ts"],

@@ -95,6 +95,32 @@ export function fixtureResult(overrides: Partial<AnalysisResult> = {}): Analysis
       hotspots: [],
       cycles: [{ files: ["src/cycle-a.ts", "src/cycle-b.ts"] }],
       summary: { fileCount: nodes.length, edgeCount: edges.length, cycleCount: 1, isolatedFileCount: 1, maxBlastRadius: 3 },
+      // V3-P1 Louvain partition, matching the fixture's actual shape: the import/call chain is
+      // one community, the cycle pair another, the orphan its own. Added in V3-P2 because the
+      // synthetic generator mines SAME-COMMUNITY hard negatives, and a fixture with no
+      // assignments would exercise only the empty path.
+      clusters: {
+        algorithm: "louvain",
+        seed: 42,
+        resolution: 1,
+        modularity: 0.42,
+        count: 3,
+        assignments: [
+          { fileId: "src/base.ts", cluster: 0 },
+          { fileId: "src/cycle-a.ts", cluster: 1 },
+          { fileId: "src/cycle-b.ts", cluster: 1 },
+          { fileId: "src/index.ts", cluster: 0 },
+          { fileId: "src/orphan.ts", cluster: 2 },
+          { fileId: "src/repo.ts", cluster: 0 },
+          { fileId: "src/service.ts", cluster: 0 },
+          { fileId: "src/util.ts", cluster: 0 },
+        ],
+        clusters: [
+          { id: 0, files: ["src/base.ts", "src/index.ts", "src/repo.ts", "src/service.ts", "src/util.ts"], size: 5, internalWeight: 12, externalWeight: 0 },
+          { id: 1, files: ["src/cycle-a.ts", "src/cycle-b.ts"], size: 2, internalWeight: 2, externalWeight: 0 },
+          { id: 2, files: ["src/orphan.ts"], size: 1, internalWeight: 0, externalWeight: 0 },
+        ],
+      },
     },
     graph: {
       nodes,

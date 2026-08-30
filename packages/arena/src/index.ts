@@ -29,6 +29,18 @@ export {
   GRAPH_ORACLE_ID,
 } from "./verifiers/graphOracle.js";
 
+// V3-P2 task 4: the synthetic-data flywheel. Generates guaranteed-correct Q&A from the CPG —
+// labels from the ORACLE, never from a model — and mines graph-shaped hard negatives.
+export {
+  generateSyntheticQuestions,
+  mineHardNegatives,
+  summarizeSynthetic,
+  toTaskSpecs,
+  type GenerateSyntheticOptions,
+  type SyntheticQuestion,
+  type SyntheticSummary,
+} from "./synthetic.js";
+
 export {
   createCitationVerifier,
   createFileGroundingVerifier,

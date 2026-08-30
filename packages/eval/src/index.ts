@@ -74,6 +74,15 @@ export {
   type AbQuestion,
   type AbReport,
 } from "./enrichmentAb.js";
+// V3-P2 task 4: the flywheel adapter. Generated questions (labels from the graph oracle) mapped
+// onto the eval's dataset shape, so one harness scores both the authored and the generated set.
+export {
+  buildSyntheticDataset,
+  summarizeSyntheticDataset,
+  type BuildSyntheticDatasetOptions,
+  type SyntheticDatasetExtras,
+  type SyntheticDatasetResult,
+} from "./syntheticDataset.js";
 export {
   scoreSynthesis,
   scoreQuestion,

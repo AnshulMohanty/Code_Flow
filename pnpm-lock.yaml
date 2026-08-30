@@ -188,6 +188,9 @@ importers:
       '@codeflow/analyzers':
         specifier: workspace:*
         version: link:../analyzers
+      '@codeflow/arena':
+        specifier: workspace:*
+        version: link:../arena
       '@codeflow/config':
         specifier: workspace:*
         version: link:../config
