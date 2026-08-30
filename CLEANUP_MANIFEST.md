@@ -123,6 +123,44 @@ Run as a report; the compiler flags are **not** committed (enabling them repo-wi
 
 ---
 
+## OUTCOME (all removals executed, gates green after each)
+
+Executed in 6 commits, one logical removal each, with the full gate
+(`typecheck` + `lint` + `pnpm test` + `build` + legacy `node --test`) run after every one.
+**No removal reddened the tree, so nothing had to be reverted and no verdict was reclassified.**
+
+| Commit | What | Files | LOC |
+|---|---|---:|---:|
+| `873e04b` | R8 — `packages/exports` + its `tsconfig.base.json` paths entry | −3 | −33 |
+| `9bd9e40` | R9 — `apps/card-action` | −3 | −37 |
+| `7c8353b` | R1+R2 — `PRReportModel`, `ShareModel` | −2 | −41 |
+| `f8221ae` | R3–R7 + R12 — 6 web files + 71 lines of orphaned CSS | −6 | −135 |
+| `2573240` | R10 — `Citation`, `ProjectSummary` | 0 | −21/+7 |
+| `cfa3ed5` | R11 — 11 dead symbols incl. the orphaned `llmBudgetSchema`/`LlmBudgetModel` | 0 | −22/+7 |
+
+**Totals:** tracked files **331 → 318 (−13)**; **−282 / +17 lines** (a net **−265**), excluding
+this manifest and the lockfile. `apps/web/src/styles.css` 1278 → 1207. Two pnpm workspace packages
+gone, so every `pnpm -r` run does two fewer typecheck/build/test invocations.
+
+Off-repo: `tmp/` + `temp/` (10 stale May smoke logs) + `codeflow.zip` deleted from disk — **1.96 MB**
+of working-tree junk, all already gitignored, so zero repo change and no `.gitignore` edit needed.
+
+**Test counts after — identical to before, nothing failed and nothing was lost:**
+analyzers 231 · eval 76 · arena 43 · web 60 · api 39 · graph 33 · parsers 28 · worker 13 ·
+shared-types 3 = **526**, legacy **25/25**. Also still green: the keyless `parity` and `check` CI
+steps, `docker compose config`, and all three Docker images rebuilt.
+
+`tsc --noUnusedLocals --noUnusedParameters` re-run after the pass reports **zero** unused locals or
+parameters across all 10 packages and apps (was 11).
+
+### Minor orphan left in place, on purpose
+`.button-row` in `styles.css` has zero `.tsx` references. It was NOT orphaned by anything in this
+pass (it predates it and is unrelated to any removed component) and it sits in a shared flex-utility
+group with `.badge-row`, which is live. Removing unrelated CSS was outside this pass's evidence
+chain, so it is recorded here rather than deleted on a hunch.
+
+---
+
 ## DECISIONS NEEDED (not acted on)
 
 1. **`screenshot.png` (1.0 MB) + `codeflow-social.png` (297 KB) — UNSURE, kept.**

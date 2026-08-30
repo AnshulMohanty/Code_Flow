@@ -3,7 +3,21 @@
 > Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
 > [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
 
-_Last updated: 2026-08-30 — V3-P0 (backfill): cost control plane, honest degradation, real golden set + Arena (branch `v3/p0-backfill-foundations-arena`)._
+_Last updated: 2026-08-30 — V3-CLEANUP: evidence-based dead-code + orphan-file removal (branch `v3/cleanup-deadcode`)._
+
+> ✅ **V3-CLEANUP is DONE** — a leaner tree by PROOF, not by eye. The audit lives in
+> [CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md), committed **before** anything was deleted: 13 REMOVE
+> verdicts each with a grep/import-graph receipt, 12 KEEP verdicts each with the reason written down
+> so the next pass does not re-litigate them, and 3 items left for the owner to call. Removed the
+> empty `@codeflow/exports` package, the `apps/card-action` stub, two never-written Mongo models,
+> six unreferenced web files (two of them placeholders superseded by shipped work) + 71 lines of
+> orphaned CSS, the `Citation`/`ProjectSummary` types V3-P0 orphaned, and 11 dead symbols — including
+> the `llmBudgetSchema`/`LlmBudgetModel` that V3-P0's move to the Redis budget left behind.
+> **331 → 318 tracked files, net −265 lines, and 526 tests + legacy 25/25 unchanged** — nothing
+> referenced any of it, which is the whole point. **Three of the brief's premises were wrong**:
+> ledger #4 and #15 were already done (the files do not exist here), and `card/examples/*.svg` are
+> real 1.7–12 KB SVGs, not zero-byte. `card/` is KEPT — it is a **published GitHub Action** with
+> external consumers whose analyzer reads `legacy/index.html` at runtime. Closes ledger #4 and #15.
 
 > ✅ **V3-P0 (Foundations + Arena) is DONE** — ran AFTER P1, out of plan order and by design (P1 did
 > not depend on it). Cost is now **measured**: one token utility, real provider usage read-back, and
@@ -549,6 +563,41 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-CLEANUP — dead code + orphan files (branch `v3/cleanup-deadcode`)
+
+> Full audit + every verdict with its evidence: **[CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md)**
+> (committed before any deletion, so the reasoning is reviewable separately from the diffs).
+
+- **Method, not vibes.** An import-graph orphan sweep over all 220 tracked `.ts`/`.tsx` files —
+  counting a reference from a test, a `package.json` script, a tsconfig path, a compose file,
+  a Dockerfile or a CI workflow as "referenced" — plus `tsc --noUnusedLocals --noUnusedParameters`
+  per package run as a REPORT (the flags were not committed), plus a targeted grep per candidate.
+- **Removed** (6 commits, full gate after each, none reverted): `packages/exports` (`export {};`,
+  zero importers) + its tsconfig paths entry · `apps/card-action` (placeholder, zero references,
+  and `V3_PLAN` §5 redirects that work to `apps/mcp`) · `PRReportModel` + `ShareModel` (never
+  imported ⇒ their collections were never read or written) · six unreferenced web files, two of them
+  placeholders superseded by shipped work (`GraphLegend`/`GraphToolbar` vs the real 2D graph's own
+  legend and controls) · 71 lines of CSS orphaned by those removals plus the last ledger-#15
+  remnants · the `Citation`/`ProjectSummary` types V3-P0 orphaned · 11 dead symbols.
+- **Two of the removals were my own V3-P0 leftovers**: the `Citation`/`ProjectSummary` types (orphaned
+  when `AiAnalysis.projectSummary` went) and `llmBudgetSchema`/`LlmBudgetModel` (orphaned when the
+  budget moved to Redis). Worth naming — a phase that removes hollowness can leave its own behind.
+- **Kept, with the reason recorded so it is not re-litigated.** `card/` is a **published GitHub
+  Action** (`action.yml` + a documented external-workflow consumer) whose `lib/analyzer.js` reads
+  `legacy/index.html` at runtime — an external consumer the hermetic suite cannot see, so deleting it
+  would be an external break. `legacy/index.html` is load-bearing twice (4 legacy tests parse it, and
+  `card/` reads it). **`docker-compose.yml` is not a duplicate** of `docker-compose.app.yml` — it is
+  dev-infra only (mongo + redis), which is what `pnpm dev:api`/`dev:worker` and the deferred wire
+  smoke need. `mockAnalysis.ts` backs 8 test files and a live demo button. `apps/local-cli` is
+  referenced by the root `dev:local` script. The commented-out `require` in the parity corpus is a
+  deliberate fixture proving the regex parser hallucinates imports from comments.
+- **Delta:** tracked files **331 → 318**; **−282/+17** lines (net −265); `styles.css` 1278 → 1207;
+  two fewer pnpm workspace packages (so two fewer invocations per `pnpm -r` run); 1.96 MB of
+  already-gitignored working-tree junk (`tmp/`, `temp/`, `codeflow.zip`) cleared off disk with zero
+  repo change. `tsc --noUnusedLocals --noUnusedParameters` now reports **zero** unused locals or
+  parameters repo-wide (was 11).
+- **Nothing broke.** Test counts are identical before and after — see Verification below.
+
 ### V3-P0 — Foundations + Arena (branch `v3/p0-backfill-foundations-arena`)
 
 > Ran **AFTER** V3-P1, out of plan order and by design: P1 did not depend on anything P0 builds, so
@@ -762,11 +811,10 @@ driven by injected fakes; in-memory remains the default everywhere.
 
 ## Verification
 
-`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **526 tests** (V3-P0: 380 -> 526,
-+146; V3-P1 before it: 308 -> 380): shared-types 3, graph 33, parsers 28, **analyzers 231** (+33
-tokens/budget/issues), **arena 43 (new package)**, **eval 76** (+49 answer path, judge, golden set),
-**api 39** (+12 Redis rate limit + persistence degradation), **web 60** (+9 degradation notices),
-worker 13 (unchanged count, +4 assertions inside existing tests) — confirmed **hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
+`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **526 tests**, UNCHANGED across
+V3-CLEANUP (removals touched only code nothing referenced): shared-types 3, graph 33, parsers 28,
+**analyzers 231**, **arena 43**, **eval 76**, **api 39**, **web 60**, worker 13 — confirmed
+**hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
 LLM/embedding + stubbed `fetch`/`EventSource` + **mocked `react-force-graph-2d`** (canvas never
 rendered in jsdom) throughout — zero real API/network calls/spend). NOTE: `pnpm -r test` (parallel)
 can OOM running all suites back-to-back with the heavier web env; run serially
@@ -789,6 +837,11 @@ parity report. The worker + api images were rebuilt to confirm the new `ioredis`
 break the `node:20-slim` runtime. The **scored** eval now has its own manual-dispatch workflow
 (`.github/workflows/eval-scored.yml`) with an approval environment and a concurrency lock; it stays out
 of the per-push gate because it needs real keys and spends money.
+
+V3-CLEANUP ran the FULL gate after every single removal commit (typecheck, lint, serial test, build,
+legacy `node --test`), so a reddened tree would have been caught and reverted at that commit rather
+than at the end — none was. At phase end all three Docker images (worker, api, web) were rebuilt, and
+the keyless `parity` + `check` CI steps and `docker compose config --quiet` are green.
 
 ## Not done here (by design)
 
@@ -870,10 +923,11 @@ former blocker — is **DONE** this session).
    relabelling by (size desc, lowest member fileId), weights rounded at 1e-10; verified byte-identical
    across re-runs and input orderings. Partitions the CPG **union** (imports + weighted
    call/inheritance edges) while `fanIn`/`fanOut` stay import-only - a documented, tested asymmetry.
-4. **Delete the unwired `analysisProcessor.ts` reference.** Production-dead (worker runs
-   `runAnalysisJob`; nothing imports `processAnalysisJob` except its own test), superseded by Connect
-   + Analyze. 415 lines + a 207-line test — flagged in the cleanup audit as too big to fold into an
-   unrelated session; delete it (and its test) as its own small change.
+4. **Delete the unwired `analysisProcessor.ts` reference. RESOLVED — it was already gone
+   (confirmed V3-CLEANUP).** The file and its test do NOT exist in this tree; `apps/worker/src/
+   processors/` holds only `pipelineJobProcessor.ts` + its test, and `git log --all` shows
+   `e46f859 chore: remove unwired analysisProcessor reference (ledger #4)`. This entry had simply
+   gone stale — the work happened, the ledger was never updated. Nothing to delete.
 5. **Real Anthropic adapter is integration-only.** `createAnthropicClient` (fetch-based, no SDK) is
    not unit-tested (tests mock the `LlmClient`); needs a manual/integration check with a real key.
    Token streaming to the UI is a separate P5 question. An **end-to-end smoke run** (real repo →
@@ -930,12 +984,13 @@ former blocker — is **DONE** this session).
     across API instances); only the in-memory store is wired/tested. (d) Guard 3 bounds async stalls
     only; CPU-bound sync parse hangs need worker-thread isolation. (e) `measureRepoSize` (fs walk) +
     `createMongoBudgetHandle` are integration-only (not in the hermetic suite).
-15. **Legacy P5-era mock panels are dead code (cleanup).** The dashboard (P16) replaced the old
-    `dashboard-layout` in `AppShell`; `RepositorySummary`, `ActionGrid`, `HealthPanel`,
-    `SecurityPanel`, `ArchitectureRulesPanel`, `PRRiskPanel`, `AIContextPanel`, `ExportPanel`,
-    `SettingsPanel`, `GraphPlaceholder`, `FileDetailDrawer` (+ the `selectedPanel`/`panelComponents`
-    machinery and `SelectedPanel`/`FileDetailTab` types) are no longer imported. They still compile
-    but are superseded — delete in a focused cleanup commit.
+15. **Legacy P5-era mock panels. ✅ RESOLVED (V3-CLEANUP).** All 11 components and the
+    `selectedPanel`/`panelComponents` machinery plus the `SelectedPanel`/`FileDetailTab` types were
+    already absent from this tree (grep for every name returns zero hits). What genuinely survived was
+    their orphaned CSS — `.dashboard-layout` (+ `.dashboard-main`/`.dashboard-side` and the 1100px
+    media-query override) and the `.file-drawer`/`.health-panel` sticky rules — removed in
+    V3-CLEANUP. Two superseded *graph* placeholders the entry did not name (`GraphLegend`,
+    `GraphToolbar`) were found by the orphan sweep and removed in the same pass.
 16. **Tree-sitter grammar coverage is JS/TS/JSX/TSX/Python only (V3-P1).** Every other language (Go,
     Rust, Java, Ruby, PHP, C#, C/C++, …) falls through to the regex/generic engine, so those files get
     no symbols and **no CPG enrichment** — they contribute graph nodes and (for the regex-covered

@@ -1471,3 +1471,108 @@ tested against fakes, never against a real server).
 Next session: **V3 Phase 2 — retrieval** (real vector store + AST-aware chunks + hybrid/rerank).
 It needs infra stood up first (vector store + object storage); Phase 0 and Phase 1 are now both
 complete, so Phase 2's entry gate is satisfied on the code side.
+
+## 2026-08-30 — V3-CLEANUP: dead-code + orphan-file removal (evidence-based) (branch `v3/cleanup-deadcode`)
+
+No new features. A leaner tree, arrived at by proof rather than by eye: every deletion carries a
+grep/import-graph receipt, every survivor carries a written reason so the next pass does not
+re-litigate it. The audit landed as `CLEANUP_MANIFEST.md` **before** any file was touched, so the
+verdicts are reviewable independently of the diffs that act on them. Seven commits: the manifest,
+then six removals, with the full gate after every one.
+
+**Method.** (1) An import-graph orphan sweep over all 220 tracked `.ts`/`.tsx` files, matching each
+file's module specifier against every tracked `.ts/.tsx/.js/.mjs/.cjs/.json/.yml/.sh/.bat/.html`
+file plus Dockerfiles — so a reference from a test, a `package.json` script, a tsconfig path, a
+compose file or a CI workflow counts as "referenced". (2) `tsc --noUnusedLocals
+--noUnusedParameters` per package, run as a REPORT (the flags were deliberately not committed).
+(3) A targeted grep per candidate named in the brief.
+
+**THREE OF THE BRIEF'S PREMISES WERE WRONG, and that is the most useful finding.**
+- `apps/worker/src/processors/analysisProcessor.ts` + its test (ledger #4, "~415+207 LOC") **do not
+  exist in this tree.** The directory holds only `pipelineJobProcessor.ts` + its test; `git log --all`
+  shows `e46f859 chore: remove unwired analysisProcessor reference (ledger #4)` on another branch.
+  Ledger #4 was satisfied long ago and the ledger entry was stale.
+- **None of the 11 ledger-#15 P5-era panels exist** — grep for all of them plus `selectedPanel` /
+  `panelComponents` / `SelectedPanel` / `FileDetailTab` across `apps/web/src` returns zero hits. Only
+  orphaned CSS survived (`.dashboard-layout`, `.file-drawer`, `.health-panel`), removed here.
+- `card/examples/*.svg` are **not** "10 zero-byte files" — they are 1.7–12.3 KB real rendered SVGs,
+  and the repo contains **zero** zero-byte tracked files. The premise for deleting them was false.
+
+**REMOVED (6 commits, gates green after each — nothing had to be reverted).**
+- `packages/exports` (3 files) — `src/index.ts` was literally `export {};`. Zero importers; its only
+  live reference was a `tsconfig.base.json` paths entry, removed in the same commit. It was still in
+  the pnpm workspace, so every `pnpm -r` run paid a typecheck/build/test invocation for zero output.
+- `apps/card-action` (3 files) — a stub returning `{status:"placeholder"}`. Zero importers, zero root
+  scripts, zero CI/compose references — and its TODO ("port the legacy card action") is obsolete:
+  `V3_PLAN.md` §5 redirects that work to `apps/mcp`. Isolated in its own commit because this is the
+  one removal resting on a roadmap judgement rather than pure deadness.
+- `PRReportModel` + `ShareModel` (41 LOC) — Mongoose models for `prReports`/`shares` that nothing
+  imports, so those collections are never read or written. Reference counts made it unambiguous:
+  AnalysisModel 4, JobModel 4, RepoModel 2, these two **0**. Safe by construction — Mongoose only
+  registers a model on import, so an unimported one is inert.
+- Six web files (60 LOC) + 71 lines of CSS. Two were self-declared placeholders superseded by shipped
+  work: `GraphLegend` (invented UI/API/Data/Risk categories; the real 2D graph renders its own legend
+  from actual node roles) and `GraphToolbar` (three dead buttons + a TODO for the 2D-graph migration
+  that landed in P17). `ErrorState`/`LoadingState` were functional but never imported — error and
+  loading surfaces are rendered inline where they are actually needed. `formatters.ts` was a 3-line
+  helper with no callers. `app/routes.tsx` was a one-entry route stub; `main.tsx` renders `<App/>`
+  directly and there is no router in the tree. The CSS orphaned by those components went in the same
+  commit, plus the last ledger-#15 remnants. `.state-box` was deliberately KEPT — `EmptyState` uses it.
+- `Citation` + `ProjectSummary` in shared-types — orphaned by **my own V3-P0 change**, which deleted
+  `AiAnalysis.projectSummary` for being producerless. That left `ProjectSummary` with no field to type
+  and `Citation` used only by it. Keeping them would reproduce exactly the smell V3-P0 removed; a note
+  at the removal site records that they return WITH a producer if Orient grows its AI summary.
+- 11 dead symbols. The substantive one is also a V3-P0 leftover: replacing the Mongo budget handle with
+  the shared Redis one orphaned `llmBudgetSchema` + `LlmBudgetModel` (a model for the `llmbudget`
+  collection nothing can now read or write) plus two unused imports in `workerAnalysisService.ts`. The
+  rest were unused imports/params across graph, parsers, and four test files. `inventoryCtx`'s unused
+  `readFile` param was removed along with both call sites that were passing an argument it ignored.
+
+Off-repo: `tmp/`, `temp/` (10 stale May smoke logs) and `codeflow.zip` deleted from disk — **1.96 MB**
+of working-tree junk. All were already gitignored (verified literal entries for `tmp/`, `temp/`,
+`*.zip`, `dist/`, `coverage/`, `*.log`), so this is zero repo change and needed no `.gitignore` edit.
+
+**KEPT, with the reason recorded** (12 entries in the manifest; the load-bearing ones):
+- **`card/` — all 26 files.** A *published* GitHub Action, not internal code: `action.yml` declares a
+  full documented input surface and its README documents consumption from an external workflow, so it
+  has consumers the hermetic suite cannot see. It is also functional — `card/lib/analyzer.js` reads
+  `legacy/index.html` and runs the analyzer in a Node `vm`. Deleting any of it is an external break.
+- `legacy/index.html` — load-bearing twice: four `tests/*.mjs` parse it AND `card/` reads it at runtime.
+- **`docker-compose.yml` is NOT a duplicate** of `docker-compose.app.yml`. It is dev-infra only
+  (mongo:7 + redis:7-alpine, 15 lines); `.app.yml` is the full app stack and is what every documented
+  path uses (`README`, `QUICKSTART`, `start.sh`, `start.bat`). Plain `docker compose up -d` picks up
+  this one, which is what `pnpm dev:api`/`dev:worker` and the deferred SSE/BullMQ wire smoke need.
+- `mockAnalysis.ts` — 8 test files import it AND `appStore.loadMockAnalysis` backs a live demo button.
+- `apps/local-cli` — the root `dev:local` script references it, so it is not an orphan.
+- `apps/web/public/config.js`, `.env.example`, `tests/fixtures/*` — runtime/fixture contracts.
+- The commented-out `require` at `packages/eval/src/parity/corpus.ts:36` is a **deliberate fixture**
+  proving the regex parser hallucinates an import out of a comment. Deleting it would silently weaken
+  that test. (Searched for real commented-out code; there is none.)
+
+**Delta.** Tracked files **331 → 318 (−13)**. **−282 / +17 lines** (net **−265**), excluding the
+manifest and lockfile. `styles.css` 1278 → 1207. Two fewer pnpm workspace packages, so every
+`pnpm -r` run does two fewer invocations. `tsc --noUnusedLocals --noUnusedParameters` now reports
+**zero** unused locals/params across all 10 packages and apps (was 11).
+
+**Verification — every gate green after every commit, and again at phase end.** Per-package tests are
+**unchanged**, which is the point: nothing referenced any of this. analyzers **231** · eval **76** ·
+arena **43** · web **60** · api **39** · graph **33** · parsers **28** · worker **13** ·
+shared-types **3** = **526**; legacy **25/25**. Also green: `pnpm -r typecheck`, `pnpm -r lint`,
+`pnpm -r build`, the keyless `parity` and `check` CI steps, `docker compose config --quiet`, and all
+three Docker images rebuilt (worker, api, web).
+
+**Judgment calls flagged.** (1) `apps/card-action` removed on a roadmap argument, isolated for easy
+revert. (2) `apps/local-cli` kept purely because a root script points at it — an equally minimal stub
+otherwise. (3) `.button-row` CSS is a leftover orphan NOT caused by this pass and unrelated to any
+removed component; recorded in the manifest rather than deleted on a hunch. (4) `screenshot.png`
+(1.0 MB) + `codeflow-social.png` (297 KB) have zero in-repo references but names strongly suggesting
+GitHub repo-settings / external usage — exactly the "might break a path the suite cannot see" case, so
+they were **not** deleted and are listed for the owner to call.
+
+**Ledger:** **#4 RESOLVED** (was already done on another branch — the entry was stale; the file does
+not exist here). **#15 RESOLVED** (the components were already gone; this pass removed the last CSS
+remnants). No new carries — the only two items this pass generated are the owner decisions above and
+the `.button-row` note, both recorded in `CLEANUP_MANIFEST.md`.
+
+Next session: **V3 Phase 2 — retrieval** (real vector store + AST-aware chunks + hybrid/rerank),
+still awaiting the vector-store / object-storage infra brief.
