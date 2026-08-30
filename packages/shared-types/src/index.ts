@@ -754,20 +754,13 @@ export interface RepoMetrics {
   summary: RepoMetricsSummary;
 }
 
-/** A grounding reference back to real code — every AI claim must carry these. */
-export interface Citation {
-  /** References FileNode.id. */
-  fileId: string;
-  path: string;
-  lineStart?: number;
-  lineEnd?: number;
-}
-
-/** AI 3-line "what is this project" (Orient). */
-export interface ProjectSummary {
-  text: string;
-  citations: Citation[];
-}
+// NOTE (V3-CLEANUP): `Citation` and `ProjectSummary` were removed here. V3-P0 deleted
+// `AiAnalysis.projectSummary` (producerless — nothing wrote it, nothing read it), which left
+// `ProjectSummary` as its only type and `Citation` used solely by `ProjectSummary.citations`.
+// Keeping them would have reproduced exactly the smell V3-P0 removed: a declared contract no
+// code writes or reads. They come back WITH a producer if Orient ever grows its AI summary.
+// The live citation shapes are elsewhere and untouched: `RagAnswerCitation` (@codeflow/
+// analyzers), `AskCitation` (apps/web), and `Synthesis.readingOrder` / `droppedCitations`.
 
 /**
  * One step in the onboarding reading order. `fileId === graph.nodes[].id === repo-relative
