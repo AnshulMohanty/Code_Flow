@@ -6,15 +6,43 @@ import {
   createRedisBudgetHandle,
   type RagAnswer,
 } from "@codeflow/analyzers";
+import {
+  askAgent,
+  createGraphTools,
+  createSearchTool,
+  createWhatChangedTool,
+  entitiesFrom,
+  type AgentAnswer,
+} from "@codeflow/agents";
 import { RAG_TOP_K } from "@codeflow/config";
-import { createRetrievalStores, type RetrievalStores } from "@codeflow/retrieval";
+import {
+  createMemoryRepoStore,
+  createMemorySessionStore,
+  createRedisSessionStore,
+  type RepoMemoryStore,
+  type SessionMemoryStore,
+} from "@codeflow/memory";
+import { createLexicalOverlapReranker, createRetrievalStores, type RetrievalStores } from "@codeflow/retrieval";
 import type { AnalysisCacheHandle, AnalysisResult, BudgetHandle } from "@codeflow/shared-types";
 import { env } from "../config/env.js";
 import { getSharedRedis, isSharedRedisEnabled } from "../queues/redisClient.js";
 
-/** Answers a question against a stored analysis' RAG index. Injectable so tests supply a mock
- *  (with mock chat/embedding clients) and the suite makes zero real calls. */
-export type AskHandler = (input: { result: AnalysisResult; question: string }) => Promise<RagAnswer>;
+/**
+ * Answers a question against a stored analysis. Injectable so tests supply a mock (with mock
+ * chat/embedding clients) and the suite makes zero real calls.
+ *
+ * V3-P3 widened the INPUT (a session id + the analysis id, for conversation memory) and the
+ * OUTPUT (`AgentAnswer` is a superset of `RagAnswer`) additively, so an existing test double that
+ * returns a plain `RagAnswer` still satisfies it.
+ */
+export type AskHandler = (input: {
+  result: AnalysisResult;
+  question: string;
+  /** Present when the client is continuing a conversation. Absent ⇒ a stateless one-shot ask. */
+  sessionId?: string;
+  /** The stored analysis' id — scopes a session so it cannot mix two repositories. */
+  analysisId?: string;
+}) => Promise<RagAnswer | AgentAnswer>;
 
 let testOverride: AskHandler | null = null;
 let productionHandler: AskHandler | null = null;
@@ -64,6 +92,50 @@ async function resolveBudget(): Promise<BudgetHandle> {
 export function resetQaBudgetForTests(): void {
   sharedBudget = null;
   sharedRetrieval = null;
+  sessionStore = null;
+  repoStore = null;
+}
+
+/**
+ * Conversation + repository memory (V3-P3).
+ *
+ * Redis-backed when a shared Redis is available, in-memory otherwise — and the fallback is
+ * ANNOUNCED, because it is a genuinely different product: an in-memory session lives in one API
+ * process's heap, so two replicas give a user two different conversations and a restart forgets
+ * every follow-up. Same honest-degradation rule V3-P0 applied to the budget.
+ *
+ * Repo memory stays in-memory for now, deliberately: "what changed" only becomes useful once
+ * several commits of a repository have been analysed, and a shared store for it is a P5 wiring
+ * task rather than something to half-build here. The consequence is stated where it is felt —
+ * `what_changed` will report "only one commit analysed" after a restart.
+ */
+let sessionStore: Promise<SessionMemoryStore> | null = null;
+let repoStore: RepoMemoryStore | null = null;
+
+function resolveSessionStore(): Promise<SessionMemoryStore> {
+  sessionStore ??= (async () => {
+    const redis = await getSharedRedis();
+    if (redis) return createRedisSessionStore({ redis: redis as never, onError: reportSessionError });
+    if (isSharedRedisEnabled()) {
+      console.warn(
+        "[codeflow] Q&A session memory: Redis unavailable — conversations are PER-PROCESS. " +
+          "Follow-ups will not resolve across replicas or survive a restart.",
+      );
+    }
+    return createMemorySessionStore();
+  })();
+  return sessionStore;
+}
+
+function reportSessionError(error: unknown, operation: string): void {
+  // Reported, never swallowed: a lost session costs context for one question, which is
+  // recoverable — but silence would make it undiagnosable.
+  console.warn(`[codeflow] session memory ${operation} failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+function resolveRepoStore(): RepoMemoryStore {
+  repoStore ??= createMemoryRepoStore();
+  return repoStore;
 }
 
 /**
@@ -107,14 +179,21 @@ function createInMemoryCache(): AnalysisCacheHandle {
 }
 
 /**
- * Production ask handler: build the chat + embedding clients from env (same provider selection
- * as the worker), then `answerQuestion` against the stored index. The embedding-space
- * homogeneity guard inside `answerQuestion` throws if the configured client can't match the
- * index — fail loud. Integration-only (needs real keys); the hermetic suite injects a mock.
+ * Production ask handler (V3-P3): the BOUNDED MULTI-TURN AGENT over graph tools + V3-P2 hybrid
+ * retrieval, with session memory so a follow-up resolves against prior turns.
+ *
+ * WHY THE SINGLE-SHOT PATH IS STILL HERE. `answerQuestion` remains the fallback for an analysis
+ * with an index but NO GRAPH — a pre-V3-P1 cached result. The agent's whole advantage is exact
+ * graph lookups; with no graph its tools return nothing and it would burn turns discovering that.
+ * Falling back is not hedging, it is picking the better path for the data that exists, and which
+ * one ran is visible in the response (an agent answer carries a `trace`).
+ *
+ * The homogeneity guard, the similarity floor, cache-before-budget and the daily ceiling all still
+ * apply — the first two inside `search_code`, the last two around every turn.
  */
 function createProductionAskHandler(): AskHandler {
   const cache = createInMemoryCache();
-  return async ({ result, question }) => {
+  return async ({ result, question, sessionId, analysisId }) => {
     const budget = await resolveBudget();
     const ragIndex = result.ai?.rag;
     if (!ragIndex) {
@@ -129,17 +208,65 @@ function createProductionAskHandler(): AskHandler {
       embeddingModel: embeddingClient.model,
       embeddingDim: embeddingClient.dimension,
     });
-    return answerQuestion({
-      question,
-      ragIndex,
+
+    const hasGraph = (result.graph?.nodes.length ?? 0) > 0;
+    if (!hasGraph) {
+      return answerQuestion({
+        question,
+        ragIndex,
+        vectorStore: retrieval.vectorStore,
+        textStore: retrieval.textStore,
+        chatClient,
+        embeddingClient,
+        cache,
+        budget,
+        commitSha: result.commitSha,
+        k: RAG_TOP_K,
+      });
+    }
+
+    const store = await resolveSessionStore();
+    const scopedAnalysisId = analysisId ?? result.id;
+    const memory = sessionId ? await store.load(sessionId) : null;
+
+    const searchTool = createSearchTool({
       vectorStore: retrieval.vectorStore,
       textStore: retrieval.textStore,
-      chatClient,
       embeddingClient,
-      cache,
-      budget,
-      commitSha: result.commitSha,
+      reranker: createLexicalOverlapReranker(),
       k: RAG_TOP_K,
     });
+
+    const answer = await askAgent({
+      question,
+      result,
+      chatClient,
+      budget,
+      tools: [...createGraphTools(), searchTool, createWhatChangedTool({ store: resolveRepoStore() })],
+      ...(memory ? { memory } : {}),
+    });
+
+    // Persist the turn ONLY when the client is running a session. A stateless ask must not create
+    // one, or a shared store would fill with single-turn sessions nobody can address.
+    if (sessionId) {
+      // Recover the retrieved chunks' METADATA from the index slice so `entitiesFrom` can derive
+      // symbol entities (a follow-up like "where is it declared?" resolves against those). The
+      // agent's answer carries only chunk ids; the coordinates and symbol names live here.
+      const byId = new Map(ragIndex.chunks.map((chunk) => [chunk.id, chunk]));
+      const chunks = answer.retrievedChunkIds
+        .map((id) => byId.get(id))
+        .filter((chunk): chunk is NonNullable<typeof chunk> => Boolean(chunk))
+        .map((chunk) => ({ ...chunk, text: "", fusedScore: 0, sources: ["vector" as const] }));
+      await store.append(sessionId, scopedAnalysisId, {
+        question,
+        answer: answer.answer,
+        answered: answer.answered,
+        citations: answer.citations,
+        retrievedChunkIds: answer.retrievedChunkIds,
+        toolsUsed: [...new Set(answer.trace.turns.map((turn) => turn.toolCalled).filter((id): id is string => Boolean(id)))],
+        entities: entitiesFrom(answer, chunks),
+      });
+    }
+    return answer;
   };
 }

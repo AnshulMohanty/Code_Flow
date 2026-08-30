@@ -9,7 +9,9 @@
     "lib": ["ES2022"],
     "types": ["node"],
     "paths": {
+      "@codeflow/agents": ["packages/agents/dist/index.d.ts"],
       "@codeflow/analyzers": ["../../packages/analyzers/dist/index.d.ts"],
+      "@codeflow/memory": ["packages/memory/dist/index.d.ts"],
       "@codeflow/config": ["../../packages/config/dist/index.d.ts"],
       "@codeflow/retrieval": ["packages/retrieval/dist/index.d.ts"],
       "@codeflow/shared-types": ["../../packages/shared-types/dist/index.d.ts"]

@@ -373,6 +373,52 @@ describe("codeflow api", () => {
     expect(response.body.answered).toBe(false);
   });
 
+  it("POST /api/result/:id/ask passes a sessionId through and echoes it back (V3-P3)", async () => {
+    // The conversation contract: the client sends a session id, the handler receives it (so the
+    // agent can load prior turns), and the response echoes it so the client can continue.
+    const seen: Array<{ sessionId?: string; analysisId?: string }> = [];
+    setAskHandlerForTests(async ({ sessionId, analysisId }) => {
+      seen.push({ sessionId, analysisId });
+      return { answer: "ok", answered: true, citations: [], retrievedChunkIds: [] };
+    });
+    const jobId = await seedAskJob();
+
+    const response = await request(app)
+      .post(`/api/result/${jobId}/ask`)
+      .send({ question: "what about its callers?", sessionId: "sess-abc_1.2" })
+      .expect(200);
+    expect(response.body.sessionId).toBe("sess-abc_1.2");
+    expect(seen[0].sessionId).toBe("sess-abc_1.2");
+    // The analysis id is passed too, so a session cannot mix two repositories.
+    expect(seen[0].analysisId).toBeTruthy();
+  });
+
+  it("POST /api/result/:id/ask omits the session entirely for a stateless ask", async () => {
+    // A one-shot ask must not create a session, or a shared store fills with single-turn
+    // sessions nobody can address again.
+    const seen: Array<string | undefined> = [];
+    setAskHandlerForTests(async ({ sessionId }) => {
+      seen.push(sessionId);
+      return { answer: "ok", answered: true, citations: [], retrievedChunkIds: [] };
+    });
+    const jobId = await seedAskJob();
+    const response = await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(200);
+    expect(seen[0]).toBeUndefined();
+    expect(response.body.sessionId).toBeUndefined();
+  });
+
+  it("POST /api/result/:id/ask REJECTS a malformed sessionId rather than sanitising it", async () => {
+    // A session id becomes a STORE KEY: unbounded length is a memory-exhaustion vector, and
+    // separators could collide with another namespace in a shared Redis. Rejecting beats silently
+    // rewriting, which would hand the client a session it cannot address again.
+    setAskHandlerForTests(async () => ({ answer: "ok", answered: true, citations: [], retrievedChunkIds: [] }));
+    const jobId = await seedAskJob();
+    for (const bad of ["a".repeat(65), "has spaces", "colon:separated", "slash/es"]) {
+      await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?", sessionId: bad }).expect(400);
+    }
+    await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?", sessionId: 42 }).expect(400);
+  });
+
   it("POST /api/result/:id/ask rejects an empty question (400) and an unknown job (404)", async () => {
     const jobId = await seedAskJob();
     await request(app).post(`/api/result/${jobId}/ask`).send({ question: "  " }).expect(400);
