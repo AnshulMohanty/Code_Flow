@@ -7,6 +7,7 @@ import type {
   ProgressMessage,
 } from "@codeflow/shared-types";
 import type { RepoCloner } from "@codeflow/analyzers";
+import type { TraceReport } from "@codeflow/observability";
 import { runAnalysisJob } from "./pipelineJobProcessor.js";
 import type { SavedWorkerAnalysis, WorkerAnalysisService, WorkerJobPatch } from "../services/workerAnalysisService.js";
 
@@ -212,6 +213,82 @@ describe("runAnalysisJob", () => {
       expect(outcome.skippedStages).not.toContain("synthesize");
       expect(outcome.status).not.toBe("failed");
     }
+  });
+
+  it("produces a COMPLETE trace with per-span tokens and cost for a run (V3-P5 acceptance)", async () => {
+    // The task-2 acceptance criterion, asserted on a real run rather than on a unit fixture. Spans
+    // are derived from the EXISTING progress events, so a stage that forgot to instrument itself
+    // cannot go missing from the trace.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      pricing: { "mock-model": { inputPerMillion: 1, outputPerMillion: 2 } },
+      onTrace: (report) => traces.push(report),
+    });
+
+    expect(traces).toHaveLength(1);
+    const trace = traces[0];
+    // COMPLETE: every span was ended, including on the paths that skip stages — so its durations
+    // are facts rather than lower bounds.
+    expect(trace.complete).toBe(true);
+    expect(trace.traceId).toBe(payload.jobId);
+    // The root run span plus one span per deterministic stage.
+    expect(trace.spans[0].kind).toBe("run");
+    expect(trace.spans.map((span) => span.name)).toContain("stage:ingest");
+    expect(trace.spans.map((span) => span.name)).toContain("stage:connect");
+    // Cost is reported from real usage; with no paid calls in this fixture there is no spend, and
+    // the token counts are still present rather than absent.
+    expect(trace.cost.inputTokens).toBe(0);
+    expect(trace.cost.measured).toBe(true);
+    // And the interaction graph shows the run → stage shape.
+    expect(trace.interactions.edges.every((edge) => edge.from === "run")).toBe(true);
+  });
+
+  it("finishes the trace on the FAILURE path too", async () => {
+    // A tracer that only reported successful runs would be blind to exactly the runs anyone wants
+    // to look at.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    const cloner = fakeCloner({ clone: vi.fn(async () => { throw new Error("invalid repo url"); }) });
+    await runAnalysisJob(payload, {
+      service,
+      cloner,
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      onTrace: (report) => traces.push(report),
+    });
+    expect(traces).toHaveLength(1);
+    expect(traces[0].complete).toBe(true);
+    expect(traces[0].spans[0].status).toBe("error");
+  });
+
+  it("an EXPORTER that throws cannot fail the run it observes", async () => {
+    // An observability layer that can fail the thing it observes is worse than none, and it fails in
+    // exactly the situation you most need the trace.
+    const { service } = fakeService(null);
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      traceExporter: {
+        id: "explodes",
+        async export() {
+          throw new Error("collector unreachable");
+        },
+      },
+    });
+    expect(outcome.status).not.toBe("failed");
   });
 
   it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {

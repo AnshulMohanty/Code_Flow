@@ -17,6 +17,7 @@
       "@codeflow/agents": ["packages/agents/src/index.ts"],
       "@codeflow/config": ["packages/config/src/index.ts"],
       "@codeflow/graph": ["packages/graph/src/index.ts"],
+      "@codeflow/observability": ["packages/observability/src/index.ts"],
       "@codeflow/parsers": ["packages/parsers/src/index.ts"],
       "@codeflow/memory": ["packages/memory/src/index.ts"],
       "@codeflow/retrieval": ["packages/retrieval/src/index.ts"],

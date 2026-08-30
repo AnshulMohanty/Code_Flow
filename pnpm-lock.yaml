@@ -137,6 +137,9 @@ importers:
       '@codeflow/graph':
         specifier: workspace:*
         version: link:../../packages/graph
+      '@codeflow/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
       '@codeflow/parsers':
         specifier: workspace:*
         version: link:../../packages/parsers
@@ -245,6 +248,15 @@ importers:
         version: link:../shared-types
 
   packages/memory:
+    dependencies:
+      '@codeflow/config':
+        specifier: workspace:*
+        version: link:../config
+      '@codeflow/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
+
+  packages/observability:
     dependencies:
       '@codeflow/config':
         specifier: workspace:*

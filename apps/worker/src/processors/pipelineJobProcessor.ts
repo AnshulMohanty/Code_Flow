@@ -32,6 +32,13 @@ import type {
   RunMode,
 } from "@codeflow/shared-types";
 import { createAdaptiveSynthesizeStage, createFanOutSynthesizeStage } from "@codeflow/agents";
+import {
+  createRecordingTracer,
+  renderTrace,
+  type PricingTable,
+  type TraceExporter,
+  type TraceReport,
+} from "@codeflow/observability";
 import type { ChunkTextStore, VectorStore } from "@codeflow/retrieval";
 import type { WorkerAnalysisService } from "../services/workerAnalysisService.js";
 
@@ -70,6 +77,17 @@ export interface PipelineJobDependencies {
    * deterministic spine, and the slices are proven byte-identical either way.
    */
   parallelStages?: boolean;
+  /**
+   * V3-P5 observability: prices per model, for the per-run cost figure. INJECTED rather than baked
+   * in — prices change, differ per account, and a stale table would report confident wrong money.
+   * Absent ⇒ token counts are still reported and `usd` comes back null (never 0, which reads as free).
+   */
+  pricing?: PricingTable;
+  /** Optional trace sink (Langfuse/Helicone/OTel). Absent ⇒ nothing is exported and no code path
+   *  can reach a network, which is what "off in tests" means in practice. */
+  traceExporter?: TraceExporter;
+  /** Called with the finished trace — the seam the hermetic test asserts through. */
+  onTrace?(report: TraceReport): void;
   /** Embedding client for the RAG (AI) stage. When absent (no VOYAGE_API_KEY), RAG is NOT
    *  registered and `configured.ai` simply omits it (the P10 coverage partition stays
    *  correct — an ANTHROPIC-only setup runs Synthesize but not RAG). */
@@ -210,6 +228,53 @@ export async function runAnalysisJob(
     currentStep: "Ingesting repository.",
   });
 
+  // --- V3-P5 OBSERVABILITY ---------------------------------------------------
+  // One tracer per JOB, not per process: a trace is the unit a human replays, and a process-wide
+  // tracer would interleave concurrent jobs into one unreadable tree.
+  const tracer = createRecordingTracer({
+    traceId: payload.jobId,
+    ...(deps.pricing ? { pricing: deps.pricing } : {}),
+  });
+  const runSpan = tracer.startSpan("run", "run", {
+    jobId: payload.jobId,
+    repo: `${payload.repositoryRef.owner ?? ""}/${payload.repositoryRef.name}`,
+    mode: payload.mode,
+    analyzerVersion: payload.analyzerVersion,
+  });
+  /** Open stage spans, so the emitter can close the right one. */
+  const stageSpans = new Map<string, ReturnType<typeof runSpan.child>>();
+
+  /**
+   * Close the run span and hand the trace on. Idempotent, and it NEVER throws: an observability
+   * layer that can fail the run it observes is worse than none, and it would fail in exactly the
+   * situation you most need the trace.
+   */
+  let traceFinished = false;
+  const finishTrace = async (status: "ok" | "error", error?: string): Promise<void> => {
+    if (traceFinished) return;
+    traceFinished = true;
+    try {
+      // Any stage span still open means the run ended mid-stage; ending them keeps the trace
+      // COMPLETE so its durations are facts rather than lower bounds.
+      for (const [stage, span] of stageSpans) {
+        span.addEvent("unfinished", { stage });
+        span.end();
+      }
+      stageSpans.clear();
+      runSpan.setStatus(status, error);
+      runSpan.end();
+      const report = tracer.report();
+      deps.onTrace?.(report);
+      if (deps.traceExporter) await deps.traceExporter.export(report);
+      // Only the header lines: the full span tree belongs in an exporter, not in a worker's stdout.
+      console.log(renderTrace(report).split("\n").slice(0, 2).join(" | "));
+    } catch (traceError) {
+      console.warn(
+        `[worker] trace finalisation failed (ignored): ${traceError instanceof Error ? traceError.message : String(traceError)}`,
+      );
+    }
+  };
+
   try {
     const stages: PipelineStage[] = [
       createIngestStage({ cloner, measureRepoSize: deps.measureRepoSize, now }),
@@ -252,6 +317,24 @@ export async function runAnalysisJob(
     }
     const { result: ranResult, cached } = await runPipeline(stages, input, {
       emit: (event) => {
+        // Spans are derived from the EXISTING progress events rather than by instrumenting each
+        // stage: the events already carry stage, status, duration and a preview, so a second
+        // instrumentation path would be a second thing to keep in step — and it would miss any
+        // stage that forgot to call it.
+        if (event.status === "completed" || event.status === "failed" || event.status === "skipped") {
+          const open = stageSpans.get(event.stage);
+          const span = open ?? runSpan.child(`stage:${event.stage}`, "stage", { kind: event.kind });
+          if (event.durationMs !== undefined) span.setAttribute("reportedDurationMs", event.durationMs);
+          for (const [key, value] of Object.entries(event.preview ?? {})) {
+            if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+              span.setAttribute(`preview.${key}`, value);
+            }
+          }
+          if (event.status === "failed") span.setStatus("error", event.error?.message ?? "stage failed");
+          else if (event.status === "skipped") span.addEvent("skipped", { detail: event.detail ?? "" });
+          span.end();
+          stageSpans.delete(event.stage);
+        }
         void deps.publisher.publishProgress(payload.jobId, event);
         // Persist to the replay buffer (#20) so a late connection still sees this stage.
         void deps.eventLog?.append(payload.jobId, { kind: "progress", jobId: payload.jobId, event });
@@ -321,9 +404,13 @@ export async function runAnalysisJob(
 
     await deps.eventLog?.append(payload.jobId, { kind: "done", jobId: payload.jobId, status });
     await deps.publisher.publishDone(payload.jobId, status);
+    await finishTrace(status === "failed" ? "error" : "ok", status === "failed" ? "run failed" : undefined);
     return { analysisId, cached, status, skippedStages, runMode, degradations };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown analysis error.";
+    // The trace is finished on the FAILURE path too. A tracer that only reported successful runs
+    // would be blind to exactly the runs anyone wants to look at.
+    await finishTrace("error", message);
     await deps.service.updateJob(payload.jobId, {
       status: "failed",
       runStatus: "failed",
