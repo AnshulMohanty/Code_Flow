@@ -21,10 +21,15 @@
     "test": "vitest run --passWithNoTests",
     "lint": "tsc -p tsconfig.json --noEmit",
     "preparity": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
-    "parity": "tsx src/parity/cli.ts"
+    "parity": "tsx src/parity/cli.ts",
+    "precheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "check": "tsx src/checkCli.ts",
+    "preeval:scored": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "eval:scored": "tsx src/scoredCli.ts"
   },
   "dependencies": {
     "@codeflow/analyzers": "workspace:*",
+    "@codeflow/config": "workspace:*",
     "@codeflow/parsers": "workspace:*",
     "@codeflow/shared-types": "workspace:*"
   },

@@ -73,6 +73,14 @@ export interface PerQuestionResult {
   hit: boolean;
   /** Expected targets NOT found in the top-k (surfaced, not hidden). */
   missed: string[];
+  /**
+   * True when the question has NO expected targets — a deliberate NEGATIVE CONTROL asking
+   * something the repo cannot answer. Retrieval always returns a top-k, so such a question
+   * has nothing to recall and is EXCLUDED from recall/MRR (see aggregateRag). Its value is
+   * on the answer path, where an honest refusal is the correct behaviour and is scored as
+   * `refusalJustified`. Counting it as recall 0 would penalise exactly the right answer.
+   */
+  negativeControl: boolean;
 }
 
 export interface RagScores {
@@ -80,7 +88,10 @@ export interface RagScores {
   meanRecallAtK: number;
   /** Mean reciprocal rank across questions. */
   mrr: number;
+  /** Questions the means are computed over — negative controls EXCLUDED. */
   questionCount: number;
+  /** Negative-control questions present but not scored here (scored on the answer path). */
+  negativeControlCount: number;
 }
 
 interface Target {
@@ -136,13 +147,30 @@ export function scoreQuestion(question: RagEvalQuestion, chunks: RagChunk[], que
     reciprocalRank,
     hit: recallAtK > 0,
     missed: targets.filter((target) => !hitLabels.has(target.label)).map((target) => target.label),
+    negativeControl: targets.length === 0,
   };
 }
 
 /** Aggregate per-question results into mean recall@k + MRR. */
+/**
+ * Aggregate retrieval scores over the questions that HAVE targets.
+ *
+ * Negative controls (no expected files — a question the repo cannot answer) are excluded
+ * rather than scored 0: retrieval always returns a top-k, so there is nothing for them to
+ * recall, and averaging them in would penalise the very behaviour they exist to test. They
+ * are counted separately so their presence is visible, and they are genuinely scored on the
+ * answer path via `refusalJustified`.
+ */
 export function aggregateRag(perQuestion: PerQuestionResult[], k: number): RagScores {
-  const n = perQuestion.length;
-  const meanRecallAtK = n === 0 ? 0 : perQuestion.reduce((sum, r) => sum + r.recallAtK, 0) / n;
-  const mrr = n === 0 ? 0 : perQuestion.reduce((sum, r) => sum + r.reciprocalRank, 0) / n;
-  return { k, meanRecallAtK, mrr, questionCount: n };
+  const scored = perQuestion.filter((entry) => !entry.negativeControl);
+  const n = scored.length;
+  const meanRecallAtK = n === 0 ? 0 : scored.reduce((sum, r) => sum + r.recallAtK, 0) / n;
+  const mrr = n === 0 ? 0 : scored.reduce((sum, r) => sum + r.reciprocalRank, 0) / n;
+  return {
+    k,
+    meanRecallAtK,
+    mrr,
+    questionCount: n,
+    negativeControlCount: perQuestion.length - n,
+  };
 }

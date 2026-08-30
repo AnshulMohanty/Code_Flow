@@ -89,9 +89,9 @@ describe("aggregateRag", () => {
   it("means recall and reciprocal rank across questions", () => {
     const agg = aggregateRag(
       [
-        { id: "a", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 1, hit: true, missed: [] },
-        { id: "b", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 0.5, hit: true, missed: [] },
-        { id: "c", question: "", retrieved: [], recallAtK: 0, reciprocalRank: 0, hit: false, missed: ["x"] },
+        { id: "a", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 1, hit: true, missed: [], negativeControl: false },
+        { id: "b", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 0.5, hit: true, missed: [], negativeControl: false },
+        { id: "c", question: "", retrieved: [], recallAtK: 0, reciprocalRank: 0, hit: false, missed: ["x"], negativeControl: false },
       ],
       5,
     );

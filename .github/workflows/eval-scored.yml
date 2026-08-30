@@ -1,0 +1,83 @@
+name: Eval (scored — manual, uses secrets)
+
+# The REAL scored eval. Kept OUT of the per-push CI on purpose:
+#   * it needs a live embedding + chat provider key, so it cannot be hermetic;
+#   * it spends money on every run;
+#   * it clones and analyzes real repositories, so it is slow.
+#
+# The per-push gate (ci.yml) runs the HERMETIC half instead: golden-set validation,
+# determinism, and the keyless parser-parity report. This workflow is the out-of-band
+# counterpart, triggered by hand when someone wants real numbers.
+#
+# THRESHOLDS ARE STILL PLACEHOLDERS. This workflow therefore does NOT fail the build on a
+# threshold miss by default — it publishes the report so the numbers can be read and the
+# thresholds calibrated FROM them. Flip `fail-on-threshold` once they are real.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: 'Dataset name from packages/eval/datasets (e.g. "chalk", "requests"), or "all"'
+        required: true
+        default: all
+      fail-on-threshold:
+        description: "Fail the run when a threshold is missed (leave false until thresholds are calibrated)"
+        required: false
+        type: boolean
+        default: false
+
+# One scored run at a time: they cost money, and two concurrent runs would double the spend
+# for no extra information.
+concurrency:
+  group: eval-scored
+  cancel-in-progress: false
+
+jobs:
+  scored:
+    name: Scored eval
+    runs-on: ubuntu-latest
+    # A manual approval gate on the environment is the right place to control who can spend.
+    environment: eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Use Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm -r build
+
+      # Fail fast on a malformed golden set BEFORE spending anything on embeddings.
+      - name: Validate the golden set (hermetic)
+        run: pnpm --filter @codeflow/eval run check
+
+      # Produces an AnalysisResult per dataset (clone -> full pipeline incl. the AI stages),
+      # then scores it. `pnpm eval` reads the same datasets the hermetic check validated.
+      - name: Run the scored eval
+        env:
+          # Provider keys. A single GEMINI_API_KEY can power both chat and embeddings.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          EVAL_DATASET: ${{ inputs.dataset }}
+          EVAL_FAIL_ON_THRESHOLD: ${{ inputs.fail-on-threshold }}
+        run: pnpm --filter @codeflow/eval run eval:scored
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: packages/eval/reports/
+          if-no-files-found: warn

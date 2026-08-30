@@ -51,6 +51,14 @@ jobs:
       - name: Parser parity (tree-sitter vs regex)
         run: pnpm --filter @codeflow/eval run parity
 
+      # V3-P0 §0.4: the HERMETIC half of the eval check. It cannot verify a SCORE (that needs
+      # an embedding key and costs money — see eval-scored.yml), so it verifies the things a
+      # rotting golden set fails first: every dataset validates, is pinned to a full commit
+      # hash, records its provenance, is substantial, includes negative controls, covers both
+      # parser families, and loads byte-identically twice.
+      - name: Eval golden set (hermetic — validation + determinism, no secrets)
+        run: pnpm --filter @codeflow/eval run check
+
       - name: Legacy root tests
         run: node --test tests/*.mjs
 

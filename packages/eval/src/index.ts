@@ -8,9 +8,40 @@ export {
   EVAL_SCHEMA_VERSION,
   TEMPLATE_DATASET,
   assertDatasetShape,
+  type DatasetProvenance,
   type EvalDataset,
   type RagEvalQuestion,
 } from "./dataset.js";
+// V3-P0: the authored golden set + its loader (runtime-validated at the file boundary).
+export {
+  loadGoldenDatasets,
+  totalNegativeControls,
+  totalQuestions,
+  type LoadedDataset,
+} from "./datasets.js";
+// V3-P0: answer-path scoring + the calibrated judge.
+export {
+  aggregateAnswers,
+  scoreAnswer,
+  type AggregateAnswerScores,
+  type AnswerScores,
+  type PerAnswerResult,
+} from "./answerScore.js";
+export {
+  buildJudgePrompt,
+  calibrateJudge,
+  cohensKappa,
+  judgeIsGateable,
+  parseJudgeVerdict,
+  waldInterval,
+  JUDGE_GATE_REQUIREMENTS,
+  JUDGE_SYSTEM_PROMPT,
+  type Judge,
+  type JudgeConcordance,
+  type JudgeLabel,
+  type JudgeRequest,
+  type JudgeVerdict,
+} from "./judge.js";
 // Retrieval is the ONE production primitive (hoisted to @codeflow/analyzers in P18) — re-exported
 // here so existing eval consumers keep working and eval measures the SAME retrieval as production.
 export { cosineSimilarity, retrieve } from "@codeflow/analyzers";
@@ -26,6 +57,7 @@ export { EVAL_THRESHOLDS, type EvalThresholds } from "./thresholds.js";
 export {
   runEval,
   assertHomogeneity,
+  type AnswerRunner,
   type EvalReport,
   type RunEvalOptions,
 } from "./runEval.js";

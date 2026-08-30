@@ -1,0 +1,70 @@
+{
+  "evalSchemaVersion": 1,
+  "provenance": {
+    "authoredOn": "2026-08-30",
+    "authoredIn": "V3-P0 §0.4",
+    "method": "Cloned at the pinned SHA and read the source. Every expectedFile and every expectedLines range below was verified against the actual file at that SHA — nothing here is inferred from the repository's reputation or from memory.",
+    "measures": "The tree-sitter parsing + CPG pipeline from V3-P1 (ANALYZER_VERSION 1.1.0). A pre-V3-P1 regex-parsed run of the same repo is NOT comparable against these numbers, because symbol extraction changed.",
+    "whyThisRepo": "Small, real, pure-ESM JavaScript with a genuine internal structure (public entry, utilities, two vendored subsystems). It exercises the JS grammar, relative-import resolution, and the `#ansi-styles` subpath-imports case that our resolver deliberately does NOT resolve — so the graph's `unresolved` tally is exercised honestly rather than avoided.",
+    "thresholdStatus": "EVAL_THRESHOLDS are still PLACEHOLDERS. Calibrate them from the out-of-band scored run against this dataset before any gating decision."
+  },
+  "repoUrl": "https://github.com/chalk/chalk",
+  "commitSha": "661317e6f91fe7c90306c2c48ea9354562ee9146",
+  "embeddingModel": "gemini-embedding-001",
+  "embeddingDim": 768,
+  "synthesis": {
+    "expectedEntryPoints": ["source/index.js"]
+  },
+  "questions": [
+    {
+      "id": "chalk-q1",
+      "question": "How does chalk decide whether the terminal supports color, and how does FORCE_COLOR affect it?",
+      "expectedFiles": ["source/vendor/supports-color/index.js"],
+      "expectedLines": [{ "fileId": "source/vendor/supports-color/index.js", "startLine": 33, "endLine": 56 }]
+    },
+    {
+      "id": "chalk-q2",
+      "question": "Where are the ANSI escape codes for colors and modifiers defined?",
+      "expectedFiles": ["source/vendor/ansi-styles/index.js"],
+      "expectedLines": [{ "fileId": "source/vendor/ansi-styles/index.js", "startLine": 13, "endLine": 104 }]
+    },
+    {
+      "id": "chalk-q3",
+      "question": "How does chalk build up a chain of nested styles like chalk.red.bold?",
+      "expectedFiles": ["source/index.js"],
+      "expectedLines": [{ "fileId": "source/index.js", "startLine": 152, "endLine": 198 }]
+    },
+    {
+      "id": "chalk-q4",
+      "question": "How is the style actually applied to a string, and how are already-styled substrings handled?",
+      "expectedFiles": ["source/index.js", "source/utilities.js"],
+      "expectedLines": [
+        { "fileId": "source/index.js", "startLine": 199, "endLine": 232 },
+        { "fileId": "source/utilities.js", "startLine": 2, "endLine": 19 }
+      ]
+    },
+    {
+      "id": "chalk-q5",
+      "question": "What is the public API of the chalk package and how do I create an instance with a fixed color level?",
+      "expectedFiles": ["source/index.js"],
+      "expectedLines": [{ "fileId": "source/index.js", "startLine": 45, "endLine": 62 }]
+    },
+    {
+      "id": "chalk-q6",
+      "question": "How does chalk handle line breaks inside styled text?",
+      "expectedFiles": ["source/utilities.js"],
+      "expectedLines": [{ "fileId": "source/utilities.js", "startLine": 21, "endLine": 33 }]
+    },
+    {
+      "id": "chalk-q7",
+      "question": "Which validation rejects an invalid color level?",
+      "expectedFiles": ["source/index.js"],
+      "expectedLines": [{ "fileId": "source/index.js", "startLine": 17, "endLine": 34 }]
+    },
+    {
+      "id": "chalk-q8",
+      "question": "How does the database connection pool get configured?",
+      "expectedFiles": []
+    }
+  ]
+}
