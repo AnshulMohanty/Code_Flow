@@ -200,7 +200,7 @@ export function mockEmbed(dim = 3): MockEmbed {
  * latter is how a test asserts that the prompt actually contained what it should before the model
  * "decides" anything.
  */
-export type ScriptEntry = string | ((prompt: string) => string);
+export type ScriptEntry = string | ((prompt: string) => string | Promise<string>);
 
 export interface ScriptedChat extends LlmClient {
   prompts: string[];
@@ -230,7 +230,9 @@ export function scriptedChat(script: readonly ScriptEntry[]): ScriptedChat {
       // A script that runs out REPEATS its last entry rather than throwing: several tests
       // deliberately let the loop hit its turn cap, and an exception there would be testing the
       // fixture rather than the cap.
-      const text = typeof entry === "function" ? entry(request.prompt) : entry;
+      // Awaited, so a script entry can introduce a real delay — which is what the V3-P4
+      // concurrency probe needs in order to have anything to overlap.
+      const text = typeof entry === "function" ? await entry(request.prompt) : entry;
       return { text, usage: { inputTokens: 100, outputTokens: 20, measured: true } };
     },
   };

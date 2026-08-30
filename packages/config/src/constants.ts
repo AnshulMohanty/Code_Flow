@@ -132,3 +132,39 @@ export const SESSION_MAX_CHUNK_IDS = 200;
 export const SESSION_MAX_ANSWER_CHARS = 600;
 /** Snapshots kept per repository. "What changed recently", not a full history. */
 export const REPO_MAX_SNAPSHOTS = 10;
+
+// -- Bounded agent fan-out + test-time compute (V3-P4; P5-tunable) -----------
+// PARALLELISM IS EARNED HERE, not assumed: the fan-out is over V3-P1's Louvain communities,
+// which are low-coupling by construction, so per-community work is genuinely independent.
+/** Max specialist workers in flight at once. Bounds provider concurrency (rate limits) and
+ *  peak memory, NOT the number of communities — a 60-community repo still gets all 60 analysed,
+ *  in waves. */
+export const FANOUT_MAX_CONCURRENCY = 5;
+/** Max communities analysed per run. A repo with more gets the most COMPLEX ones (see
+ *  `complexityOf`), and the omission is REPORTED — a silent cap reads as "covered everything". */
+export const FANOUT_MAX_COMMUNITIES = 12;
+/** Files from a community shown to one specialist. Input safety AND a cost bound: a specialist
+ *  reasoning over 400 files is a specialist reasoning over noise. */
+export const SPECIALIST_MAX_FILES = 25;
+/** Characters of a specialist's `detail` kept on the blackboard. Bounded because the SUPERVISOR
+ *  reads it, and the supervisor's context must not grow with worker count. */
+export const SPECIALIST_MAX_DETAIL_CHARS = 400;
+/** Max findings one specialist may return per community. */
+export const SPECIALIST_MAX_FINDINGS = 3;
+
+// THE property that makes the orchestrator scale: the supervisor sees a BOUNDED selection of the
+// blackboard, chosen deterministically by importance. With 5 workers or 500, its prompt has the
+// same ceiling — which is the documented failure at 4+ workers, avoided by construction rather
+// than by hoping summaries stay short.
+/** Findings handed to the supervisor, at most. */
+export const SUPERVISOR_MAX_FINDINGS = 12;
+/** Reading-order steps the supervisor may produce. */
+export const SUPERVISOR_MAX_READING_STEPS = 10;
+
+// Test-time compute. N-times cost is paid ONLY on the routed-hard tail, never repo-wide.
+/** Complexity score at or above which a community is "hard" and gets best-of-N. */
+export const HARD_COMMUNITY_COMPLEXITY = 0.6;
+/** Trajectories sampled for a hard community. */
+export const BEST_OF_N = 3;
+/** Max communities that may be routed hard in one run — the ceiling on the N-times bill. */
+export const MAX_HARD_COMMUNITIES = 3;

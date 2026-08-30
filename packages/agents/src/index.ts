@@ -52,3 +52,61 @@ export {
 } from "./tools/graphTools.js";
 export { createSearchTool, type SearchToolDeps } from "./tools/searchTool.js";
 export { createWhatChangedTool, type WhatChangedToolDeps } from "./tools/whatChangedTool.js";
+
+// -- V3-P4: bounded agent fan-out + test-time compute -------------------------
+// Fan out specialists over V3-P1's Louvain communities (low-coupling BY CONSTRUCTION, which is why
+// the parallelism is earned rather than assumed), collect STRUCTURED SUMMARIES on a shared
+// blackboard, and have ONE supervisor synthesise from a BOUNDED selection — so orchestrator context
+// does not grow with worker count. Never an open mesh.
+export type {
+  Blackboard,
+  BlackboardEntry,
+  CommunityRoute,
+  FanOutResult,
+  FindingImportance,
+  SpecialistFinding,
+  SpecialistId,
+  SpecialistTask,
+} from "./orchestrator/contracts.js";
+export { SPECIALIST_IDS } from "./orchestrator/contracts.js";
+export {
+  emptyBlackboard,
+  post,
+  renderFindings,
+  selectForSupervisor,
+  summarizeBlackboard,
+  type BlackboardSummary,
+} from "./orchestrator/blackboard.js";
+export { complexityOf, planRouting, type ComplexitySignals, type RoutingPlan } from "./orchestrator/routing.js";
+export {
+  buildSpecialistPrompt,
+  buildSpecialistTask,
+  groundFindings,
+  importanceRank,
+  parseSpecialistOutput,
+  SPECIALIST_SPECS,
+  SPECIALIST_SYSTEM_PROMPT,
+  type ParsedSpecialistOutput,
+  type SpecialistSpec,
+} from "./orchestrator/specialists.js";
+export {
+  buildSupervisorPrompt,
+  deriveSupervisedSynthesis,
+  fallbackSynthesis,
+  SUPERVISOR_SYSTEM_PROMPT,
+  type SupervisorPromptResult,
+} from "./orchestrator/supervisor.js";
+export {
+  createGroundingScorer,
+  mapWithConcurrency,
+  runFanOut,
+  type FanOutDeps,
+} from "./orchestrator/runFanOut.js";
+export {
+  createFanOutSynthesizeStage,
+  type FanOutSynthesizeDependencies,
+} from "./orchestrator/synthesizeStage.js";
+export {
+  createAdaptiveSynthesizeStage,
+  type AdaptiveSynthesizeDependencies,
+} from "./orchestrator/adaptiveStage.js";
