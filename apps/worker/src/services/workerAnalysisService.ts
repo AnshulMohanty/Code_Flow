@@ -24,6 +24,12 @@ export const env = {
    * developer machine without Postgres log a connection failure at boot instead.
    */
   postgresUrl: process.env.POSTGRES_URL || "",
+  /**
+   * V3-P4: opt in to the bounded agent fan-out for stage 7. Default OFF because of cost SHAPE, not
+   * doubt — a fan-out is 5N+1 provider calls where the single-shot stage is 1, which is right for a
+   * real onboarding guide and wrong for a demo on a free tier.
+   */
+  fanOutSynthesis: (process.env.FANOUT_SYNTHESIS || "").toLowerCase() === "true",
 };
 
 export interface WorkerJobPatch {

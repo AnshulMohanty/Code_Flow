@@ -66,6 +66,13 @@ async function main() {
       ? `Synthesize (AI) enabled — provider ${synthesisClient.provider}, model ${synthesisClient.model}.`
       : "Synthesize (AI) disabled: no chat provider key configured (deterministic pipeline only).",
   );
+  if (synthesisClient) {
+    console.log(
+      env.fanOutSynthesis
+        ? "Synthesize path: bounded agent FAN-OUT over code communities (V3-P4) — 5N+1 provider calls per run."
+        : "Synthesize path: single-shot (set FANOUT_SYNTHESIS=true for the V3-P4 agent fan-out).",
+    );
+  }
 
   const embeddingClient = createEmbeddingClientFromEnv(process.env);
   console.log(
@@ -106,6 +113,7 @@ async function main() {
         measureRepoSize,
         cleanupRepo: cleanupRepoPath,
         synthesisClient,
+        fanOutSynthesis: env.fanOutSynthesis,
         embeddingClient,
         ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
         cache,

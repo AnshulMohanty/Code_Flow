@@ -31,6 +31,7 @@ import type {
   ProgressPublisher,
   RunMode,
 } from "@codeflow/shared-types";
+import { createAdaptiveSynthesizeStage, createFanOutSynthesizeStage } from "@codeflow/agents";
 import type { ChunkTextStore, VectorStore } from "@codeflow/retrieval";
 import type { WorkerAnalysisService } from "../services/workerAnalysisService.js";
 
@@ -54,6 +55,16 @@ export interface PipelineJobDependencies {
   /** LLM client for the Synthesize (AI) stage. When absent, Synthesize is NOT registered
    *  and the pipeline runs deterministic-only (no API key configured ⇒ no AI stage). */
   synthesisClient?: LlmClient;
+  /**
+   * V3-P4: use the bounded agent FAN-OUT for stage 7 when the analysis has communities.
+   *
+   * Opt-in rather than the unconditional default, and the reason is cost shape, not doubt: a
+   * fan-out is 5N+1 calls where the single-shot stage is 1, which is the right trade for a real
+   * onboarding guide and the wrong one for a demo running on a free tier. When enabled the choice
+   * is still made at RUN time (see `createAdaptiveSynthesizeStage`), because whether communities
+   * exist is not knowable when the stage list is assembled.
+   */
+  fanOutSynthesis?: boolean;
   /** Embedding client for the RAG (AI) stage. When absent (no VOYAGE_API_KEY), RAG is NOT
    *  registered and `configured.ai` simply omits it (the P10 coverage partition stays
    *  correct — an ANTHROPIC-only setup runs Synthesize but not RAG). */
@@ -207,7 +218,18 @@ export async function runAnalysisJob(
     // Without it the pipeline runs deterministic-only; with it, an AI failure degrades to
     // "partial" (deterministic slices intact), never "failed".
     if (deps.synthesisClient) {
-      stages.push(createSynthesizeStage({ client: deps.synthesisClient, now }));
+      const singleShot = createSynthesizeStage({ client: deps.synthesisClient, now });
+      if (deps.fanOutSynthesis) {
+        stages.push(
+          createAdaptiveSynthesizeStage({
+            fanOut: createFanOutSynthesizeStage({ chatClient: deps.synthesisClient, now }),
+            singleShot,
+            onChoice: (choice, reason) => console.log(`[worker] synthesize path: ${choice} (${reason}).`),
+          }),
+        );
+      } else {
+        stages.push(singleShot);
+      }
     }
     // RAG (AI, stage 8) registers only when an embedding client is configured. It reuses
     // the same readFile abstraction (disk path) and the same cache handle (both the

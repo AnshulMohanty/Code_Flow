@@ -183,6 +183,37 @@ describe("runAnalysisJob", () => {
     expect(updates.at(-1)).not.toHaveProperty("degradations");
   });
 
+  it("fanOutSynthesis is OPT-IN: default off, and enabling it keeps stage 7 registered as `synthesize`", async () => {
+    // V3-P4. Opt-in because of cost SHAPE, not doubt: a fan-out is 5N+1 provider calls where the
+    // single-shot stage is 1 — right for a real onboarding guide, wrong for a demo on a free tier.
+    // What must NOT change is the stage's identity: the orchestrator's coverage partition, its cache
+    // lookup and its "AI failure => partial" handling all key off the id, so a different one would
+    // silently take stage 7 out of that machinery.
+    const chat = {
+      provider: "anthropic" as const,
+      model: "test",
+      complete: vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } })),
+    };
+
+    for (const fanOutSynthesis of [false, true]) {
+      const { service } = fakeService(null);
+      const outcome = await runAnalysisJob(payload, {
+        service,
+        cloner: fakeCloner(),
+        publisher: createChannel(),
+        readFile: noFiles,
+        readDir: emptyDir,
+        now: makeClock(),
+        synthesisClient: chat,
+        fanOutSynthesis,
+      });
+      // Either way Synthesize is REGISTERED (so it is never reported as skipped), and either way an
+      // AI failure on this empty fixture degrades to "partial" rather than failing the run.
+      expect(outcome.skippedStages).not.toContain("synthesize");
+      expect(outcome.status).not.toBe("failed");
+    }
+  });
+
   it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {
     const { service, updates } = fakeService(null);
     const channel = createChannel();
