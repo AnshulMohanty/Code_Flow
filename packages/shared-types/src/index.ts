@@ -104,7 +104,16 @@ export interface DependencyEdge {
   weight: number;
   from?: string;
   to?: string;
-  dependencyType?: "import" | "dynamic-import" | "require" | "python-import" | "heuristic";
+  dependencyType?:
+    | "import"
+    | "dynamic-import"
+    | "require"
+    | "python-import"
+    | "heuristic"
+    // V3-P1 code-property-graph relationships.
+    | "call"
+    | "extends"
+    | "implements";
   confidence?: ParserConfidence;
   evidence?: string;
   sourceLine?: number;
@@ -226,6 +235,10 @@ export type GraphEdgeType =
   | "python-import"
   | "symbol-reference"
   | "heuristic"
+  // V3-P1 code-property-graph edge types (see RepoGraph.cpgEdges).
+  | "call"
+  | "extends"
+  | "implements"
   | "unknown";
 
 export interface GraphNode {
@@ -248,6 +261,13 @@ export interface GraphEdge {
   confidence: ParserConfidence;
   evidence: string;
   sourceLine?: number;
+  /**
+   * Relationship STRENGTH (V3-P1). 1 for a dependency edge (a file either imports another
+   * or it does not); the occurrence count for a CPG call edge, so "A calls 40 symbols in
+   * B" outweighs "A imports a type from B". Weighted modularity in community detection
+   * reads this; the degree/centrality metrics deliberately do not.
+   */
+  weight?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -498,6 +518,65 @@ export interface RepoDependencyEdge {
 }
 
 /**
+ * A CODE PROPERTY GRAPH edge: a semantic relationship between two repo files that goes
+ * BEYOND the import statement — a call into an imported symbol, or a class inheriting from
+ * one. `from`/`to` are fileIds (=== repo-relative POSIX path).
+ *
+ * Aggregated per (from, to, kind, symbol) with an occurrence `count` rather than stored
+ * one-edge-per-call-site. That keeps the list COMPLETE (no truncation, no sampling) while
+ * bounding it by distinct symbols instead of by call sites — a 200-call file would
+ * otherwise put tens of thousands of near-identical edges in the cached document.
+ *
+ * HONEST LIMIT: targets are resolved through the file's OWN imports (the cheap tree-sitter
+ * heuristic), so a cpgEdge always refines a relationship the import graph already has —
+ * it never invents a dependency between two files with no import between them. What it
+ * adds is *strength and kind*: "A imports B" vs "A calls 40 symbols in B" vs "A's class
+ * extends B's class". That weighting is what community detection consumes. Compiler-exact
+ * cross-file references need an indexer (SCIP), which is deliberately gated and optional.
+ */
+export interface CpgEdge {
+  from: string;
+  to: string;
+  kind: "call" | "extends" | "implements";
+  /** The symbol the relationship goes through, as written (e.g. `renderTemplate`, `utils.parse`). */
+  symbol: string;
+  /** Occurrences of this exact relationship in `from`. Always >= 1. */
+  count: number;
+  /** 1-based line of the FIRST occurrence — enough to cite the relationship. */
+  line: number;
+}
+
+/** HTTP method label on a detected route. `USE` is an Express mount point; `ALL` matches
+ *  any verb. Uppercase so the value is comparable across frameworks. */
+export type HttpRouteMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "OPTIONS"
+  | "HEAD"
+  | "ALL"
+  | "USE";
+
+/**
+ * An HTTP route declared in a repo file — the "property" half of the code property graph:
+ * a fact about a node, not an edge. Detected from cheap, high-precision syntax only
+ * (Express-style `app.get("/x", …)`, Flask `@app.route("/x")`, FastAPI `@router.get("/x")`)
+ * and only when the path is a STRING LITERAL starting with `/`, so a `map.get(key)` is
+ * never mistaken for a route.
+ */
+export interface HttpRoute {
+  /** References FileNode.id (=== repo-relative POSIX path). */
+  fileId: string;
+  method: HttpRouteMethod;
+  /** The route path exactly as written in source (never normalized or guessed). */
+  path: string;
+  line: number;
+  framework: "express" | "flask" | "fastapi" | "unknown";
+}
+
+/**
  * Import-resolution stats — makes the "real vs simplified" approximation data-backed
  * rather than hidden. Regex extraction + heuristic relative resolution is approximate;
  * tsconfig/package path aliases are out of scope (counted as unresolved).
@@ -527,6 +606,37 @@ export interface RepoGraph {
   /** Resolved repo-file→repo-file edges only (external/unresolved live in `resolution`). */
   edges: RepoDependencyEdge[];
   resolution: GraphResolution;
+  /**
+   * V3-P1 code-property-graph edges (calls / inheritance), sorted by
+   * (from, to, kind, symbol). COMPLETE and never truncated.
+   *
+   * Deliberately a SEPARATE list from `edges`: `edges` is the DEPENDENCY graph, and
+   * `metrics.perFile.fanIn`/`fanOut` are contractually "files that import this one". Folding
+   * call edges into `edges` would silently redefine every existing metric. Algorithms that
+   * want the richer graph opt in — community detection runs on the union, which is why
+   * `metrics.clusters` reflects calls while `fanIn` still means imports.
+   *
+   * Absent (not empty) when the parser engine could not produce them — a regex fallback
+   * yields imports only, and `cpg.engine` records that.
+   */
+  cpgEdges?: CpgEdge[];
+  /** V3-P1 detected HTTP routes, sorted by (fileId, path, method, line). Uncapped. */
+  routes?: HttpRoute[];
+  /** How the code property graph was produced — makes a degraded run visible. */
+  cpg?: CpgProvenance;
+}
+
+/**
+ * Provenance for the code-property-graph enrichment. Without this, a repo whose grammars
+ * failed to load would look like a repo with genuinely no calls or routes.
+ */
+export interface CpgProvenance {
+  /** Files whose CPG facts came from tree-sitter (calls/inheritance/routes are real). */
+  treeSitterFiles: number;
+  /** Files that fell back to the regex engine (imports only — no calls/routes from these). */
+  fallbackFiles: number;
+  /** True when at least one file was parsed by tree-sitter. */
+  enriched: boolean;
 }
 
 // ── Analyze slice (stage 6) ──────────────────────────────────────────────────
@@ -564,12 +674,53 @@ export interface RepoMetricsSummary {
 }
 
 /**
+ * One detected community (module) of files. `id` is canonical: communities are sorted by
+ * size descending, then by their lowest member fileId, and numbered from 0 — so the id does
+ * not depend on any internal iteration order.
+ */
+export interface RepoCluster {
+  id: number;
+  /** Member fileIds, sorted. COMPLETE — never truncated. */
+  files: string[];
+  /** == files.length. */
+  size: number;
+  /** Summed edge weight WITHIN the community (higher ⇒ more cohesive). */
+  internalWeight: number;
+  /** Summed edge weight leaving the community (lower ⇒ more independent). */
+  externalWeight: number;
+}
+
+/**
+ * Deterministic community partition of the code property graph (V3-P1). The ONE canonical
+ * home for clusters/modules — there is no second competing field.
+ *
+ * Computed on the UNION of `graph.edges` and `graph.cpgEdges` (imports + weighted calls +
+ * inheritance), projected undirected: coupling for the purpose of clustering genuinely
+ * includes calls, and a call edge with `count: 40` should outweigh a single type import.
+ * Note this differs from `perFile.fanIn`/`fanOut`, which stay contractually "files that
+ * directly import this one" — that asymmetry is deliberate and documented, not an oversight.
+ */
+export interface RepoClusters {
+  algorithm: "louvain";
+  /** Seed of the deterministic node-visit permutation (no RNG is used). */
+  seed: number;
+  /** Resolution used to steer partition granularity. */
+  resolution: number;
+  /** STANDARD (unscaled) weighted modularity Q of this partition. Higher ⇒ better-separated
+   *  modules; > ~0.3 indicates meaningful structure. 0 for an edgeless graph. */
+  modularity: number;
+  /** == clusters.length. */
+  count: number;
+  /** Every node's community, sorted by fileId. COMPLETE — one entry per graph node. */
+  assignments: Array<{ fileId: string; cluster: number }>;
+  /** The communities themselves, in canonical id order. */
+  clusters: RepoCluster[];
+}
+
+/**
  * Deterministic graph metrics produced by Analyze (stage 6). All rankings are COMPLETE
  * and never truncated (top-N is a P5 render concern only) and deterministically ordered
  * (ties broken by fileId) so the SHA-keyed cache + P3 eval set stay stable.
- *
- * NOTE: `clusters`/modules are intentionally absent — @codeflow/graph has no clustering
- * algorithm yet; adding one is its own session (see CURRENT_STATE deferred ledger).
  */
 export interface RepoMetrics {
   /** Every node's metrics, sorted by fileId. */
@@ -580,6 +731,11 @@ export interface RepoMetrics {
   hotspots: string[];
   /** Every dependency cycle, as fileId lists; deterministic order. */
   cycles: Array<{ files: string[] }>;
+  /**
+   * Community/module partition (V3-P1 — closes the long-standing "no clustering algorithm
+   * yet" gap). Absent only when the graph slice carries no nodes to partition.
+   */
+  clusters?: RepoClusters;
   summary: RepoMetricsSummary;
 }
 

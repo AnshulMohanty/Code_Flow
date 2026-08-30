@@ -8,6 +8,14 @@ export { javascriptParser } from "./parsers/javascriptParser.js";
 export { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 export { pythonParser } from "./parsers/pythonParser.js";
 export { createTreeSitterParser, parseTreeSitterFile } from "./treesitter/parseTreeSitter.js";
+export { extractCpgFacts } from "./treesitter/cpg.js";
+export type {
+  CpgCall,
+  CpgFacts,
+  CpgImport,
+  CpgInheritance,
+  CpgRoute,
+} from "./treesitter/cpg.js";
 export {
   hasGrammar,
   initTreeSitter,

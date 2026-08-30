@@ -93,6 +93,9 @@ function buildEdges(
       confidence: dependency.confidence ?? 0.6,
       evidence,
       sourceLine: dependency.sourceLine,
+      // Relationship strength: 1 for a dependency edge, the occurrence count for a CPG
+      // call edge. Weighted community detection reads it; degree metrics do not.
+      weight: dependency.weight ?? 1,
     });
   });
 
