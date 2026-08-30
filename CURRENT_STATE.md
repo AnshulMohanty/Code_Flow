@@ -3,7 +3,24 @@
 > Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
 > [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
 
-_Last updated: 2026-08-31 — V3-P2: retrieval (real vector store, AST-enriched chunks, hybrid/rerank/MMR, synthetic flywheel) (branch `v3/p2-retrieval`)._
+_Last updated: 2026-08-31 — V3-P3: agentic Q&A + memory (bounded multi-turn agent, graph tools, session/repo memory) (branch `v3/p3-agentic-memory`)._
+
+> ✅ **V3-P3 is DONE** — `/api/result/:id/ask` is a BOUNDED multi-turn agent. Two new packages:
+> `@codeflow/agents` (the loop + `find_references`/`get_callers`/`get_blast_radius`/`symbol_search`
+> over the V3-P1 CPG, plus V3-P2 hybrid retrieval and `what_changed` as tools) and
+> `@codeflow/memory` (session + repository memory, everything bounded because memory feeds the
+> prompt). **Prompted tool-calling, not native** — `LlmClient` has no tool-calling and both
+> providers expose it differently, so the loop is ReAct over a completion; the cost is recorded and
+> native is a P5 upgrade behind the same `AgentTool` interface. Both risks the brief named are
+> handled IN CODE: `AGENT_MAX_TURNS`/`AGENT_MAX_TOOL_CALLS` are hard caps (**a test caught that the
+> tool cap was not actually capping** — it stopped offering tools while still executing them), and
+> honest-no-answer has three guards, the strongest being that **`answered: true` with no grounded
+> evidence is downgraded to a refusal** — the check is on EVIDENCE, not on the model's claim.
+> Follow-ups resolve deterministically in code ("what about its callers?" with no argument), and an
+> AMBIGUOUS path suffix is refused rather than guessed. Task 3's context hygiene ships with the loop
+> because it IS the loop's bounds: per-step tool curation (descriptions are prompt text paid every
+> turn) and per-PILLAR metering, since a total says the prompt grew while only a breakdown says
+> which bug did it. **881 tests** (was 742).
 
 > ✅ **V3-P2 is DONE** — retrieval is a real pipeline and the index has left the Mongo document.
 > New `@codeflow/retrieval` sits BELOW analyzers and owns the ONE `VectorStore` interface: an
@@ -581,6 +598,54 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-P3 — agentic Q&A + memory (branch `v3/p3-agentic-memory`)
+
+> Full detail, including the `LlmClient` audit finding and every judgment call:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P3`).
+
+- **`@codeflow/agents` (new, 91 tests).** A bounded ReAct loop over a plain completion, because the
+  audit found `LlmClient` has **no native tool-calling** and its two adapters expose tool use
+  differently — changing that contract before an agent existed would have been the wrong order. The
+  cost of prompted tool-calling (less reliable output, hence a forgiving parser and a bounded retry)
+  is recorded in the code, and native is a P5 upgrade behind the SAME `AgentTool` interface.
+- **Bounds in code, not in the prompt.** `AGENT_MAX_TURNS` (6) and `AGENT_MAX_TOOL_CALLS` (10) are
+  hard caps; a hallucinated tool name counts against the budget (or a model inventing names loops for
+  free); observations are truncated with the truncation STATED; the daily budget is checked before
+  every turn and exhaustion keeps the turns already paid for. When the tool budget runs out the agent
+  gets one FINAL tool-free turn — a loop cut off mid-thought has spent its whole budget for no answer.
+- **Honest-no-answer survives an agent, three ways.** The similarity floor lives inside `search_code`
+  with **no model-settable argument**; grounding is enforced afterwards against evidence a tool
+  actually returned (existing in the repository is NOT evidence); and **`answered: true` with no
+  grounded evidence is DOWNGRADED to a refusal**, so a model answering from pre-training cannot
+  produce an answered response.
+- **Exact graph tools.** `find_references` LABELS direction (imports vs imported-by is the confusion
+  V3-P2's flywheel mines as a hard negative); `get_callers` states its honest limit rather than
+  presenting an approximate answer as exhaustive; `get_blast_radius` uses `@codeflow/graph`'s own
+  traversal so the agent cannot drift from the product on what "affected" means; `symbol_search`
+  returns exact matches ALONE when there are any. No tool ever invents a fileId, which is what makes
+  file-level citations trustworthy by construction.
+- **`@codeflow/memory` (new, 45 tests).** Session memory (turns including REFUSALS, retrieved-chunk
+  history, resolved entities most-recent-first) and repo memory (a small sorted SNAPSHOT per commit —
+  storing whole results per SHA would re-introduce, per commit, the document-size problem V3-P2 just
+  solved). Everything BOUNDED, with the bounds shared by every store and applied on read as well as
+  write: two implementations trimming differently would mean the same conversation behaved differently
+  depending on whether Redis happened to be configured. A session is scoped to ONE analysis, so a
+  follow-up cannot resolve "it" to a file from another repository. The Redis store FAILS SOFT and
+  reports — a lost session costs context for one question, which beats a 500.
+- **Follow-ups resolve in code, deterministically.** An exact node, a UNIQUE path suffix (models
+  shorten paths), or the last remembered file — and an AMBIGUOUS suffix is refused, because silently
+  answering about the wrong file is worse than not answering.
+- **Context hygiene (task 3) ships with the loop, because it IS the loop's bounds.** Tool descriptions
+  are prompt text paid on every turn whether called or not, so curating them is the largest lever —
+  and a quality lever too, since a model offered six tools picks worse than one offered three. Rules
+  are deterministic: no model decides what a model may see. Metering is per PILLAR because a total
+  only says the prompt grew, while the breakdown says whether that is a memory-bounds bug, a routing
+  bug, an agent looping, or retrieval working as intended; the pillars SUM to the total.
+- **Wired ADDITIVELY.** `AgentAnswer` is a superset of `RagAnswer`, so the web app is untouched. The
+  single-shot path stays as the fallback for an analysis with an index but no GRAPH (a pre-V3-P1
+  cached result), where the agent's tools would return nothing and it would burn turns finding out.
+  `sessionId` is runtime-validated and REJECTED rather than sanitised, because it becomes a store key.
+
 ### V3-P2 — retrieval (branch `v3/p2-retrieval`)
 
 > Full detail, including the reranker dependency probe and every judgment call:
@@ -880,10 +945,12 @@ driven by injected fakes; in-memory remains the default everywhere.
 
 ## Verification
 
-`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **742 tests** (V3-P2: 526 -> 742,
-+216): shared-types 3, graph 33, parsers 28, **retrieval 155 (new package)**, **analyzers 234**,
-**arena 68** (+25 synthetic flywheel), **eval 109** (+33 enrichment A/B, index sidecar, generated
-datasets), **api 39**, **web 60**, worker 13 — confirmed **hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
+`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **881 tests** (V3-P3: 742 -> 881,
++139; V3-P2 before it: 526 -> 742): shared-types 3, graph 33, parsers 28, **memory 45 (new
+package)**, **agents 91 (new package)**, **retrieval 155**, **analyzers 234**, **arena 68**,
+**eval 109**, **api 42** (+3 session contract), **web 60**, worker 13 — confirmed **hermetic**
+(the agent suite injects a SCRIPTED LlmClient whose entries can assert on the prompt they received,
+which is what stops those tests being tautological) (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
 LLM/embedding + stubbed `fetch`/`EventSource` + **mocked `react-force-graph-2d`** (canvas never
 rendered in jsdom) throughout — zero real API/network calls/spend). NOTE: `pnpm -r test` (parallel)
 can OOM running all suites back-to-back with the heavier web env; run serially
@@ -1122,6 +1189,10 @@ former blocker — is **DONE** this session).
     question once, and a restart forgets every answer. Not a correctness or spend-ceiling problem
     (cache-before-budget still holds, and the ceiling is shared), just wasted spend. Natural fix: move
     the answer cache onto the same Redis connection `redisClient.ts` already provides.
+    **V3-P3 gave this a sibling worth naming in the same breath:** repo memory (the per-commit
+    snapshots `what_changed` diffs) is per-process too, so after a restart it reports "only one commit
+    analysed". Session memory is already Redis-backed when Redis is available; the answer cache and
+    the repo snapshots are the two that are not, and they are the same P5 wiring task.
 22. **Gemini's batch-embed endpoint reports no usage, so that path is an honest ESTIMATE (V3-P0).**
     `createGeminiEmbeddingClient` returns `TokenUsage.measured: false` and the RAG stage logs it. Every
     other paid path (Anthropic chat, Gemini chat, Voyage embeddings) is genuinely measured. The client

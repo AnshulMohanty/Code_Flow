@@ -1907,6 +1907,237 @@ recall@k must not depend on how many results the caller happened to pass).
 - **#21 (per-process Q&A answer cache) unchanged** — untouched by this phase.
 
 
+## 2026-08-31 — V3-P3: agentic Q&A + memory (branch `v3/p3-agentic-memory`)
+
+Three commits. `/api/result/:id/ask` is now a BOUNDED multi-turn agent over exact graph tools plus
+V3-P2 hybrid retrieval, with conversation memory so a follow-up resolves against prior turns.
+
+**AUDIT FIRST — the finding that shaped the whole phase.** `LlmClient`
+(`packages/analyzers/src/llm/llmClient.ts`) is a plain text-completion interface with **no native
+tool-calling**, and its two adapters (Anthropic Messages, Gemini) expose tool use quite differently.
+Adding native tool-calling would have meant changing that contract, both adapters and their tests,
+and writing provider-specific request shaping — before a single agent existed to justify it.
+
+So the loop is **ReAct over a completion**: one JSON action per turn, parsed and validated. It works
+with both providers unchanged, is trivially mockable (the suite injects a scripted client), and puts
+the parse at exactly the boundary the V3-P0 contract rule names — parsed LLM JSON. **The cost is
+stated rather than hidden:** prompted tool-calling is less reliable than native, so the parser is
+forgiving about fences and surrounding prose and there is a bounded retry for unparseable output.
+Native tool-calling is a P5 upgrade that slots in behind the SAME `AgentTool` interface — the tools,
+the router, the metering and the grounding do not change.
+
+Two other live-tree facts: `AnalysisCacheHandle`/`BudgetHandle` were already injectable (so the
+agent reuses them unchanged), and `AskHandler` was already a test seam, which is what let the whole
+phase land without touching the web app.
+
+### Task 1 — the bounded multi-turn agent (`f29dde6`, wired in `19b236c`)
+
+New `@codeflow/agents` (V3-P4 extends the same package). Tools: `find_references`, `get_callers`,
+`get_blast_radius`, `symbol_search` (all exact, from the V3-P1 CPG, free), plus `search_code` (V3-P2
+hybrid) and `what_changed` (task 2's repo memory).
+
+**RISK (a): unbounded cost/latency.** Handled in code, never in a prompt.
+- `AGENT_MAX_TURNS` (6) and `AGENT_MAX_TOOL_CALLS` (10) are hard caps. **A test caught that the tool
+  cap was not actually capping** — the loop stopped OFFERING tools once the budget was spent but
+  still EXECUTED the calls, so `maxToolCalls: 2` produced 4 calls. That is precisely the runaway the
+  cap exists to prevent, and it was a real bug, fixed by refusing the call on a forced-answer turn.
+- When the tool budget runs out the agent is not cut off mid-thought: it gets one FINAL turn with the
+  descriptions removed and an explicit instruction to answer from what it has, because a truncated
+  loop that returns nothing has spent the whole budget for no answer. That turn is also the cheapest
+  of the loop.
+- **A hallucinated tool name counts against the budget.** Otherwise a model inventing names loops for
+  free until the turn cap — the same runaway with extra steps. It is told what exists so it can
+  recover rather than guess again.
+- Observations are truncated to `AGENT_MAX_TOOL_RESULT_CHARS`, and the truncation STATES the original
+  length so the model knows it saw a prefix rather than believing it saw everything.
+- The daily `BudgetHandle` is checked before EVERY turn; exhaustion mid-loop keeps the turns already
+  paid for rather than discarding them.
+
+**RISK (b): regressing honest-no-answer.** Three independent guards, none of which the model can
+talk past:
+1. The similarity floor lives INSIDE `search_code`, with **no model-settable argument** — exposing
+   one would be exposing the refusal gate as a tunable. A refusal is a fact the agent must work with,
+   and the tool's text says explicitly not to guess from outside the repository.
+2. **Grounding is enforced after the fact.** A chunk citation must resolve to a chunk actually
+   retrieved this session; a file citation to a fileId a tool actually returned. *Existing in the
+   repository is not evidence* — there is a test for exactly that.
+3. **`answered: true` with no grounded evidence is DOWNGRADED to a refusal.** This is the one that
+   matters: the check is on EVIDENCE, not on the model's claim, so a model that ignores every empty
+   tool result and answers from pre-training cannot produce an answered response.
+
+**Follow-ups resolve deterministically, in code.** `resolveFileArg` accepts an exact graph node, a
+UNIQUE path suffix (models shorten paths), or falls back to the most recently resolved file entity —
+and **REFUSES an ambiguous suffix**, because silently answering about the wrong file is worse than
+not answering. It reports when it resolved from memory, or a transcript would be undebuggable. The
+acceptance criterion ("what about its callers?" with no fileId argument) is covered by a test that
+asserts the resolution AND that the prompt actually contained the prior turn.
+
+Tool design rules worth recording: a tool NEVER invents a fileId (so anything cited from one is
+grounded by construction); `find_references` LABELS direction, because imports-vs-imported-by is the
+same confusion V3-P2's flywheel mines as a hard negative and an undirected blob would hand the model
+exactly the ambiguity it is worst at; `get_callers` states its honest limit (call edges resolve
+through the caller's imports) rather than presenting an approximate answer as exhaustive;
+`get_blast_radius` uses `@codeflow/graph`'s own traversal, so the agent cannot drift from the product
+on what "affected" means; `symbol_search` returns exact matches ALONE when there are any, because a
+substring search that also surfaced 40 near-misses would bury the symbol the developer named.
+
+A tool that THROWS is reported to the model as an error so it can try something else, and lands on
+the trace — a bug, not an answer. `search_code` distinguishes an embedding-provider failure
+(`error`) from "found nothing" (`empty`), because the agent must not read an outage as evidence that
+the repository contains nothing relevant.
+
+### Task 2 — `@codeflow/memory` (`0df9e1f`)
+
+Two different things behind two interfaces, in a package depending only on `shared-types` + `config`
+(no driver — production injects one, the V3-P0 pattern).
+
+- **SESSION memory**: turns (including REFUSALS — a refusal tells the next turn what has already
+  failed), retrieved-chunk history, and resolved entities most-recent-first with a re-mention MOVED
+  rather than duplicated so the order encodes only recency.
+- **REPO memory**: a small deterministic snapshot per commit — fileIds, `from>to` edges, symbol names
+  per file, cycle keys, all sorted. Storing `AnalysisResult`s per SHA would turn a memory layer into
+  a second database and re-introduce, per commit, the document-size problem V3-P2 just solved.
+  Sorting is why two snapshots of the same tree are byte-identical and their diff is empty BY
+  CONSTRUCTION; a cycle is keyed by its SORTED members, so the same cycle reported from a different
+  starting node is not a new one. `changedFiles` compares SYMBOL SETS — the closest thing to "this
+  file changed" without hashing contents, and better for "should I care?": a reformat produces
+  nothing, a renamed export produces an entry. New cycles are called out separately because a cycle
+  that did not exist last commit is a regression somebody introduced.
+- **Everything is BOUNDED**, and not as a nicety: memory feeds the prompt, so unbounded memory is a
+  context-budget bug that grows silently. `applySessionBounds` is shared by every implementation and
+  applied on READ as well as write — two stores trimming differently would mean the same
+  conversation behaved differently depending on whether Redis happened to be configured, which is
+  the class of split V3-P0 removed from the budget.
+- **A session is scoped to ONE analysis.** Appending under a different analysisId starts fresh,
+  because silently mixing would let a follow-up resolve "it" to a file from another repository.
+- **The Redis store FAILS SOFT and reports** — a different judgement from the budget's fail-open, for
+  an analogous reason at smaller cost: a lost session means a worse answer to THIS question, which is
+  recoverable and strictly better than a 500. It returns POST-append memory even when the write
+  failed, because returning the pre-append state would be a lie about what memory holds.
+- No clock is read anywhere (`capturedAt` is passed in), the same reason V3-P1's size guard is a byte
+  ceiling rather than a timeout.
+
+`what_changed` snapshots the CURRENT commit on the way in, so asking the question also makes this
+commit a baseline for the next one — that is what makes the memory accumulate instead of needing a
+separate ingestion step. It refuses an ambiguous SHA prefix and lists the commits it does know,
+rather than diffing against an arbitrary baseline and producing a perfectly plausible wrong answer.
+
+### Task 3 — context-budget hygiene (shipped with task 1, and here is why)
+
+Task 3 IS task 1's bounds; a loop and the constraints that keep it affordable are not separately
+shippable, so they landed in one commit.
+
+- **Per-step tool curation.** A tool's `description` is prompt text, paid on EVERY turn whether the
+  tool is called or not — six tools with two-line descriptions is a few hundred tokens of fixed
+  overhead per call, times up to six turns, on every question. It is also a QUALITY lever: a model
+  offered six tools picks worse than one offered three, because irrelevant options invite exploratory
+  calls that cost a turn and return nothing.
+  Rules are DETERMINISTIC — no model decides which tools a model may see, since that would be a paid
+  call to save a paid call and would make the loop unreproducible. General-purpose tools are always
+  candidates; trigger matches and already-used tools qualify; a tool EMPTY twice is dropped; the rest
+  is capped at `AGENT_MAX_TOOLS_PER_STEP` and every omission is recorded with its reason. The
+  empty-twice rule is the arguable one and is flagged as such in the code: it can in principle drop a
+  tool that would have succeeded on a better-formed third call, accepted knowingly against a loop
+  that burns its whole budget re-asking the same empty question.
+- **Per-pillar token metering.** Broken down by pillar because a TOTAL only says the prompt grew,
+  while the breakdown says WHICH of several unrelated bugs did it: memory growing is a bounds bug,
+  tool descriptions growing is a routing bug, the transcript growing is an agent looping, retrieval
+  growing is working as intended. The pillars SUM to the total, so nothing is unaccounted for.
+  Estimated via the shared `estimateTokens`, with the reason V3-P0 gave for bundling no tokenizer —
+  and `AgentTurnTrace.usage` carries the provider's authoritative cost separately. The two answer
+  different questions: `usage` says what the turn cost, `context` says where the input went.
+
+**Acceptance (per-call breakdown visible in a trace):** every `AgentTurnTrace` carries a
+`ContextBreakdown`, `AgentTrace.totalContextTokens` sums them, `dominantPillar` names the largest
+share, and there are tests asserting the pillars add up and that the dominant pillar is identified.
+
+### Wiring (`19b236c`)
+
+- Widened ADDITIVELY: `AgentAnswer` is a superset of `RagAnswer`, so the existing web app keeps
+  working untouched and `sessionId`/`citedFiles`/`trace` are there for a client that wants them. Same
+  for `AskHandler` — an existing test double returning a plain `RagAnswer` still satisfies it.
+- **The single-shot path stays** as the fallback for an analysis with an index but NO GRAPH (a
+  pre-V3-P1 cached result). The agent's advantage is exact graph lookups; with no graph its tools
+  return nothing and it would burn turns discovering that. Not hedging — picking the better path for
+  the data that exists.
+- `sessionId` is runtime-validated (bounded length, restricted charset) because it becomes a STORE
+  KEY: unbounded length is a memory-exhaustion vector and separators could collide with another
+  namespace in a shared Redis. REJECTED rather than sanitised — silently rewriting would hand the
+  client a session it cannot address again.
+- A stateless ask creates NO session, or a shared store fills with single-turn sessions nobody can
+  address.
+- Session memory is Redis-backed when available, in-memory otherwise, with the fallback ANNOUNCED at
+  startup. Repo memory stays in-memory deliberately, and the consequence is stated where it is felt:
+  `what_changed` reports "only one commit analysed" after a restart. A shared store for it is P5
+  wiring, not something to half-build here.
+
+### Docker + a measured curation saving
+
+The api image was rebuilt and both packages exercised INSIDE the pruned `node:20-slim` image (the
+V3-P1/P2 discipline — "it compiles" is not "the dependency is there"):
+
+```
+agents loaded: true | tools: find_references,get_callers,get_blast_radius,symbol_search
+memory loaded: memory-session-store / memory-repo-store
+curated: get_callers | omitted: find_references:no-trigger-match, get_blast_radius:no-trigger-match,
+                                symbol_search:no-trigger-match
+pillars: {"instructions":100,"retrieval":1000,"memory":0,"tools":50,"transcript":0,"question":1,
+          "total":1151} | dominant: {"pillar":"retrieval","share":0.869}
+```
+
+That curation line is the task-3 saving, measured rather than asserted: for "which files call
+src/auth.ts?" **one of four** graph-tool descriptions is offered and three are omitted with their
+reason recorded. Image cost of two new pure-TypeScript packages: api **365 MB → 366 MB (+1 MB)**.
+
+### Verification
+
+`pnpm -r typecheck`, `pnpm -r lint`, `pnpm test` (serial), `pnpm -r build`, `node --test tests/*.mjs`
+— all green. **881 unit tests**, up from 742 (**+139**):
+
+| package | before | after | delta |
+|---|---:|---:|---:|
+| **agents (new)** | — | **91** | +91 |
+| **memory (new)** | — | **45** | +45 |
+| api | 39 | **42** | +3 |
+| retrieval | 155 | 155 | — |
+| analyzers | 234 | 234 | — |
+| eval | 109 | 109 | — |
+| arena | 68 | 68 | — |
+| web | 60 | 60 | — |
+| graph | 33 | 33 | — |
+| parsers | 28 | 28 | — |
+| worker | 13 | 13 | — |
+| shared-types | 3 | 3 | — |
+| **total** | **742** | **881** | **+139** |
+
+Legacy `node --test`: **25/25**. `tsc --noUnusedLocals --noUnusedParameters` clean on both new
+packages. **Hermetic**: the agent tests inject a SCRIPTED `LlmClient` whose entries can assert on the
+prompt they received — which is what stops them being tautological, since checking that memory
+reached the prompt checks the part we own, whereas checking that a mock returned what it was told to
+return checks nothing.
+
+### Judgment calls flagged
+
+1. **Prompted tool-calling over native**, for the audit reason above. Recorded with its cost and its
+   P5 upgrade path.
+2. **Tasks 1 and 3 in one commit**, because task 3 is task 1's bounds.
+3. **The empty-twice tool-drop rule** can lose a would-be third-call success. Accepted knowingly and
+   documented at the rule.
+4. **Repo memory is in-memory only**, with the user-visible consequence stated rather than papered
+   over.
+5. **The single-shot path was kept**, not deleted. It is the correct path for a graph-less cached
+   analysis, and deleting it would have made those analyses worse to serve the tidiness of having one
+   path.
+6. **No new eval scenarios were added for the agent.** The multi-turn behaviour is covered by 91
+   hermetic unit tests including the acceptance criteria; a scored multi-turn eval needs real keys and
+   is in the deferred bucket. Adding a mock-driven "eval" would have measured the mock.
+
+### Ledger
+
+- **#21 (per-process Q&A answer cache) unchanged**, and now has a sibling worth naming: repo memory
+  is per-process too. Both are the same P5 wiring task onto the Redis connection `redisClient.ts`
+  already provides.
+
 ---
 
 ## DEFERRED TO MANUAL PHASE (P5/P6)
@@ -1937,6 +2168,18 @@ keys, real spend or a real clock to actually run. Nothing in these phases blocks
    (`RETRIEVAL_*`, `BM25_*`, `RRF_K`, `MMR_LAMBDA`) — every one of which is a documented default
    with no calibration against this repo's own eval.
 6. **BullMQ/SSE wire smoke** (`pnpm dev:api` + `pnpm dev:worker` against the dev compose stores).
+
+**Agentic Q&A + memory (V3-P3)**
+10. **A real multi-turn agent run with keys.** Needs a chat provider; the whole loop is covered
+    hermetically with a scripted client, so this measures real-model behaviour (how often it picks the
+    right tool, how often output is unparseable) rather than whether the plumbing works.
+11. **The Redis session store against a live Redis.** Driven in-suite against a fake `MemoryRedisLike`
+    — key scheme, TTL, serialisation and bounds are all asserted; what remains is the round trip.
+12. **A shared repo-memory store.** Repo snapshots are per-process today, so `what_changed` reports
+    "only one commit analysed" after a restart. Same P5 wiring task as ledger #21's answer cache, onto
+    the Redis connection `redisClient.ts` already provides.
+13. **Scored multi-turn eval scenarios.** Needs keys, and needs a real model in the loop for the
+    numbers to mean anything.
 
 **Owner setup**
 7. A GitHub `eval` environment + the `GEMINI_API_KEY` secret, for the scored-eval workflow's

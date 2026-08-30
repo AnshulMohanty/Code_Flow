@@ -234,13 +234,47 @@ config. Retrieval gains recorded above. No embeddings in `analyses` — asserted
 
 ## PHASE 3 — Agentic Q&A + memory
 **Goal:** multi-turn Q&A that traverses the graph, with memory.
-**Entry gate:** Phase 2 `[x]`.
+**Entry gate:** Phase 2 `[x]`. **Satisfied.** **Executed 2026-08-31** (branch
+`v3/p3-agentic-memory`, cut off `v3/p2-retrieval`).
 
-- [ ] Make `/api/result/:id/ask` a **multi-turn agent** with graph tools (`find_references`, `get_blast_radius`, `get_callers`, `symbol_search`) + hybrid retrieval. Keep all grounding. *Acceptance:* follow-ups ("what about its callers?") resolve against prior turns.
-- [ ] **Memory layer** (`@codeflow/memory`): session/Q&A memory (turns, retrieved-chunk history, resolved entities) + repo memory (cross-SHA diff → "what changed"). *Acceptance:* session state persists across turns; cross-SHA diff answerable.
-- [ ] **Context-budget hygiene:** curate the agent tool set per step; meter tokens per context pillar. *Acceptance:* per-call token breakdown by pillar in traces.
+- [x] Make `/api/result/:id/ask` a **multi-turn agent** with graph tools (`find_references`, `get_blast_radius`, `get_callers`, `symbol_search`) + hybrid retrieval. Keep all grounding. *Acceptance:* follow-ups ("what about its callers?") resolve against prior turns.
+      → **DONE** in the new `@codeflow/agents`, with one design decision the audit forced:
+      **PROMPTED tool-calling, not native.** `LlmClient` is a plain completion interface and its two
+      adapters expose tool use differently, so native tool-calling would have meant changing that
+      contract, both adapters and their tests before any agent existed to justify it. The loop is
+      ReAct over a completion; the cost (less reliable output ⇒ a forgiving parser + a bounded retry)
+      is recorded in the code, and native is a P5 upgrade behind the SAME `AgentTool` interface.
+      Both bounds are hard caps in code — and a test caught that the tool cap was NOT capping (it
+      stopped offering tools while still executing them), which was a real bug. Grounding is enforced
+      against evidence a tool actually returned, and **`answered: true` with no grounded evidence is
+      DOWNGRADED to a refusal**, which is what makes honest-no-answer survive a model in the loop.
+      The acceptance criterion is covered by tests that assert BOTH the resolution and that the
+      prompt actually contained the prior turn.
+- [x] **Memory layer** (`@codeflow/memory`): session/Q&A memory (turns, retrieved-chunk history, resolved entities) + repo memory (cross-SHA diff → "what changed"). *Acceptance:* session state persists across turns; cross-SHA diff answerable.
+      → **DONE.** Session memory in-memory (hermetic) + Redis (prod, integration-only), with the
+      BOUNDS shared by both and applied on read as well as write — two stores trimming differently
+      would mean the same conversation behaved differently depending on whether Redis happened to be
+      configured. Repo memory keeps a small SORTED snapshot per commit rather than whole results,
+      which is what stops a memory layer from re-introducing V3-P2's document-size problem per
+      commit; `what_changed` makes the diff answerable and snapshots the current commit on the way
+      in, so asking also creates the next baseline. Repo memory is per-process for now, and the
+      user-visible consequence is stated rather than papered over.
+- [x] **Context-budget hygiene:** curate the agent tool set per step; meter tokens per context pillar. *Acceptance:* per-call token breakdown by pillar in traces.
+      → **DONE**, and shipped in the same commit as the loop because it IS the loop's bounds — a
+      loop and the constraints that keep it affordable are not separately shippable. Curation is
+      DETERMINISTIC (no model decides which tools a model may see: that would be a paid call to save
+      a paid call, and it would make the loop unreproducible), and it is a quality lever as well as a
+      cost one. Metering is per PILLAR and the pillars SUM to the total, because a total only says
+      the prompt grew while the breakdown says which of several unrelated bugs did it. Every
+      `AgentTurnTrace` carries one; `dominantPillar` names the largest share.
 
 **Phase 3 DoD:** gates green · multi-turn eval scenarios pass · memory covered by tests.
+→ **MET, with one item explicitly deferred and why.** Gates green after each of the three commits:
+typecheck, lint, **881 tests** (742 → 881, +139; agents 91, memory 45, api +3), build, legacy 25/25.
+Memory is covered by 45 tests. Multi-turn behaviour is covered by 91 hermetic tests INCLUDING the
+acceptance criteria — but **scored** multi-turn eval scenarios need real keys and a real model for
+the numbers to mean anything, so they are in the deferred bucket. A mock-driven "eval" would have
+measured the mock.
 
 ---
 
