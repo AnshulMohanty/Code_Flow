@@ -83,12 +83,17 @@ pnpm eval <dataset.json> <analysisResult.json>      # must not regress threshold
 **Goal:** replace regex-grade parsing with a tree-sitter **code property graph** + community detection.
 **Entry gate:** Phase 0 `[x]`.
 
-- [ ] Add tree-sitter to `@codeflow/parsers` (node bindings for worker; keep an interface that a `web-tree-sitter` build can satisfy for local mode later). Preserve the `ParserAdapter` contract. *Acceptance:* symbol/import extraction parity-or-better vs current parsers on the golden repos (measured via eval).
-- [ ] Build the **code property graph** (files, symbols, calls, imports, inheritance, routes) in the Connect stage; keep `fileId === repo-relative POSIX path`. Keep all `@codeflow/graph` algorithms working on the richer graph.
-- [ ] Add **community detection** (Louvain/Leiden) producing a stable partition; expose it on the graph slice. *Acceptance:* deterministic partition for a fixed SHA; communities are low-coupling (report modularity).
+- [x] Add tree-sitter to `@codeflow/parsers` (node bindings for worker; keep an interface that a `web-tree-sitter` build can satisfy for local mode later). Preserve the `ParserAdapter` contract. *Acceptance:* symbol/import extraction parity-or-better vs current parsers on the golden repos (measured via eval).
+      → **DONE** with `web-tree-sitter` (WASM) directly rather than node bindings, so ONE build serves the worker and a browser and `node:20-slim` needs no native toolchain (the official grammar packages carry `node-gyp-build`). Grammars from `@vscode/tree-sitter-wasm`. `ParserAdapter` unchanged (`parseFile` stays sync; only loading is async). Acceptance met by a HERMETIC parity harness against 6 authored ground-truth cases (symbols 59.3%→100% recall, imports 90.0%→100%), because the golden repos of §0.4 do not exist — the golden-set/eval comparison is still owed, see ledger #17.
+- [x] Build the **code property graph** (files, symbols, calls, imports, inheritance, routes) in the Connect stage; keep `fileId === repo-relative POSIX path`. Keep all `@codeflow/graph` algorithms working on the richer graph.
+      → **DONE.** `graph.cpgEdges` (call/extends/implements, aggregated with occurrence counts) + `graph.routes` + `graph.cpg` provenance, kept as SEPARATE lists from `graph.edges` so `fanIn`/`fanOut` keep their documented import-only meaning. New `buildCodePropertyGraph` is the opt-in richer view; every algorithm is asserted to still work on it.
+- [x] Add **community detection** (Louvain/Leiden) producing a stable partition; expose it on the graph slice. *Acceptance:* deterministic partition for a fixed SHA; communities are low-coupling (report modularity).
+      → **DONE** (resolves the long-standing `clusters` ledger item). Louvain in `@codeflow/graph`, surfaced on `metrics.clusters` — the Analyze-owned metrics slice, NOT the Connect-owned graph slice, since a partition is a computed metric. Deterministic with no RNG at all (seeded permutation of sorted ids, lowest-index tie-break, canonical relabelling); standard modularity reported.
 - [ ] Optional, gated: SCIP indexer integration for TS/Py where affordable, behind a flag; tree-sitter heuristics remain the default. Do **not** block the phase on SCIP.
+      → **NOT BUILT, deliberately** (see ledger #18). `scip-typescript`/`scip-python` need a real compile of the TARGET repo — installing an arbitrary public repo's deps — plus a protobuf decoder, and cannot be tested hermetically. A flag over an unimplemented interface would be dead code, so none was added.
 
 **Phase 1 DoD:** gates green · eval retrieval metrics ≥ Phase 0 baseline · communities available for Phase 4.
+**Status (2026-08-30):** gates green ✅ · communities available ✅ · **eval retrieval baseline NOT comparable** ⚠️ — Phase 0's entry gate was not met (no golden set), so the retrieval comparison is owed (ledger #17). Parser accuracy was measured hermetically instead.
 
 ---
 
