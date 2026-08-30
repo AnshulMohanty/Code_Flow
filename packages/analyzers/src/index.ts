@@ -67,12 +67,18 @@ export {
   assertEmbeddingSpace,
   assertVectorDimension,
   cosineSimilarity,
+  createIdentityReranker,
+  createLexicalOverlapReranker,
+  hybridSearch,
   retrieve,
   retrievalNamespace,
   vectorRetrieve,
   type Embedded,
   type EmbeddingClientLike,
   type EmbeddingSpace,
+  type HybridSearchTrace,
+  type Reranker,
+  type RetrievedChunk,
 } from "@codeflow/retrieval";
 export {
   answerQuestion,

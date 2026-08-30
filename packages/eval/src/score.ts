@@ -145,7 +145,13 @@ function chunkHitsTarget(chunk: ScoredCoords, target: Target): boolean {
  * something else. The caller now performs the real retrieval and hands the ranking in, so this
  * is a pure, order-sensitive scorer over whatever production actually returned.
  */
-export function scoreQuestion(question: RagEvalQuestion, top: readonly ScoredCoords[], k: number): PerQuestionResult {
+export function scoreQuestion(question: RagEvalQuestion, ranking: readonly ScoredCoords[], k: number): PerQuestionResult {
+  // `k` is ENFORCED here rather than trusted from the caller. After V3-P2 moved retrieval out,
+  // `k` briefly became an unused parameter — and the honest options were to delete it or to
+  // make it mean something. Deleting it would leave a metric called recall@k whose value
+  // depended on however many results the caller happened to pass, so it is applied instead:
+  // recall@5 is recall over the top 5, whatever arrives.
+  const top = ranking.slice(0, Math.max(0, k));
   const targets = targetsFor(question);
 
   const hitTargets = targets.filter((target) => top.some((chunk) => chunkHitsTarget(chunk, target)));

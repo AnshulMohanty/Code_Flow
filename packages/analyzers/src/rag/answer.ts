@@ -2,8 +2,11 @@ import { createHash } from "node:crypto";
 import { RAG_MIN_SIMILARITY, RAG_TOP_K } from "@codeflow/config";
 import {
   assertEmbeddingSpace,
-  vectorRetrieve,
+  createLexicalOverlapReranker,
+  hybridSearch,
   type ChunkTextStore,
+  type HybridSearchTrace,
+  type Reranker,
   type RetrievedChunk,
   type VectorStore,
 } from "@codeflow/retrieval";
@@ -42,6 +45,13 @@ export interface RagAnswer {
   answered: boolean;
   /** Citations the LLM emitted that didn't map to a retrieved chunk (dropped by grounding). */
   droppedCitations?: { count: number; ids: string[] };
+  /**
+   * Per-stage retrieval trace (V3-P2): arm hit counts, what each arm found alone, the reranker
+   * that ran (or the error that made it degrade), the vector cosine the refusal floor was
+   * compared against. Present on every answer, including a refusal — a refusal is exactly when
+   * you want to know what retrieval actually saw.
+   */
+  retrieval?: HybridSearchTrace;
 }
 
 export interface AnswerQuestionDeps {
@@ -53,6 +63,13 @@ export interface AnswerQuestionDeps {
   vectorStore: VectorStore;
   /** Where the index's chunk text lives. Same injection rule. */
   textStore: ChunkTextStore;
+  /**
+   * Reranker for the hybrid pipeline (V3-P2). Defaults to the deterministic lexical-overlap
+   * one — keyless, in-process, zero-dependency (see `reranker.ts` for the probe that ruled out
+   * every ONNX cross-encoder for the pruned image). Pass `createIdentityReranker()` to turn
+   * reranking off explicitly, or a `createCrossEncoderReranker` once a session exists.
+   */
+  reranker?: Reranker;
   chatClient: LlmClient;
   embeddingClient: EmbeddingClient;
   cache: AnalysisCacheHandle;
@@ -95,19 +112,27 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
 
   const queryVector = await embedQuery(deps);
 
-  const found = await vectorRetrieve(
-    { ragIndex, vectorStore: deps.vectorStore, textStore: deps.textStore },
-    { queryVector, k },
+  // V3-P2: HYBRID retrieval — vector + BM25, fused by RRF, reranked, diversified by MMR. The
+  // refusal floor is evaluated INSIDE, on the vector arm's real cosine and before any rerank,
+  // so the honest-no-answer behaviour is byte-identical to the pre-hybrid path and a refusal
+  // still costs exactly one vector search.
+  const found = await hybridSearch(
+    {
+      ragIndex,
+      vectorStore: deps.vectorStore,
+      textStore: deps.textStore,
+      reranker: deps.reranker ?? createLexicalOverlapReranker(),
+    },
+    { text: question, vector: queryVector, k, minSimilarity },
   );
   const retrieved = found.chunks;
   const retrievedChunkIds = retrieved.map((c) => c.id);
-  // The floor is compared against a real COSINE from the store, exactly as before — never
-  // against a fused or reranked score, which are ordinal and have no absolute meaning.
-  const topScore = found.topScore;
 
-  // Honest no-answer: empty or below the floor ⇒ refuse, do NOT call the answer LLM.
-  if (retrieved.length === 0 || topScore < minSimilarity) {
-    return { answer: NO_ANSWER, citations: [], retrievedChunkIds, answered: false };
+  // Honest no-answer: refused by the floor, or nothing survived grounding ⇒ do NOT call the
+  // answer LLM. The trace travels with the refusal, because "what did retrieval see" is the
+  // first question anyone asks about one.
+  if (found.trace.refused || retrieved.length === 0) {
+    return { answer: NO_ANSWER, citations: [], retrievedChunkIds, answered: false, retrieval: found.trace };
   }
 
   // Answer cache (cache-before-budget): a hit costs zero LLM and never touches the budget.
@@ -133,7 +158,7 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
     temperature: 0,
     maxTokens: deps.maxTokens,
   });
-  const answer = deriveAnswer(completed.text, retrieved, retrievedChunkIds);
+  const answer = { ...deriveAnswer(completed.text, retrieved, retrievedChunkIds), retrieval: found.trace };
 
   await cache.set(qaKey, answer);
   // Record the provider's REAL usage, not the pre-flight estimate.

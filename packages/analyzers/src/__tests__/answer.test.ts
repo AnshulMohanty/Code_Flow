@@ -195,6 +195,64 @@ describe("answerQuestion — honest no-answer (never fabricate)", () => {
   });
 });
 
+describe("answerQuestion — hybrid retrieval (V3-P2)", () => {
+  it("attaches the per-stage retrieval trace to an answer", async () => {
+    const result = await answerQuestion({
+      question: "how does auth work?",
+      ragIndex: ragIndex(),
+      vectorStore,
+      textStore,
+      chatClient: mockChat(),
+      embeddingClient: mockEmbed(),
+      cache: memCache(),
+      k: 2,
+    });
+    expect(result.retrieval?.refused).toBe(false);
+    expect(result.retrieval?.vectorHits).toBeGreaterThan(0);
+    // The default reranker is the deterministic one — keyless and in-process (see the probe in
+    // @codeflow/retrieval's reranker.ts for why no ONNX cross-encoder ships).
+    expect(result.retrieval?.rerankerId).toBe("lexical-overlap");
+  });
+
+  it("attaches the trace to a REFUSAL too — the case you most want it for", async () => {
+    const chat = mockChat(undefined, { throwIfCalled: true });
+    const result = await answerQuestion({
+      question: "what is xyzzy?",
+      ragIndex: ragIndex(),
+      vectorStore,
+      textStore,
+      chatClient: chat,
+      embeddingClient: mockEmbed(),
+      cache: memCache(),
+    });
+    expect(result.answered).toBe(false);
+    expect(result.retrieval?.refused).toBe(true);
+    // Refusing still costs exactly one vector search: no lexical arm, no rerank, no LLM.
+    expect(result.retrieval?.lexicalHits).toBe(0);
+    expect(chat.calls).toHaveLength(0);
+  });
+
+  it("still refuses below the floor even though the LEXICAL arm would have matched", async () => {
+    // Worth pinning: the lexical arm could easily have been allowed to rescue a below-floor
+    // query, which would silently delete the honest-no-answer behaviour. The floor is the
+    // vector arm's cosine, full stop.
+    const chat = mockChat(undefined, { throwIfCalled: true });
+    const result = await answerQuestion({
+      // "AuthService" appears verbatim in a chunk, so BM25 would score it highly — but the
+      // authored query vector for this question is orthogonal to the whole index.
+      question: "what is xyzzy?",
+      ragIndex: ragIndex(),
+      vectorStore,
+      textStore,
+      chatClient: chat,
+      embeddingClient: mockEmbed(),
+      cache: memCache(),
+    });
+    expect(result.answered).toBe(false);
+    expect(chat.calls).toHaveLength(0);
+  });
+});
+
 describe("answerQuestion — a pre-V3-P2 index is refused, not silently answered", () => {
   it("throws with a rebuild instruction when ai.rag has no `store` reference", async () => {
     // Before P2 the vectors were inline in this slice. Such an index is not "empty", it is

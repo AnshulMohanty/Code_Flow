@@ -38,6 +38,26 @@ export {
   type EnrichableChunk,
   type SymbolSpan,
 } from "./enrichment.js";
+// V3-P2 task 3: hybrid retrieval. BM25 + vector, fused by RRF, reranked, diversified by MMR —
+// with the similarity-floor refusal evaluated on the VECTOR arm's real cosine, unchanged.
+export { Bm25Index, type Bm25Document, type Bm25Hit } from "./bm25.js";
+export { reciprocalRankFusion, type FusedResult, type RankedList } from "./rrf.js";
+export { mmrSelect, normalizeScores, type MmrCandidate } from "./mmr.js";
+export {
+  createCrossEncoderReranker,
+  createIdentityReranker,
+  createLexicalOverlapReranker,
+  LEXICAL_RERANKER_ID,
+  type CrossEncoderRerankerOptions,
+  type CrossEncoderSession,
+} from "./reranker.js";
+export {
+  hybridSearch,
+  type HybridSearchDeps,
+  type HybridSearchQuery,
+  type HybridSearchResult,
+  type HybridSearchTrace,
+} from "./hybridSearch.js";
 export {
   assertIndexHasStore,
   indexById,
