@@ -72,9 +72,24 @@ importers:
 
   apps/local-cli:
     dependencies:
+      '@codeflow/analyzers':
+        specifier: workspace:*
+        version: link:../../packages/analyzers
       '@codeflow/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@codeflow/graph':
+        specifier: workspace:*
+        version: link:../../packages/graph
+      '@codeflow/parsers':
+        specifier: workspace:*
+        version: link:../../packages/parsers
+      '@codeflow/retrieval':
+        specifier: workspace:*
+        version: link:../../packages/retrieval
+      '@codeflow/shared-types':
+        specifier: workspace:*
+        version: link:../../packages/shared-types
     devDependencies:
       '@types/node':
         specifier: ^22.9.0

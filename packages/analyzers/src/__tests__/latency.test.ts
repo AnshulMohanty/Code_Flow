@@ -267,6 +267,45 @@ describe("layered execution — the deterministic spine is UNCHANGED", () => {
     expect(JSON.stringify(withoutTimings(layered.result))).toBe(JSON.stringify(withoutTimings(sequential.result)));
   });
 
+  it("propagates a ctx MUTATION from Ingest, which a launched copy could not", async () => {
+    // A real bug this caught: Ingest is the one stage that mutates `ctx` (resolving `repoPath` and
+    // `commitSha`), and a launched stage gets its own `{...ctx, prior}` copy — so a launched Ingest
+    // would mutate the copy and every later stage would see nothing. Ingest is therefore never
+    // launched, which costs nothing because everything depends on it anyway.
+    const seen: Array<string | undefined> = [];
+    const ingest: PipelineStage = {
+      id: "ingest",
+      kind: "deterministic",
+      label: "ingest",
+      owns: [],
+      async run(_input, ctx) {
+        ctx.repoPath = "/resolved/by/ingest";
+        ctx.commitSha = "sha-from-ingest";
+        return {
+          partial: {},
+          event: { jobId: "job-1", stage: "ingest", stageIndex: 1, stageCount: 2, kind: "deterministic", status: "completed", label: "ingest", progress: 0, startedAt: "", emittedAt: "" },
+        };
+      },
+    };
+    const reader: PipelineStage = {
+      id: "orient",
+      kind: "deterministic",
+      label: "orient",
+      owns: ["orientation"],
+      async run(_input, ctx) {
+        seen.push(ctx.repoPath);
+        return {
+          partial: { orientation: sliceFor("orientation", ctx) as never },
+          event: { jobId: "job-1", stage: "orient", stageIndex: 2, stageCount: 2, kind: "deterministic", status: "completed", label: "orient", progress: 0, startedAt: "", emittedAt: "" },
+        };
+      },
+    };
+
+    const layered = await runPipeline([ingest, reader], input, { now: makeClock(), schedule: "layered" });
+    expect(seen).toEqual(["/resolved/by/ingest"]);
+    expect(layered.result.commitSha).toBe("sha-from-ingest");
+  });
+
   it("defaults to sequential when no schedule is given", async () => {
     const log: string[] = [];
     await runPipeline(fullStages({ log, aiDelayMs: 5 }), input, { now: makeClock() });

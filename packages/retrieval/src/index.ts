@@ -71,6 +71,23 @@ export {
 // Postgres pair is the production adapter, integration-only.
 export { createMemoryVectorStore } from "./stores/memoryVectorStore.js";
 export { createMemoryChunkTextStore } from "./stores/memoryChunkTextStore.js";
+// V3-P5 task 4 — the LOCAL-FIRST pair: an embedded file-backed store and a keyless in-process
+// embedder. LanceDB was probed and REJECTED (656 MB, native NAPI, drags onnxruntime-node back in);
+// see fileVectorStore.ts and localEmbedding.ts for the evidence and the upgrade path.
+export {
+  createFileChunkTextStore,
+  createFileVectorStore,
+  type FileVectorStoreOptions,
+} from "./stores/fileVectorStore.js";
+export {
+  createLocalEmbeddingClient,
+  localEmbed,
+  LOCAL_EMBEDDING_DIM,
+  LOCAL_EMBEDDING_MODEL,
+  type LocalEmbeddingClient,
+  type LocalEmbeddingRequest,
+  type LocalEmbeddingResult,
+} from "./localEmbedding.js";
 export { createPgvectorStore, toVectorLiteral, vectorTableName, type PgvectorStoreOptions } from "./stores/pgvectorStore.js";
 export {
   createPostgresChunkTextStore,

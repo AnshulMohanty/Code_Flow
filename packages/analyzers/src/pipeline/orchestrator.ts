@@ -223,6 +223,14 @@ export async function runPipeline(
       if (launched.has(candidate.id) || settled.has(candidate.id)) continue;
       if (coveredStageIds.has(candidate.id)) continue;
       if (aborted || signal?.aborted || deterministicFailed) continue;
+      // INGEST IS NEVER LAUNCHED, and this is a correctness requirement rather than an optimisation.
+      // Ingest is the one stage that MUTATES `ctx` (it resolves `repoPath` and `commitSha`), and a
+      // launched stage receives its own `{...ctx, prior}` copy — so a mutation inside a launched
+      // Ingest would land on the copy and never reach the stages that need it. Found by the
+      // local-first CLI, whose first stage does exactly that; it would equally have broken a hosted
+      // run with layered scheduling enabled. Launching Ingest also buys nothing: everything else
+      // depends on it, so it is a barrier by construction.
+      if (candidate.id === "ingest") continue;
       if (!readyToLaunch(candidate)) continue;
       const snapshot = { ...slices };
       const candidateCtx: PipelineContext = { ...ctx, prior: snapshot };

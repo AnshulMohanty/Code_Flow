@@ -17,7 +17,15 @@ export interface EmbeddingRequest {
 
 /** An embedding provider identifier (part of the embedding cache key + RAG index
  *  homogeneity check, so vectors from different spaces are never mixed or mis-served). */
-export type EmbeddingProvider = "voyage" | "gemini";
+/**
+ * Which embedding provider produced a vector.
+ *
+ * `"local"` (V3-P5) is the in-process, keyless embedder the local-first CLI uses. It belongs in this
+ * union rather than outside it because the value SCOPES CACHE KEYS and the embedding-space name: a
+ * local index and a hosted one must be impossible to mix, and the type is what makes that structural
+ * rather than a convention.
+ */
+export type EmbeddingProvider = "voyage" | "gemini" | "local";
 
 /**
  * One vector per input text plus what the call cost. Widened from a bare `number[][]` in
