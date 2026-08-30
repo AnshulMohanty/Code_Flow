@@ -2138,6 +2138,231 @@ return checks nothing.
   is per-process too. Both are the same P5 wiring task onto the Redis connection `redisClient.ts`
   already provides.
 
+
+## 2026-08-31 — V3-P4: bounded agent fan-out + test-time compute (branch `v3/p4-agent-fanout`)
+
+Two commits. Stage 7 becomes a fan-out of five specialist lenses over V3-P1's Louvain communities,
+collected on a shared blackboard, synthesised by one supervisor — with all four of the brief's named
+risks handled in code and MEASURED rather than argued.
+
+**AUDIT FIRST.** `packages/analyzers/src/stages/synthesize.ts` is 347 lines: one prompt, a SHA-keyed
+completion cache checked before any call, `estimateTokens` admission control then real-usage
+recording, a 3-attempt retry on schema/grounding failure, `deriveSynthesis` enforcing
+fileId-∈-graph-nodes with drop-and-count, and a throw on total failure that the orchestrator turns
+into a "partial" run. That is the contract this phase had to preserve, and every clause of it now has
+a test on the new path. `@codeflow/arena`'s grounding verifiers were already exact and free, which is
+what made a no-model best-of-N scorer possible.
+
+### Task 1 — orchestrator/worker fan-out (`07727f1`, wired in `e26039c`)
+
+**Parallelism is EARNED.** Fanning five specialists over "the repo" would be five agents reading the
+same files and reporting overlapping paragraphs — parallel in wall-clock and redundant in content.
+The fan-out is over COMMUNITIES, which are low-coupling by construction (that is what modularity
+measures), so per-community work is genuinely independent and the results genuinely compose. The five
+lenses (architecture, data-flow, security, api-surface, dependency-risk) are five different
+questions, not five copies of "analyse this", which is what lets a supervisor compose them.
+
+**Never an open mesh.** Workers cannot see or address each other. Each posts STRUCTURED findings to a
+blackboard; one supervisor reads a bounded selection plus deterministic graph facts.
+
+**Specialists are given FACTS, not code.** The graph already knows the imports, calls, cycles,
+symbols and routes for a community; handing those over is cheaper and more reliable than handing over
+file contents for a model to re-derive — and it makes the claims checkable, because every fileId the
+specialist may legitimately cite appears in that block.
+
+#### RISK (b) — orchestrator context must not grow with worker count
+
+The documented failure at 4+ workers, avoided structurally: findings are individually bounded and the
+supervisor reads at most `SUPERVISOR_MAX_FINDINGS`, so its input is a function of the CAP and nothing
+else. **Measured:**
+
+| communities | findings on the blackboard | supervisor prompt | specialist calls |
+|---:|---:|---:|---:|
+| 1 | 5 | 417 tok | 5 |
+| 3 | 15 | 667 tok | 15 |
+| 12 | 60 | **668 tok** | 60 |
+| 60 | 300 | **668 tok** | 300 |
+
+**5× the workers and 5× the findings for the same 668-token prompt.** The selection is ROUND-ROBIN
+across communities rather than a plain importance sort, and that detail is load-bearing: one
+pathological community with five `high` findings would otherwise consume the entire cap, and the
+supervisor would synthesise one corner of the repository while believing it had seen the whole
+blackboard. Breadth first, depth second — so the cap degrades coverage gracefully instead of
+catastrophically. The FULL finding list is still kept for the report and the trace; the bound applies
+to the PROMPT, because losing the record would trade one problem for a worse one.
+
+#### RISK — "parallel" that is parallel in name only
+
+`peakConcurrency` is OBSERVED with a counter around each call, not inferred from a stopwatch: a
+wall-clock comparison is flaky on a loaded machine and can pass by accident, whereas peak 5 means
+five calls were genuinely in flight. The wall-clock number is reported too, because it is what a
+reader wants:
+
+```
+maxConcurrency 1: 496ms, peak concurrency 1, 15 calls (15 jobs)
+maxConcurrency 5: 126ms, peak concurrency 5, 15 calls (15 jobs)   → 3.9x
+```
+
+`mapWithConcurrency` is a worker POOL pulling from a shared cursor, not fixed batches — batching
+idles the whole pool behind one slow call per batch, which on a provider with variable latency throws
+away most of the saving. **That test was flaky in its first form and was fixed rather than loosened:**
+`setTimeout(30)` against five `setTimeout(1)` calls failed on Windows, which clamps short timers, so
+five "1ms" waits exceeded the 30ms one. Replaced with an explicitly-held promise, which removes
+timing from the assertion entirely.
+
+#### RISK (c) — N-times cost
+
+Routing is deterministic and free — no model, no RNG. Four signals, each a real difficulty signal,
+each CLAMPED so an outlier cannot dominate: size, coupling (external/(internal+external) edge
+weight), cycles through the community, and symbol density. An edgeless community scores 0 on coupling
+rather than 1, because dividing by zero and calling the result cohesion would be inventing a signal
+from missing data. Weights are STATED as uncalibrated: the shape is defensible, the numbers are a
+guess flagged for P5. Every route reports its dominant signal, so a decision can be argued with.
+
+Two ceilings, because an unbounded router is an unbounded bill. `MAX_HARD_COMMUNITIES` caps the
+N-times spend per run and is spent on the HARDEST communities (the plan is complexity-descending);
+communities that qualified but missed the ceiling say so in their reason rather than looking easy.
+`FANOUT_MAX_COMMUNITIES` caps how many are analysed at all, dropping the LEAST complex — and the
+omission is reported, because a silent cap reads as "covered everything". **Measured:**
+
+```
+threshold 0.99: 0 hard, 20 calls,  0 best-of-N extra  ( 0% overhead)
+threshold 0.50: 1 hard, 30 calls, 10 best-of-N extra  (33% overhead)
+```
+
+Sampling STOPS on a refusal — further samples would be paying to talk a specialist out of a correct
+"nothing here". The scorer is EXACT and free (grounding 0.5, coverage 0.3, substance 0.2, with
+substance capped because length is not insight): a judge per candidate on top of an N-times bill
+would be unaffordable, and a scorer that varied run to run would make the winner unreproducible —
+the two problems compound.
+
+#### RISK (d) — agents must never mutate a deterministic slice
+
+They are AI leaves. The graph, metrics and communities are computed before any agent runs and are
+read-only throughout, and the only slice produced is `aiSynthesis`, which was always an AI slice.
+Asserted rather than assumed: the spine is compared byte-for-byte across a fan-out, the ROUTING is
+asserted identical across two runs even though the specialists are not, and the blackboard is sorted
+before posting so entry order does not depend on scheduling.
+
+### Task 2 — the per-specialist phase gate + guardrails
+
+Four checks, all in code:
+
+1. **Input safety** — a specialist sees only its own community's files, bounded to
+   `SPECIALIST_MAX_FILES` and sorted before truncating (so which files it sees is deterministic).
+   Bounded for cost, but mainly because a specialist reasoning over 400 files is reasoning over noise.
+2. **Schema** — REJECTS rather than coerces. A headline coerced to `""` reaches the supervisor as an
+   empty bullet that looks like a fact; a non-array `fileIds` coerced to `[]` silently turns a
+   grounded finding into an ungrounded one. An absent `importance` defaults to `medium`, not `high`,
+   because defaulting upward would let every finding crowd the supervisor's cap. An EMPTY findings
+   array is treated as a refusal, so callers need one path rather than two.
+3. **Grounding TO THE COMMUNITY** — stricter than "in the graph". A specialist on community 3 citing
+   a file from community 7 has wandered outside its evidence, and accepting it would let the fan-out
+   produce overlapping, unattributable claims. A finding left with NO grounded files is dropped
+   entirely: an ungrounded claim is not a weaker finding, it is an unattributable one.
+4. **Budget** — per specialist, so exhaustion SKIPS the remaining lenses instead of failing the run.
+   Four lenses are worth more than none.
+
+**Refusal = a first-class outcome with a reason** (the brief's "200 + reason"), never an error.
+Treating "nothing to report" as failure pushes a model toward inventing findings, which is precisely
+the wrong incentive for a security lens.
+
+### Task 3 — test-time compute
+
+Covered under RISK (c) above: routing by community complexity, N trajectories on the hard tail only,
+each scored by the exact verifier, best kept. `bestScore` is recorded on the blackboard entry so a
+winner is explainable, and `bestOfNExtraCalls` is reported separately from `specialistCalls` so the
+extra bill is always attributable.
+
+**On "verified quality lift measured on the eval":** what IS measured is that best-of-N picks the
+better-scoring trajectory (a test constructs candidates of differing coverage and asserts the broader
+one survives) and that the N-times cost is confined to the routed tail. What is NOT measured is a
+quality lift on the golden set, because that needs a real model — a mock cannot be "better on its
+second attempt" in any way that is not written into the mock. Deferred, and named as such rather than
+faked.
+
+### Wiring (`e26039c`) — risk (a): the Synthesize contract
+
+All four clauses kept, each in the same shape rather than a similar-looking one, and each with a test:
+grounding (dropped-and-counted, renumbered), CACHE (SHA-keyed, checked before any call, keyed on the
+COMMUNITY PARTITION as well — a different partition is a different fan-out even at the same commit —
+storing the OUTCOME because there is no single completion to cache, re-grounded on read, and NEVER
+caching a fallback so a transient supervisor failure cannot freeze the degraded answer in for the
+whole SHA), BUDGET (cache-before-budget; per-specialist checks degrade), and PARTIAL (throws only when
+nothing is grounded at all — the same condition the single-shot stage threw on).
+
+**The choice is made at RUN time, and has to be:** `metrics.clusters` does not exist until Analyze
+(stage 6), but the worker assembles its stage list before the pipeline starts.
+`createAdaptiveSynthesizeStage` delegates and keeps the SAME `id`/`kind`/`owns`, because a new id
+would silently take stage 7 out of the orchestrator's coverage partition, cache lookup and
+partial handling.
+
+**The single-shot path is KEPT.** A cached pre-V3-P1 analysis has an index but no communities and is
+still worth synthesising; deleting the older path to have "one path" would have made those analyses
+worse to serve tidiness.
+
+**OPT-IN via `FANOUT_SYNTHESIS`**, and the reason is cost SHAPE, not doubt: 5N+1 provider calls is
+right for a real onboarding guide and wrong for a demo on a free tier. The worker logs which path it
+will use at startup and which one ran per job.
+
+### Docker (verified INSIDE the pruned image)
+
+```
+specialists: architecture,data-flow,security,api-surface,dependency-risk
+adaptive stage: true | fanout stage: true
+complexity: 0.567 | 20 file(s), coupling 0.89, 0 cycle(s), 0 symbol(s); dominant signal: size
+routes: 0:hard:3 1:easy:1
+```
+
+That last line is the router doing its job in the shipped image: the 20-file, heavily-coupled
+community routes HARD with 3 samples, the single-file one routes easy with 1. Worker image
+**489 MB → 491 MB (+2 MB)** for the new orchestrator code — no new runtime dependency.
+
+### Verification
+
+`pnpm -r typecheck`, `pnpm -r lint`, `pnpm test` (serial), `pnpm -r build`, `node --test tests/*.mjs`
+— all green. **955 unit tests**, up from 881 (**+74**):
+
+| package | before | after | delta |
+|---|---:|---:|---:|
+| **agents** | 91 | **164** | +73 |
+| worker | 13 | **14** | +1 |
+| retrieval | 155 | 155 | — |
+| analyzers | 234 | 234 | — |
+| eval | 109 | 109 | — |
+| arena | 68 | 68 | — |
+| memory | 45 | 45 | — |
+| api | 42 | 42 | — |
+| web | 60 | 60 | — |
+| graph | 33 | 33 | — |
+| parsers | 28 | 28 | — |
+| shared-types | 3 | 3 | — |
+| **total** | **881** | **955** | **+74** |
+
+Legacy `node --test`: **25/25**. `tsc --noUnusedLocals --noUnusedParameters` clean. Hermetic
+throughout — the fan-out tests drive a scripted `LlmClient` that can assert on the prompt it received.
+
+### Judgment calls flagged
+
+1. **`FANOUT_SYNTHESIS` is opt-in**, on cost shape. Enabling it by default would multiply every demo
+   run's bill by roughly the community count.
+2. **The single-shot path was kept**, for graph-less cached analyses. Same reasoning as V3-P3's
+   fallback: keeping a path that is correct for real data beats tidiness.
+3. **Routing weights are uncalibrated** and say so. The four signals are defensible; the numbers are
+   a guess until a real corpus.
+4. **The best-of-N scorer uses no model.** A judge per candidate would make N-times unaffordable and
+   the winner unreproducible.
+5. **"Verified quality lift on the eval" is deferred**, not faked — a mock cannot be better on its
+   second attempt except by being told to be.
+6. **The empty-community case falls back honestly** rather than fanning out over arbitrary file
+   groups, which would produce the overlapping reports the community design exists to avoid.
+
+### Ledger
+
+No new items. The two carries this phase touches are already recorded: the routing weights and the
+retrieval knobs are the same "documented default, uncalibrated" category as V3-P2's constants, all
+resolved by the same deferred big-repo run.
+
 ---
 
 ## DEFERRED TO MANUAL PHASE (P5/P6)
@@ -2180,6 +2405,17 @@ keys, real spend or a real clock to actually run. Nothing in these phases blocks
     the Redis connection `redisClient.ts` already provides.
 13. **Scored multi-turn eval scenarios.** Needs keys, and needs a real model in the loop for the
     numbers to mean anything.
+
+**Bounded fan-out + test-time compute (V3-P4)**
+14. **A real multi-agent run with keys** (`FANOUT_SYNTHESIS=true` + a chat provider). The whole
+    orchestrator is covered hermetically with a scripted client, so this measures real-model
+    behaviour — whether the five lenses genuinely produce complementary findings, and how often a
+    specialist refuses when it should.
+15. **Verified quality lift from best-of-N, on the eval.** What is measured hermetically is that the
+    better-scoring trajectory wins and that the N-times cost stays on the routed tail. A LIFT needs a
+    real model: a mock cannot be better on its second attempt except by being told to be.
+16. **Calibrating the routing weights** (size/coupling/cycles/density) and the hard threshold against
+    a real corpus. Same big-repo run as the V3-P2 retrieval knobs.
 
 **Owner setup**
 7. A GitHub `eval` environment + the `GEMINI_API_KEY` secret, for the scored-eval workflow's

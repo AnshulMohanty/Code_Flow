@@ -280,13 +280,49 @@ measured the mock.
 
 ## PHASE 4 — Bounded agent fan-out + test-time compute
 **Goal:** parallel specialist analysis over communities, with a supervisor and verified best-of-N on the hard tail.
-**Entry gate:** Phase 3 `[x]` (needs communities + Arena + memory).
+**Entry gate:** Phase 3 `[x]` (needs communities + Arena + memory). **Satisfied.** **Executed
+2026-08-31** (branch `v3/p4-agent-fanout`, cut off `v3/p3-agentic-memory`).
 
-- [ ] **`@codeflow/agents`:** orchestrator-worker; specialists (Arch, Data-flow, Security, API-surface, Dep-risk) run in parallel **per community**; workers return **structured summaries** (never raw transcripts) to a shared blackboard; a **supervisor** synthesizes + builds global reading order. Never open mesh. *Acceptance:* orchestrator context does not grow with worker count.
-- [ ] **Phase gate + guardrails** per specialist (input safety, schema, grounding, budget). Refusal = 200 + reason.
-- [ ] **Test-time compute:** route by community complexity; on hard cases sample N trajectories, score with the Arena verifier, return the best. *Acceptance:* N× cost paid only on routed-hard tail; verified quality lift measured on eval.
+- [x] **`@codeflow/agents`:** orchestrator-worker; specialists (Arch, Data-flow, Security, API-surface, Dep-risk) run in parallel **per community**; workers return **structured summaries** (never raw transcripts) to a shared blackboard; a **supervisor** synthesizes + builds global reading order. Never open mesh. *Acceptance:* orchestrator context does not grow with worker count.
+      → **DONE**, in the package V3-P3 created. **Acceptance MEASURED, not argued:** 1/3/12/60
+      communities produce 5/15/60/300 blackboard findings and supervisor prompts of
+      417/667/**668**/**668** tokens — 5x the workers and 5x the findings for the same prompt. The
+      mechanism is structural: findings are individually bounded and the supervisor reads at most
+      `SUPERVISOR_MAX_FINDINGS`, selected ROUND-ROBIN across communities so one loud community cannot
+      eat the cap and leave the supervisor synthesising one corner while believing it saw everything.
+      Parallelism is measured two ways because they answer different questions: `peakConcurrency` is
+      OBSERVED by a counter (exact, non-flaky) and wall-clock is reported for the reader
+      (**496ms -> 126ms, 3.9x** over 15 jobs).
+- [x] **Phase gate + guardrails** per specialist (input safety, schema, grounding, budget). Refusal = 200 + reason.
+      → **DONE**, with grounding deliberately STRICTER than the plan implies: a specialist's fileIds
+      must be in ITS OWN COMMUNITY, not merely in the graph. A security lens on community 3 citing a
+      file from community 7 has wandered outside its evidence, and accepting it would let the fan-out
+      produce overlapping, unattributable claims. Schema validation REJECTS rather than coerces (a
+      headline coerced to `""` reaches the supervisor as a bullet that looks like a fact), an absent
+      importance defaults to `medium` rather than `high` so findings cannot crowd the cap, and the
+      budget is checked per specialist so exhaustion skips the remaining lenses instead of failing the
+      run. Refusal is first-class with a reason: treating "nothing to report" as failure would push a
+      model toward inventing findings.
+- [x] **Test-time compute:** route by community complexity; on hard cases sample N trajectories, score with the Arena verifier, return the best. *Acceptance:* N× cost paid only on routed-hard tail; verified quality lift measured on eval.
+      → **DONE, with one half of the acceptance deferred and named.** The cost half is measured:
+      **0% overhead** when nothing routes hard, **33%** (10 of 30 calls) with one hard community of
+      four, and TWO ceilings so the N-times bill cannot run away — `MAX_HARD_COMMUNITIES` bounds the
+      spend and communities that qualified but missed it say so rather than looking easy. Routing is
+      deterministic and free (four clamped difficulty signals, weights STATED as uncalibrated), and
+      the scorer is exact — a judge per candidate on top of an N-times bill would be unaffordable and
+      a varying scorer would make the winner unreproducible. **The quality LIFT on the eval is
+      deferred:** it needs a real model, because a mock cannot be better on its second attempt except
+      by being told to be. What is proven hermetically is that best-of-N picks the better-scoring
+      trajectory and that sampling stops on a refusal.
 
 **Phase 4 DoD:** gates green · fan-out is genuinely parallel (measure wall-clock vs sequential) · eval synthesis quality up · cost bounded and reported.
+→ **MET, with "eval synthesis quality up" explicitly deferred and why.** Gates green after both
+commits: typecheck, lint, **955 tests** (881 -> 955, +74; agents 91 -> 164), build, legacy 25/25.
+Parallelism measured (**496ms -> 126ms, 3.9x**, peak concurrency observed at 5). Cost bounded and
+reported on the stage event itself (`specialistCalls`, `bestOfNExtraCalls`, `peakConcurrency`,
+`supervisorContextTokens`, hard + skipped communities). **Synthesis quality on the eval needs a real
+model** and is in the deferred bucket — measuring it against a scripted client would measure the
+script.
 
 ---
 

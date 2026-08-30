@@ -125,6 +125,9 @@ importers:
 
   apps/worker:
     dependencies:
+      '@codeflow/agents':
+        specifier: workspace:*
+        version: link:../../packages/agents
       '@codeflow/analyzers':
         specifier: workspace:*
         version: link:../../packages/analyzers

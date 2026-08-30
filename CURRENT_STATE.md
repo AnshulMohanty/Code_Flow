@@ -3,7 +3,22 @@
 > Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
 > [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
 
-_Last updated: 2026-08-31 — V3-P3: agentic Q&A + memory (bounded multi-turn agent, graph tools, session/repo memory) (branch `v3/p3-agentic-memory`)._
+_Last updated: 2026-08-31 — V3-P4: bounded agent fan-out + test-time compute (specialists over communities, blackboard, supervisor, best-of-N) (branch `v3/p4-agent-fanout`)._
+
+> ✅ **V3-P4 is DONE** — the multi-agent centrepiece. Stage 7 is now a fan-out of five specialist
+> lenses over V3-P1's **Louvain communities** (low-coupling BY CONSTRUCTION, which is why the
+> parallelism is earned rather than assumed), collected on a shared blackboard, synthesised by ONE
+> supervisor. Never an open mesh. All four risks the brief named are handled in code and **measured**:
+> the supervisor's prompt is **668 tokens at 12 communities and 668 at 60** (5× the workers, 5× the
+> findings, the same prompt — the documented failure at 4+ workers, avoided structurally); wall-clock
+> **496ms → 126ms (3.9×)** with peak concurrency OBSERVED by a counter rather than inferred from a
+> stopwatch; best-of-N costs **0% overhead when nothing routes hard and 33% with one hard community
+> of four**, with two hard ceilings so the N-times bill cannot run away; and the spine is asserted
+> byte-identical across a fan-out, because agents are AI LEAVES. The Synthesize contract survives
+> intact — grounding, a cache now keyed on the community PARTITION as well as the SHA, cache-before-
+> budget, and "throws only when nothing is grounded". The choice of path is made at RUN time (clusters
+> do not exist until stage 6), the single-shot path is KEPT for graph-less cached analyses, and the
+> fan-out is opt-in via `FANOUT_SYNTHESIS` on cost shape. **955 tests** (was 881).
 
 > ✅ **V3-P3 is DONE** — `/api/result/:id/ask` is a BOUNDED multi-turn agent. Two new packages:
 > `@codeflow/agents` (the loop + `find_references`/`get_callers`/`get_blast_radius`/`symbol_search`
@@ -598,6 +613,61 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-P4 — bounded agent fan-out + test-time compute (branch `v3/p4-agent-fanout`)
+
+> Full detail, every measurement and six flagged judgment calls:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P4`).
+
+- **Parallelism is EARNED.** Five specialists over "the repo" would be five agents reading the same
+  files and reporting overlapping paragraphs — parallel in wall-clock, redundant in content. The
+  fan-out is over COMMUNITIES, which modularity guarantees are low-coupling, so per-community work is
+  genuinely independent and the results genuinely compose. The five lenses (architecture, data-flow,
+  security, api-surface, dependency-risk) are five different QUESTIONS, which is what lets a
+  supervisor compose them. Specialists are given deterministic graph FACTS, not file contents: the
+  graph already knows the imports, calls, cycles, symbols and routes, and handing those over is
+  cheaper, more reliable, and makes every claim checkable.
+- **Orchestrator context does not grow with worker count — measured.** 1/3/12/60 communities produce
+  5/15/60/300 findings and supervisor prompts of 417/667/**668**/**668** tokens. Findings are
+  individually bounded and the supervisor reads at most `SUPERVISOR_MAX_FINDINGS`, selected
+  ROUND-ROBIN across communities — a plain importance sort would let one loud community eat the cap
+  and leave the supervisor synthesising one corner while believing it saw everything. The FULL list is
+  still kept for the report; the bound applies to the prompt.
+- **Genuinely parallel — observed, not timed.** `peakConcurrency` comes from a counter around each
+  call, because a wall-clock comparison is flaky on a loaded machine and can pass by accident. The
+  wall-clock number is reported too: **496ms → 126ms (3.9×)** over 15 jobs. `mapWithConcurrency` is a
+  worker POOL, not batches, since batching idles the pool behind one slow call per batch.
+- **N-times cost only on the routed-hard tail.** Routing is deterministic and free — four clamped
+  difficulty signals with STATED, uncalibrated weights, and an edgeless community scores 0 on coupling
+  rather than 1 (dividing by zero and calling it cohesion would invent a signal from missing data).
+  Two ceilings: `MAX_HARD_COMMUNITIES` bounds the N-times spend per run, `FANOUT_MAX_COMMUNITIES`
+  bounds coverage — and what was dropped is REPORTED, because a silent cap reads as "covered
+  everything". Measured at **0% overhead** with nothing hard and **33%** with one hard community of
+  four. Sampling stops on a refusal; the scorer is exact and free, because a judge per candidate on
+  top of an N-times bill would be unaffordable and a varying scorer would make the winner
+  unreproducible.
+- **The phase gate, four checks per specialist:** input safety (own community only, bounded, sorted),
+  schema (rejects rather than coerces — a headline coerced to `""` reaches the supervisor as a bullet
+  that looks like a fact), grounding **to the community** (stricter than "in the graph", because a
+  specialist citing another community's file has left its evidence), and budget (exhaustion skips the
+  remaining lenses rather than failing the run — four lenses beat none). **Refusal is first-class with
+  a reason**, since treating "nothing to report" as failure pushes a model toward inventing findings.
+- **Agents are AI LEAVES.** The spine is computed before any agent runs and is read-only; asserted
+  byte-identical across a fan-out, and the ROUTING is asserted identical across two runs even though
+  the specialists are not. The blackboard is sorted before posting, so entry order never depends on
+  scheduling.
+- **The Synthesize contract survives intact.** Grounding, cache-before-budget, and "throws only when
+  nothing is grounded" all behave as the single-shot stage did. The cache is now keyed on the community
+  PARTITION as well as the SHA (a different partition is a different fan-out at the same commit), it
+  stores the OUTCOME because there is no single completion to cache, it re-grounds on read, and it
+  never caches a fallback — a transient supervisor failure must not freeze the degraded answer in for
+  the whole SHA. A DETERMINISTIC FALLBACK exists because a fan-out that spent five calls and returned
+  nothing would be strictly worse than the one call it replaced; it is honest about being one.
+- **The path is chosen at RUN time**, because `metrics.clusters` does not exist until stage 6 while
+  the worker assembles its stage list before the pipeline starts. The adaptive stage keeps the same
+  `id`/`kind`/`owns`, or stage 7 would silently leave the orchestrator's coverage partition. The
+  single-shot path is KEPT for graph-less cached analyses, and the fan-out is opt-in via
+  `FANOUT_SYNTHESIS` on cost shape (5N+1 calls vs 1).
+
 ### V3-P3 — agentic Q&A + memory (branch `v3/p3-agentic-memory`)
 
 > Full detail, including the `LlmClient` audit finding and every judgment call:
@@ -945,12 +1015,13 @@ driven by injected fakes; in-memory remains the default everywhere.
 
 ## Verification
 
-`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **881 tests** (V3-P3: 742 -> 881,
-+139; V3-P2 before it: 526 -> 742): shared-types 3, graph 33, parsers 28, **memory 45 (new
-package)**, **agents 91 (new package)**, **retrieval 155**, **analyzers 234**, **arena 68**,
-**eval 109**, **api 42** (+3 session contract), **web 60**, worker 13 — confirmed **hermetic**
-(the agent suite injects a SCRIPTED LlmClient whose entries can assert on the prompt they received,
-which is what stops those tests being tautological) (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
+`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **955 tests** (V3-P4: 881 -> 955,
++74; V3-P3 before it: 742 -> 881; V3-P2: 526 -> 742): shared-types 3, graph 33, parsers 28,
+**memory 45**, **agents 164** (+73 fan-out, routing, blackboard, supervisor, stage contract),
+**retrieval 155**, **analyzers 234**, **arena 68**, **eval 109**, **api 42**, **web 60**,
+**worker 14** (+1 fan-out opt-in) — confirmed **hermetic** (the agent suites inject a SCRIPTED
+LlmClient whose entries can assert on the prompt they received, which is what stops those tests
+being tautological) (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
 LLM/embedding + stubbed `fetch`/`EventSource` + **mocked `react-force-graph-2d`** (canvas never
 rendered in jsdom) throughout — zero real API/network calls/spend). NOTE: `pnpm -r test` (parallel)
 can OOM running all suites back-to-back with the heavier web env; run serially
