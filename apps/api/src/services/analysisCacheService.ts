@@ -2,6 +2,15 @@ import type { AnalysisMode, AnalysisResult, RepositoryRef } from "@codeflow/shar
 import { env } from "../config/env.js";
 import { isMongoConnected } from "../db/connectMongo.js";
 import { AnalysisModel } from "../db/models/AnalysisModel.js";
+import { AnalysisOverflowModel } from "../db/models/AnalysisOverflowModel.js";
+import {
+  describeMissingOverflow,
+  measureAnalysis,
+  rehydrateAnalysis,
+  splitOverflow,
+  type OverflowField,
+  type OverflowManifest,
+} from "./analysisOverflow.js";
 
 export interface AnalysisCacheKey {
   repoFullName: string;
@@ -22,6 +31,8 @@ export interface CachedAnalysisRecord {
   completedAt: string;
   durationMs: number;
   createdAt: string;
+  /** Present only when heavy fields were externalized (V3-P5, ledger #20). */
+  overflow?: OverflowManifest;
 }
 
 const inMemoryAnalyses = new Map<string, CachedAnalysisRecord>();
@@ -39,7 +50,49 @@ export async function findCachedAnalysis(key: AnalysisCacheKey): Promise<CachedA
     analyzerVersion,
   }).lean();
 
-  return doc ? fromMongoDocument(doc) : null;
+  return doc ? await withOverflow(fromMongoDocument(doc)) : null;
+}
+
+/**
+ * Fetch and re-attach externalized fields (V3-P5, ledger #20).
+ *
+ * ONE EXTRA QUERY ONLY WHEN THERE IS A MANIFEST, which is the point of measuring rather than always
+ * externalising: a normal-sized analysis reads exactly as it did before, with no join.
+ *
+ * A missing or unreachable overflow document does NOT fail the read. It attaches a warning naming
+ * the fields instead, because `shared-types` documents absent `cpgEdges` as meaning "the parser
+ * could not produce them" — so silently serving the shed document would turn a storage failure into
+ * a false statement about the repository.
+ */
+async function withOverflow(record: CachedAnalysisRecord): Promise<CachedAnalysisRecord> {
+  const manifest = record.overflow;
+  if (!manifest || manifest.fields.length === 0) return record;
+
+  let payload: Record<string, unknown> | null = null;
+  try {
+    const doc = await AnalysisOverflowModel.findOne({
+      repoFullName: record.repoFullName,
+      commitSha: record.commitSha,
+      analyzerVersion: record.analyzerVersion,
+    }).lean();
+    payload = (doc?.payload as Record<string, unknown> | undefined) ?? null;
+  } catch (error) {
+    // Reported, not thrown: the rest of this analysis is still worth serving.
+    console.warn(
+      `[codeflow] overflow read failed for ${record.repoFullName}@${record.commitSha}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const { result, missing } = rehydrateAnalysis(record.result, manifest, payload);
+  if (missing.length) {
+    const warning = describeMissingOverflow(missing);
+    console.warn(`[codeflow] ${warning}`);
+    // Surfaced through the EXISTING honest-degradation channel rather than a new one: `warnings`
+    // is already rendered to the user, so an incomplete analysis says so where they will see it.
+    result.warnings = [...(result.warnings ?? []), warning];
+  }
+  return { ...record, result };
 }
 
 export async function saveAnalysis(input: {
@@ -76,6 +129,38 @@ export async function saveAnalysis(input: {
     return record;
   }
 
+  // V3-P5 (ledger #20): measure, and externalize the heavy optional fields only if this document
+  // would otherwise approach Mongo's 16MB ceiling. A normal analysis takes the original path
+  // exactly — same document, no second collection, no manifest.
+  const split = splitOverflow(input.result);
+
+  if (split.stillTooLarge) {
+    // Fail LOUDLY with the measurement. Mongo would reject this too, but with a driver error that
+    // names no field; this names the sizes and the three largest remaining slices, which is the
+    // difference between a diagnosable limit and a mystery.
+    const measured = measureAnalysis(input.result);
+    throw new Error(
+      `Cannot store the analysis of ${input.repoFullName}@${input.commitSha}: ${split.stillTooLarge} ` +
+        `(externalizable fields: ${measured.fields.map((entry) => `${entry.field}=${entry.count}`).join(", ")})`,
+    );
+  }
+
+  if (split.manifest) {
+    console.log(
+      `[codeflow] analysis ${input.repoFullName}@${input.commitSha} externalized ` +
+        `${split.manifest.fields.join(", ")} (${split.manifest.originalJsonBytes} -> ` +
+        `${split.manifest.storedJsonBytes} JSON bytes).`,
+    );
+    // The overflow document is written FIRST, deliberately. If this write fails the analysis is
+    // never stored, so the pair cannot end up with an analysis whose manifest points at nothing —
+    // a state that would read as "incomplete" forever. The reverse order could produce it.
+    await AnalysisOverflowModel.findOneAndUpdate(
+      { repoFullName: input.repoFullName, commitSha: input.commitSha, analyzerVersion },
+      { $set: { payload: split.payload, createdAt: completedAt } },
+      { upsert: true },
+    );
+  }
+
   const doc = await AnalysisModel.findOneAndUpdate(
     {
       repoFullName: input.repoFullName,
@@ -90,16 +175,20 @@ export async function saveAnalysis(input: {
         branch: input.branch,
         mode: input.mode,
         analyzerVersion,
-        result: input.result,
+        result: split.stored,
         summary: input.result.summary,
         completedAt,
         durationMs: input.durationMs,
+        ...(split.manifest ? { overflow: split.manifest } : {}),
       },
     },
     { returnDocument: "after", upsert: true },
   ).lean();
 
-  return fromMongoDocument(doc);
+  // The record returned to the CALLER carries the complete result, not the shed one: this is the
+  // response to the request that just produced the analysis, and handing back a stripped document
+  // would make the analysis look incomplete to the one user guaranteed to be watching.
+  return { ...fromMongoDocument(doc), result: { ...input.result, id: String((doc as { _id: unknown })._id) } };
 }
 
 function sanitizeId(value: string) {
@@ -112,7 +201,7 @@ export async function getAnalysisById(id: string): Promise<CachedAnalysisRecord 
   }
 
   const doc = await AnalysisModel.findById(id).lean();
-  return doc ? fromMongoDocument(doc) : null;
+  return doc ? await withOverflow(fromMongoDocument(doc)) : null;
 }
 
 export function clearAnalysisCacheForTests() {
@@ -139,5 +228,14 @@ function fromMongoDocument(doc: any): CachedAnalysisRecord {
     completedAt: new Date(doc.completedAt).toISOString(),
     durationMs: doc.durationMs,
     createdAt: new Date(doc.createdAt).toISOString(),
+    ...(doc.overflow
+      ? {
+          overflow: {
+            fields: (doc.overflow.fields ?? []) as OverflowField[],
+            originalJsonBytes: doc.overflow.originalJsonBytes ?? 0,
+            storedJsonBytes: doc.overflow.storedJsonBytes ?? 0,
+          },
+        }
+      : {}),
   };
 }

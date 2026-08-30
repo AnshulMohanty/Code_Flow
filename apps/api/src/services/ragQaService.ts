@@ -17,6 +17,7 @@ import {
 import { RAG_TOP_K } from "@codeflow/config";
 import {
   createMemoryRepoStore,
+  createRedisRepoStore,
   createMemorySessionStore,
   createRedisSessionStore,
   type RepoMemoryStore,
@@ -26,6 +27,7 @@ import { createLexicalOverlapReranker, createRetrievalStores, type RetrievalStor
 import type { AnalysisCacheHandle, AnalysisResult, BudgetHandle } from "@codeflow/shared-types";
 import { env } from "../config/env.js";
 import { getSharedRedis, isSharedRedisEnabled } from "../queues/redisClient.js";
+import { createRedisAnalysisCache } from "./redisAnalysisCache.js";
 
 /**
  * Answers a question against a stored analysis. Injectable so tests supply a mock (with mock
@@ -94,6 +96,7 @@ export function resetQaBudgetForTests(): void {
   sharedRetrieval = null;
   sessionStore = null;
   repoStore = null;
+  answerCache = null;
 }
 
 /**
@@ -104,13 +107,13 @@ export function resetQaBudgetForTests(): void {
  * process's heap, so two replicas give a user two different conversations and a restart forgets
  * every follow-up. Same honest-degradation rule V3-P0 applied to the budget.
  *
- * Repo memory stays in-memory for now, deliberately: "what changed" only becomes useful once
- * several commits of a repository have been analysed, and a shared store for it is a P5 wiring
- * task rather than something to half-build here. The consequence is stated where it is felt —
- * `what_changed` will report "only one commit analysed" after a restart.
+ * Repo memory is now Redis-backed too (V3-P5, ledger #21). It was the last per-process store, and
+ * the consequence was felt exactly where the feature lives: after a restart `what_changed` reported
+ * "only one commit analysed", for a tool whose whole value is remembering the previous one. Both
+ * stores fall back to in-memory and both ANNOUNCE it.
  */
 let sessionStore: Promise<SessionMemoryStore> | null = null;
-let repoStore: RepoMemoryStore | null = null;
+let repoStore: Promise<RepoMemoryStore> | null = null;
 
 function resolveSessionStore(): Promise<SessionMemoryStore> {
   sessionStore ??= (async () => {
@@ -133,9 +136,59 @@ function reportSessionError(error: unknown, operation: string): void {
   console.warn(`[codeflow] session memory ${operation} failed: ${error instanceof Error ? error.message : String(error)}`);
 }
 
-function resolveRepoStore(): RepoMemoryStore {
-  repoStore ??= createMemoryRepoStore();
+function resolveRepoStore(): Promise<RepoMemoryStore> {
+  repoStore ??= (async () => {
+    const redis = await getSharedRedis();
+    if (redis) return createRedisRepoStore({ redis: redis as never, onError: reportRepoError });
+    if (isSharedRedisEnabled()) {
+      console.warn(
+        "[codeflow] Repo memory: Redis unavailable — commit snapshots are PER-PROCESS. " +
+          "`what_changed` will report only the commits this process analysed itself.",
+      );
+    }
+    return createMemoryRepoStore();
+  })();
   return repoStore;
+}
+
+function reportRepoError(error: unknown, operation: string): void {
+  // Same rule as session memory: a lost snapshot degrades one answer, silence makes it
+  // undiagnosable.
+  console.warn(`[codeflow] repo memory ${operation} failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+/**
+ * The Q&A ANSWER CACHE, now shared (V3-P5, ledger #21).
+ *
+ * Resolved once per process. Redis when available, a process-local Map otherwise — and unlike the
+ * budget and the session store, this degradation is NOT announced at warn level, deliberately: an
+ * unshared answer cache costs money, not correctness, and a warning that fires on every boot of a
+ * keyless local deployment trains operators to ignore warnings. It is reported once, at info.
+ */
+let answerCache: Promise<AnalysisCacheHandle> | null = null;
+
+function resolveAnswerCache(): Promise<AnalysisCacheHandle> {
+  answerCache ??= (async () => {
+    const redis = await getSharedRedis();
+    if (redis) {
+      return createRedisAnalysisCache({
+        redis: redis as never,
+        onError: (error, operation) =>
+          console.warn(
+            `[codeflow] Q&A answer cache ${operation} failed (a miss, not an error): ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          ),
+      });
+    }
+    if (isSharedRedisEnabled()) {
+      console.log(
+        "[codeflow] Q&A answer cache: Redis unavailable — PER-PROCESS. Repeated questions may be " +
+          "paid for once per replica. The spend CEILING is unaffected (cache-before-budget still holds).",
+      );
+    }
+    return createInMemoryCache();
+  })();
+  return answerCache;
 }
 
 /**
@@ -192,8 +245,10 @@ function createInMemoryCache(): AnalysisCacheHandle {
  * apply — the first two inside `search_code`, the last two around every turn.
  */
 function createProductionAskHandler(): AskHandler {
-  const cache = createInMemoryCache();
   return async ({ result, question, sessionId, analysisId }) => {
+    // Resolved per call rather than captured at construction: the Redis connection is async, and
+    // the handler is built synchronously at first use. Memoized inside, so this is one await.
+    const cache = await resolveAnswerCache();
     const budget = await resolveBudget();
     const ragIndex = result.ai?.rag;
     if (!ragIndex) {
@@ -242,7 +297,7 @@ function createProductionAskHandler(): AskHandler {
       result,
       chatClient,
       budget,
-      tools: [...createGraphTools(), searchTool, createWhatChangedTool({ store: resolveRepoStore() })],
+      tools: [...createGraphTools(), searchTool, createWhatChangedTool({ store: await resolveRepoStore() })],
       ...(memory ? { memory } : {}),
     });
 

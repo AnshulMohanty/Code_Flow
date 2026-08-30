@@ -67,6 +67,19 @@ services:
       LLM_PROVIDER: gemini
       EMBEDDING_PROVIDER: gemini
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
+      # V3-P5: jobs per instance. 2 is the default and right for a laptop; the ceiling is 8 and
+      # the correct move past that is more worker replicas, not a bigger number here.
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-2}"
+      # The image already sets this (see apps/worker/Dockerfile) and it is repeated here so the
+      # port is visible where an operator looks for it. /health, /ready and /metrics.
+      WORKER_HEALTH_PORT: "4100"
+    ports:
+      # Published so `curl localhost:4100/metrics` works while tuning; not required by the app.
+      - "4100:4100"
+    # An analysis job runs for minutes, and a SIGKILL mid-run makes BullMQ re-deliver it — the
+    # whole run is redone, provider spend included. This is the local equivalent of the
+    # terminationGracePeriodSeconds a platform needs (see apps/worker/src/config/scaling.ts).
+    stop_grace_period: 300s
     depends_on:
       mongo:
         condition: service_healthy

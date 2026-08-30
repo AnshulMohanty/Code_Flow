@@ -1,7 +1,7 @@
 import path from "node:path";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
-import { Worker } from "bullmq";
+import { Queue, Worker } from "bullmq";
 import type { AnalysisJobPayload } from "@codeflow/shared-types";
 import {
   createEmbeddingClientFromEnv,
@@ -23,6 +23,8 @@ import { readRepoFile } from "./services/repoFileReader.js";
 import { readRepoDir } from "./services/repoDirectoryWalker.js";
 import { measureRepoSize } from "./services/measureRepoSize.js";
 import { cleanupRepoPath } from "./services/publicRepoCloneService.js";
+import { resolveScalingConfig } from "./config/scaling.js";
+import { startHealthServer } from "./health/healthServer.js";
 
 // Monorepo has a single root .env; apps run with cwd = their package dir (apps/<app>), so
 // resolve the repo-root .env explicitly rather than dotenv's cwd-relative default. Skip under
@@ -175,32 +177,51 @@ async function main() {
     console.log("Stage schedule: PARALLEL by dependency readiness (V3-P5). Slices are byte-identical to sequential.");
   }
 
+  // --- V3-P5 AUTOSCALE CONFIG ------------------------------------------------
+  // Concurrency was hardcoded at 2, which is right for a 1-vCPU box and wrong for a 4-vCPU one.
+  // An unset WORKER_CONCURRENCY resolves to the same 2, so an existing deployment is unchanged.
+  const scaling = resolveScalingConfig(process.env);
+  for (const warning of scaling.warnings) console.warn(`[worker] ${warning}`);
+  console.log(`Job concurrency: ${scaling.concurrency} per instance.`);
+
+  // In-flight count, so /metrics reports THIS instance's load rather than only the shared queue.
+  let activeJobs = 0;
+  let consumerRunning = true;
+
   const worker = new Worker<AnalysisJobPayload>(
     ANALYSIS_QUEUE_NAME,
     async (job) => {
       console.log(`Processing analysis job ${job.data.jobId}.`);
-      await runAnalysisJob(job.data, {
-        service,
-        cloner,
-        publisher: createBullmqProgressPublisher(job),
-        readFile: readRepoFile,
-        readDir: readRepoDir,
-        measureRepoSize,
-        cleanupRepo: cleanupRepoPath,
-        ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
-        fanOutSynthesis: env.fanOutSynthesis,
-        parallelStages: env.parallelStages,
-        embeddingClient,
-        ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
-        cache,
-        budget,
-        eventLog,
-      });
-      console.log(`Completed analysis job ${job.data.jobId}.`);
+      activeJobs += 1;
+      try {
+        await runAnalysisJob(job.data, {
+          service,
+          cloner,
+          publisher: createBullmqProgressPublisher(job),
+          readFile: readRepoFile,
+          readDir: readRepoDir,
+          measureRepoSize,
+          cleanupRepo: cleanupRepoPath,
+          ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
+          fanOutSynthesis: env.fanOutSynthesis,
+          parallelStages: env.parallelStages,
+          embeddingClient,
+          ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
+          cache,
+          budget,
+          eventLog,
+        });
+        console.log(`Completed analysis job ${job.data.jobId}.`);
+      } finally {
+        // `finally`, so a FAILED job still decrements. Without it a run of failures would leave
+        // /metrics reporting phantom load forever, and an autoscaler reading it would keep an
+        // idle instance alive on the strength of jobs that ended minutes ago.
+        activeJobs -= 1;
+      }
     },
     {
       connection: createRedisConnectionOptions({ forWorker: true }),
-      concurrency: 2,
+      concurrency: scaling.concurrency,
     },
   );
 
@@ -208,9 +229,43 @@ async function main() {
     console.error(`Analysis job ${job?.data.jobId ?? "unknown"} failed: ${error.message}`);
   });
 
+  // --- V3-P5 HEALTH + METRICS ------------------------------------------------
+  // A separate `Queue` handle purely to READ counts. BullMQ's Worker knows what it is running but
+  // not what is waiting, and the waiting count is the whole point of the metric: an autoscaler
+  // needs the backlog, which by definition lives outside this process.
+  const metricsQueue = scaling.healthPort
+    ? new Queue(ANALYSIS_QUEUE_NAME, { connection: createRedisConnectionOptions({ forWorker: true }) })
+    : null;
+  metricsQueue?.on("error", (error: Error) => {
+    // Reported, not fatal. The metrics queue is observability; losing it must not cost capacity.
+    console.error(`[worker] metrics queue error: ${error.message}`);
+  });
+  const healthServer = startHealthServer(scaling, {
+    warmup: () => warmupRegistry.state(),
+    async queueDepth() {
+      if (!metricsQueue) return null;
+      try {
+        const counts = await metricsQueue.getJobCounts("waiting", "delayed");
+        return (counts.waiting ?? 0) + (counts.delayed ?? 0);
+      } catch {
+        // NULL, never 0 — see healthServer.ts. Reporting zero for an unreadable queue would scale
+        // the fleet in exactly when the backlog became invisible.
+        return null;
+      }
+    },
+    activeJobs: () => activeJobs,
+    consumerRunning: () => consumerRunning,
+  });
+
   const shutdown = async () => {
     console.log("Stopping CodeFlow worker.");
+    // Flipped BEFORE the close, so /health reports 503 for the whole drain rather than only after
+    // the last job finishes. That is what lets a load balancer or scaler stop counting this
+    // instance as capacity while it is still legitimately working through its in-flight jobs.
+    consumerRunning = false;
     await worker.close();
+    await metricsQueue?.close().catch(() => undefined);
+    healthServer?.close();
     await retrieval?.sql?.end().catch(() => undefined);
     await mongoose.disconnect();
     process.exit(0);

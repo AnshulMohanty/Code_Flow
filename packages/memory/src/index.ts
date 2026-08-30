@@ -39,3 +39,8 @@ export {
   diffSnapshots,
   snapshotOf,
 } from "./repoMemory.js";
+export {
+  createRedisRepoStore,
+  type RedisRepoStoreOptions,
+  type RepoRedisLike,
+} from "./redisRepoStore.js";
