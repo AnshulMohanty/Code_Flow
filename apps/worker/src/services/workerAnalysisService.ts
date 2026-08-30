@@ -30,6 +30,16 @@ export const env = {
    * real onboarding guide and wrong for a demo on a free tier.
    */
   fanOutSynthesis: (process.env.FANOUT_SYNTHESIS || "").toLowerCase() === "true",
+  /**
+   * V3-P5: run independent stages concurrently (readiness-based, see `computeLayers`).
+   *
+   * Opt-in because it touches the DETERMINISTIC SPINE. A test asserts the slices are byte-identical
+   * to the sequential run, but "proven identical" and "the default" are different bars, and the
+   * escape hatch costs one env var.
+   */
+  parallelStages: (process.env.PARALLEL_STAGES || "").toLowerCase() === "true",
+  /** V3-P5 model routing: the cheap/fast model. Falls back to the single configured model. */
+  fastModel: process.env.FAST_MODEL || "",
 };
 
 export interface WorkerJobPatch {

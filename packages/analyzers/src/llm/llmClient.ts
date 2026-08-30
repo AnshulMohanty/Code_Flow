@@ -24,6 +24,32 @@ export interface LlmCompletionRequest {
    * actually hit is reported back in `TokenUsage.cacheReadTokens`, never assumed.
    */
   cachePrefix?: string;
+  /**
+   * MODEL-ROUTING hint (V3-P5). States the KIND of work this call is doing, and for community work
+   * the P4 complexity score, so a router can pick a tier.
+   *
+   * It lives on the REQUEST contract rather than on a separate router interface for one reason: it
+   * lets `createRoutedLlmClient` BE an `LlmClient`, so routing can be added at the composition root
+   * without editing a single call site. A provider adapter ignores this field — the router strips it
+   * before delegating.
+   */
+  routing?: RoutingHint;
+}
+
+/** The kind of work a completion is doing. Named after the CALL SITE, not after a model capability,
+ *  so a new model tier never requires renaming the tasks. */
+export type ModelTask =
+  | "specialist"
+  | "supervisor"
+  | "synthesis"
+  | "agent-turn"
+  | "judge"
+  | "classification";
+
+export interface RoutingHint {
+  task: ModelTask;
+  /** 0..1 from V3-P4's `complexityOf`. Only meaningful for `specialist`. */
+  complexity?: number;
 }
 
 /**

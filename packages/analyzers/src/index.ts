@@ -17,6 +17,50 @@ export {
   type RepoSize,
 } from "./stages/ingest.js";
 export { deriveSummary, scoreHealth, type HealthVerdict } from "./pipeline/summary.js";
+// V3-P5 task 1 — latency engineering.
+export {
+  assertAcyclic,
+  computeLayers,
+  describeSchedule,
+  STAGE_READS,
+  type SchedulePlan,
+  type StageLayer,
+} from "./pipeline/schedule.js";
+export {
+  createWarmupRegistry,
+  warmupRegistry,
+  type WarmupOptions,
+  type WarmupRegistry,
+  type WarmupState,
+  type WarmupTask,
+  type WarmupTaskState,
+  type WarmupTaskStatus,
+} from "./pipeline/warmup.js";
+export {
+  createSpeculator,
+  type SpeculationStats,
+  type SpeculationTask,
+  type Speculator,
+  type SpeculatorOptions,
+} from "./pipeline/speculation.js";
+export {
+  createRoutedLlmClient,
+  maybeRouted,
+  routeTier,
+  type ModelRouterOptions,
+  type ModelTask,
+  type ModelTier,
+  type RoutedCompletionRequest,
+  type RoutingDecision,
+  type RoutingHint,
+} from "./llm/modelRouter.js";
+export {
+  renderLatencyReport,
+  summarizeTiers,
+  timed,
+  type LatencyReport,
+  type TierSample,
+} from "./bench/latencyTiers.js";
 export { countIssues, deriveIssues, type DeriveIssuesInput } from "./pipeline/issues.js";
 export {
   PipelineReasonError,

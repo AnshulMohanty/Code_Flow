@@ -3,7 +3,15 @@ import dotenv from "dotenv";
 import mongoose from "mongoose";
 import { Worker } from "bullmq";
 import type { AnalysisJobPayload } from "@codeflow/shared-types";
-import { createEmbeddingClientFromEnv, createLlmClientFromEnv, createRedisBudgetHandle } from "@codeflow/analyzers";
+import {
+  createEmbeddingClientFromEnv,
+  createGeminiClient,
+  createLlmClientFromEnv,
+  createRedisBudgetHandle,
+  maybeRouted,
+  warmupRegistry,
+} from "@codeflow/analyzers";
+import { initTreeSitter } from "@codeflow/parsers";
 import { createRetrievalStores, type RetrievalStores } from "@codeflow/retrieval";
 import { Redis } from "ioredis";
 import { ANALYSIS_QUEUE_NAME, createRedisConnectionOptions, env } from "./services/workerAnalysisService.js";
@@ -74,6 +82,28 @@ async function main() {
     );
   }
 
+  // --- V3-P5 MODEL ROUTING ---------------------------------------------------
+  // A cheap tier for the many small specialist calls, the configured model for the calls whose
+  // output a user reads. `maybeRouted` returns the single client UNWRAPPED when only one tier
+  // exists, so a deployment that sets no FAST_MODEL is byte-identical to before — including its
+  // cache keys, which a router would otherwise re-scope and invalidate for nothing.
+  const routedSynthesisClient = (() => {
+    if (!synthesisClient || !env.fastModel) return synthesisClient;
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      console.warn("[worker] FAST_MODEL is set but GEMINI_API_KEY is not; model routing disabled.");
+      return synthesisClient;
+    }
+    const fast = createGeminiClient({ apiKey: geminiKey, model: env.fastModel });
+    const routed = maybeRouted(fast, synthesisClient, {
+      onDecision: (decision) => console.log(`[worker] routed ${decision.task} → ${decision.tier} (${decision.model})`),
+    });
+    if (routed !== synthesisClient) {
+      console.log(`Model routing enabled — fast: ${fast.model}, frontier: ${synthesisClient.model}.`);
+    }
+    return routed;
+  })();
+
   const embeddingClient = createEmbeddingClientFromEnv(process.env);
   console.log(
     embeddingClient
@@ -100,6 +130,51 @@ async function main() {
     }
   }
 
+  // --- V3-P5 COLD-START WARM-UP ---------------------------------------------
+  // Registered here, at the composition root, because these are PROCESS-lifetime resources: the
+  // tree-sitter WASM grammars are the real cost (a one-time load that whichever job arrives first
+  // would otherwise pay), and the retrieval schema is a round trip nobody should pay inside a job.
+  // Both are already idempotent, so warming is purely a matter of paying the cost before traffic.
+  warmupRegistry.register({
+    name: "tree-sitter-grammars",
+    async run() {
+      await initTreeSitter();
+    },
+  });
+  if (embeddingClient) {
+    warmupRegistry.register({
+      name: "embedding-provider",
+      // Not required for readiness: an unavailable embedding provider degrades the run to
+      // deterministic-only, which still serves. Blocking readiness on it would take the whole
+      // worker out over an optional stage.
+      required: false,
+      async run() {
+        // Construction only — deliberately NOT a probe request. A warm-up that spent money would
+        // be charging the owner for a health check.
+        void embeddingClient.model;
+      },
+    });
+  }
+  if (retrieval) {
+    warmupRegistry.register({
+      name: "retrieval-stores",
+      required: false,
+      async run() {
+        // `createRetrievalStores` already ensured the schema at boot; this records that it happened
+        // so `/health` can report it rather than inferring it.
+        void retrieval.vectorStore.id;
+      },
+    });
+  }
+  const warmState = await warmupRegistry.warmUp();
+  console.log(
+    `Warm-up ${warmState.warmedUp ? "complete" : "INCOMPLETE"} in ${warmState.durationMs ?? 0}ms — ` +
+      warmState.tasks.map((task) => `${task.name}=${task.status}(${task.durationMs ?? 0}ms)`).join(" "),
+  );
+  if (env.parallelStages) {
+    console.log("Stage schedule: PARALLEL by dependency readiness (V3-P5). Slices are byte-identical to sequential.");
+  }
+
   const worker = new Worker<AnalysisJobPayload>(
     ANALYSIS_QUEUE_NAME,
     async (job) => {
@@ -112,8 +187,9 @@ async function main() {
         readDir: readRepoDir,
         measureRepoSize,
         cleanupRepo: cleanupRepoPath,
-        synthesisClient,
+        ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
         fanOutSynthesis: env.fanOutSynthesis,
+        parallelStages: env.parallelStages,
         embeddingClient,
         ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
         cache,

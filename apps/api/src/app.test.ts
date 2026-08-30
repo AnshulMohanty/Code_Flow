@@ -54,6 +54,20 @@ describe("codeflow api", () => {
     return { id: record.id, result: record.result };
   }
 
+  it("GET /health reports readiness SEPARATELY from liveness (V3-P5)", async () => {
+    // A container that takes traffic before its caches are warm serves its first users a latency
+    // that looks like a bug. `status` stays "ok" while cold — the process is alive and CAN serve, so
+    // reporting an error would make a liveness probe kill a healthy container mid-warm-up.
+    const response = await request(app).get("/health").expect(200);
+    expect(response.body.status).toBe("ok");
+    expect(response.body).toHaveProperty("warmedUp");
+    expect(typeof response.body.warmedUp).toBe("boolean");
+    // Nothing registered in this process ⇒ NOT warm. "Nothing to do" and "ready" are different
+    // claims, and reporting an unconfigured process as ready is how a misconfiguration ships.
+    expect(response.body.warmedUp).toBe(false);
+    expect(Array.isArray(response.body.warmup.tasks)).toBe(true);
+  });
+
   it("GET /health returns ok", async () => {
     const response = await request(app).get("/health").expect(200);
 

@@ -19,6 +19,7 @@ import type {
   StageStatus,
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
+import { computeLayers, describeSchedule, STAGE_READS } from "./schedule.js";
 import { deriveIssues } from "./issues.js";
 import { deriveSummary } from "./summary.js";
 
@@ -55,6 +56,24 @@ export interface RunPipelineOptions {
   signal?: AbortSignal;
   /** Injectable clock (ms) for deterministic timing in tests. */
   now?: () => number;
+  /**
+   * How stages are executed (V3-P5 task 1).
+   *
+   * `"sequential"` (default) runs them in declared order, one at a time — the behaviour every
+   * earlier phase was built and tested against.
+   *
+   * `"layered"` computes the stage DAG (see `./schedule.js`) and runs the members of each layer
+   * CONCURRENTLY. In this pipeline exactly one layer is wider than 1 — `synthesize` ∥ `rag` — and
+   * those are the two provider-bound stages, so it is the layer worth having.
+   *
+   * Opt-in rather than the default, deliberately: this is the deterministic spine, and the
+   * invariant is that the same input yields byte-identical slices. Layered execution PRESERVES
+   * that — each layer member gets the same FROZEN `ctx.prior`, slices are assigned in declared
+   * order, records and events stay in declared order — and a test asserts the two modes produce
+   * identical results. But "proven identical" and "the default" are different bars, and the escape
+   * hatch costs one line.
+   */
+  schedule?: "sequential" | "layered";
 }
 
 export interface PipelineRunResult {
@@ -64,6 +83,18 @@ export interface PipelineRunResult {
 }
 
 const SLICE_VERSION = 1;
+
+/** What a stage returns, as far as the orchestrator's bookkeeping cares. */
+type StageResultLike = Awaited<ReturnType<PipelineStage["run"]>>;
+
+/**
+ * A launched-but-not-yet-consumed stage. The error is CAPTURED rather than left to reject, so a
+ * layer's failure cannot become an unhandled rejection while a sibling is still running — it waits
+ * to be rethrown on the consume path, where the existing error contract handles it.
+ */
+type LaunchedStage =
+  | { ok: true; value: StageResultLike; startedAt: number; durationMs: number }
+  | { ok: false; error: unknown; startedAt: number; durationMs: number };
 
 /**
  * Run stages in declared order. Assembles the AnalysisResult by per-key slice
@@ -97,6 +128,8 @@ export async function runPipeline(
     emit,
   };
 
+  /** Real elapsed span per layered stage, captured at launch (see the consume path). */
+  const layerDurations = new Map<PipelineStageId, number>();
   let deterministicFailed = false;
   let aiFailed = false;
   let aborted = false;
@@ -137,6 +170,73 @@ export async function runPipeline(
     // check can still try by the RESOLVED sha (covers a branch/unknown-sha first analysis).
   }
 
+  // --- Parallel execution by DEPENDENCY READINESS (V3-P5 task 1) --------------
+  //
+  // A first implementation used pure LAYER BARRIERS and measurably under-parallelised this DAG. The
+  // measured layer shape is [1,1,1,1,1,2,1]: `rag` reads only {graph, structure, inventory}, so it
+  // becomes ready alongside `analyze` — and a layer barrier then blocks `synthesize` (which needs
+  // `metrics`) behind `rag` finishing. That serialises the slow embedding stage against the slow
+  // synthesis stage, which is exactly the pair worth overlapping.
+  //
+  // So a stage is launched as soon as ITS OWN declared reads are satisfied, not when its layer is.
+  // On this pipeline that means `rag` starts right after `connect`, `analyze` runs beside it, and
+  // `synthesize` launches the moment `metrics` lands — while `rag` is still in flight.
+  //
+  // DETERMINISM, which is the invariant that had to survive: each stage is launched with a snapshot
+  // containing every slice it declared, slices are per-key and written by exactly one stage, and
+  // nothing mutates a slice after assignment. So a stage sees identical inputs regardless of WHEN it
+  // launched, and results are assigned in declared order. The result is byte-identical to the
+  // sequential run — asserted by a test.
+  const layered = options.schedule === "layered";
+  if (layered) logger.info(`Pipeline schedule: ${describeSchedule(computeLayers(stages))}`);
+  const producedBy = new Map<AnalysisSliceKey, PipelineStageId>();
+  for (const stage of stages) for (const key of stage.owns) producedBy.set(key, stage.id);
+  const ingestPresent = stages.some((stage) => stage.id === "ingest");
+  /** Stage ids whose results have been folded into `slices`. */
+  const settled = new Set<PipelineStageId>();
+  /** Launched-but-not-yet-consumed outcomes, keyed by stage id. */
+  const launched = new Map<PipelineStageId, Promise<LaunchedStage>>();
+
+  /** True when every declared read of `stage` is already assigned (and Ingest has run). */
+  const readyToLaunch = (stage: PipelineStage): boolean => {
+    if (ingestPresent && stage.id !== "ingest" && !settled.has("ingest")) return false;
+    for (const key of STAGE_READS[stage.id] ?? []) {
+      const producer = producedBy.get(key);
+      // A slice nobody in this run produces is not a dependency — the pipeline legitimately runs
+      // without the AI stages, and a phantom dependency would deadlock those runs.
+      if (!producer || producer === stage.id) continue;
+      if (!settled.has(producer)) return false;
+    }
+    return true;
+  };
+
+  /**
+   * Launch every not-yet-launched stage whose reads are satisfied.
+   *
+   * Called AFTER the post-Ingest cache decision rather than immediately after slice assignment,
+   * because that decision can seed slices and change `coveredStageIds` — launching before it could
+   * start a stage the cache was about to make unnecessary.
+   */
+  const launchReady = () => {
+    if (!layered) return;
+    for (const candidate of stages) {
+      if (launched.has(candidate.id) || settled.has(candidate.id)) continue;
+      if (coveredStageIds.has(candidate.id)) continue;
+      if (aborted || signal?.aborted || deterministicFailed) continue;
+      if (!readyToLaunch(candidate)) continue;
+      const snapshot = { ...slices };
+      const candidateCtx: PipelineContext = { ...ctx, prior: snapshot };
+      const at = now();
+      launched.set(
+        candidate.id,
+        candidate
+          .run(input, candidateCtx)
+          .then((value) => ({ ok: true as const, value, startedAt: at, durationMs: now() - at }))
+          .catch((error: unknown) => ({ ok: false as const, error, startedAt: at, durationMs: now() - at })),
+      );
+    }
+  };
+
   for (let i = 0; i < stages.length; i++) {
     const stage = stages[i];
     const stageIndex = i + 1;
@@ -146,6 +246,9 @@ export async function runPipeline(
     // so the re-stamped producedBy stays honest, and emit a "reused" event. For Ingest this
     // is exactly what avoids the clone on an AI-only retry.
     if (coveredStageIds.has(stage.id)) {
+      // A cache-covered stage IS settled: its slice was seeded, so downstream reads are satisfied.
+      // Without this an AI-only retry would never launch anything in layered mode.
+      settled.add(stage.id);
       records.push({ stage: stage.id, kind: stage.kind, status: "completed" });
       emitEvent(emit, {
         input,
@@ -199,10 +302,31 @@ export async function runPipeline(
 
     // Expose accumulated slices to this stage as a read-only snapshot.
     ctx.prior = { ...slices };
-    const startedAt = now();
+    let startedAt = now();
 
     try {
-      const stageResult = await stage.run(input, ctx);
+      // Launch anything now runnable (including this stage, if it has not started yet). Each
+      // launched stage gets its OWN ctx with its own frozen `prior` — never the shared mutable one,
+      // or reaching the next stage would reassign `ctx.prior` while an earlier one was mid-await.
+      launchReady();
+
+      const pending = launched.get(stage.id);
+      let stageResult: StageResultLike;
+      if (pending) {
+        launched.delete(stage.id);
+        const outcome = await pending;
+        // Use the LAUNCH time and the real elapsed span, not the moment we got round to consuming
+        // this member — otherwise the second stage of a layer reports a duration near zero and the
+        // latency numbers become fiction.
+        startedAt = outcome.startedAt;
+        layerDurations.set(stage.id, outcome.durationMs);
+        // Rethrown here so the existing catch below handles a layered failure identically to a
+        // sequential one. One error contract, not two.
+        if (!outcome.ok) throw outcome.error;
+        stageResult = outcome.value;
+      } else {
+        stageResult = await stage.run(input, ctx);
+      }
 
       // Per-key slice assignment — NOT a deep merge.
       for (const key of stage.owns) {
@@ -211,8 +335,9 @@ export async function runPipeline(
           assignSlice(slices, key, value);
         }
       }
+      settled.add(stage.id);
 
-      const durationMs = now() - startedAt;
+      const durationMs = layerDurations.get(stage.id) ?? now() - startedAt;
       records.push({ stage: stage.id, kind: stage.kind, status: "completed", startedAt: iso(startedAt), durationMs });
       emitEvent(emit, {
         input,
@@ -257,8 +382,12 @@ export async function runPipeline(
           });
         }
       }
+
+      // Now that this stage's slice is assigned AND the cache decision has settled, anything whose
+      // reads are satisfied can start — while this loop moves on to the next declared stage.
+      launchReady();
     } catch (error) {
-      const durationMs = now() - startedAt;
+      const durationMs = layerDurations.get(stage.id) ?? now() - startedAt;
       const message = error instanceof Error ? error.message : "Unknown stage error.";
       // Capture a typed guardrail reason (repo-too-large / budget-exhausted) if the stage
       // threw one, so the run summary can carry a distinct, machine-readable cause.

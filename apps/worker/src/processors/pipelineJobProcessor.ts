@@ -65,6 +65,11 @@ export interface PipelineJobDependencies {
    * exist is not knowable when the stage list is assembled.
    */
   fanOutSynthesis?: boolean;
+  /**
+   * V3-P5: run independent stages concurrently (readiness-based). Opt-in — it touches the
+   * deterministic spine, and the slices are proven byte-identical either way.
+   */
+  parallelStages?: boolean;
   /** Embedding client for the RAG (AI) stage. When absent (no VOYAGE_API_KEY), RAG is NOT
    *  registered and `configured.ai` simply omits it (the P10 coverage partition stays
    *  correct — an ANTHROPIC-only setup runs Synthesize but not RAG). */
@@ -255,6 +260,7 @@ export async function runAnalysisJob(
       cache: deps.cache,
       budget: deps.budget,
       now,
+      ...(deps.parallelStages ? { schedule: "layered" as const } : {}),
     });
 
     // An unconfigured AI stage is recorded on the result itself (warnings, persisted with
