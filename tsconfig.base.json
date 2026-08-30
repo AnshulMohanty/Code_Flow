@@ -15,7 +15,6 @@
     "paths": {
       "@codeflow/analyzers": ["packages/analyzers/src/index.ts"],
       "@codeflow/config": ["packages/config/src/index.ts"],
-      "@codeflow/exports": ["packages/exports/src/index.ts"],
       "@codeflow/graph": ["packages/graph/src/index.ts"],
       "@codeflow/parsers": ["packages/parsers/src/index.ts"],
       "@codeflow/shared-types": ["packages/shared-types/src/index.ts"]
