@@ -1576,3 +1576,371 @@ the `.button-row` note, both recorded in `CLEANUP_MANIFEST.md`.
 
 Next session: **V3 Phase 2 — retrieval** (real vector store + AST-aware chunks + hybrid/rerank),
 still awaiting the vector-store / object-storage infra brief.
+
+
+## 2026-08-31 — V3-P2: retrieval (real vector store + AST-enriched chunks + hybrid/rerank/MMR + the synthetic flywheel) (branch `v3/p2-retrieval`)
+
+Four commits, one per task, full gate after each. The phase moves retrieval out of the analysis
+document and turns it into a real pipeline; the biggest risk named in the brief — that this
+touches persistence, the RAG stage, the Q&A path, eval and the homogeneity/cache logic at once —
+was real, but the blast radius measured smaller than feared: only **6 files** referenced
+`chunk.text`/`chunk.embedding`, and 12 non-`dist` files referenced `RagChunk`/`ai.rag`.
+
+**AUDIT FIRST (verified against the live tree, not `CODEBASE_SNAPSHOT.md`).** The RAG stage was
+534 lines, embedding inline and storing `text` + `embedding` per chunk **inside the Mongo
+document** — the 16MB-BSON problem in ledger #8, exactly as described. Retrieval was a
+brute-force cosine scan (`packages/analyzers/src/rag/retrieve.ts`, 35 lines): no BM25, no
+fusion, no rerank, no MMR. `assertEmbeddingSpace` was already the one shared homogeneity guard
+for eval + production. Two live-tree findings the brief did not predict: `InventorySymbol` has
+`line`/`endLine` but **drops `signature`**, which `ParsedSymbol` has carried since V3-P1 — task 2
+needed it; and `packages/exports/dist` + `apps/card-action/{dist,node_modules}` were stale
+untracked build output left by V3-CLEANUP's `git rm` (removed).
+
+### Task 1 — `@codeflow/retrieval`: the index leaves the document (`cce9bf1`)
+
+A 1024-dim float array is roughly 8KB of JSON per chunk, so a mid-sized repo exceeds the 16MB
+BSON limit, and every read of an analysis (the dashboard, the job poll) dragged the whole index
+across the wire. The new package sits **BELOW `@codeflow/analyzers`** and depends on nothing but
+`shared-types` + `config`.
+
+- **Dependency direction was the first real design decision.** The index build (a pipeline stage
+  in analyzers) and the query path must talk to the same interface, so putting the interface in
+  analyzers would have made `retrieval → analyzers → retrieval` a cycle. `cosineSimilarity`,
+  `retrieve` and `assertEmbeddingSpace` therefore **moved down** into retrieval — they are
+  retrieval concerns — and `@codeflow/analyzers` re-exports all three, so there is still exactly
+  ONE definition of each and every existing import path resolves unchanged. `retrieve` became
+  generic over `{ id, embedding }` because a persisted `RagChunk` no longer carries a vector.
+- **Interfaces:** `VectorStore` (`upsert`/`search`/`count`/`drop`, namespaced), `ChunkTextStore`
+  (`put`/`get`/`drop`), `Reranker`, `SqlClientLike`.
+- **In-memory vs prod split.** The in-memory pair is the HERMETIC DEFAULT — not a stub: it is
+  what the whole suite and the eval run against, and it is an **exact** cosine scan, so a ranking
+  difference against pgvector is attributable to ANN recall rather than to different maths. The
+  pgvector + Postgres pair is production, reached through an injected `SqlClientLike` (the V3-P0
+  `BudgetRedisLike` pattern), so the suite asserts the real emitted SQL against a recording fake
+  with no container, no port and no cleanup.
+- **The dimension is in the pgvector TABLE NAME** (`codeflow_vectors_1024`). `vector(n)` is
+  fixed-width, so one table cannot hold two embedding spaces; giving each dimension its own table
+  makes **Postgres itself** enforce homogeneity, which is stronger than an application check.
+  HNSW with `vector_cosine_ops` (an L2 index would rank differently from every other code path);
+  above pgvector's 2000-dim HNSW ceiling the index is skipped and an exact scan is left, rather
+  than failing.
+- **`createRetrievalStores` is the ONE factory both worker and API call** — same reasoning V3-P0
+  used to unify the budget: two processes resolving stores independently can disagree, and here
+  disagreeing means the worker writes an index the API cannot read. Degradation is ANNOUNCED
+  (`mode`, `degradation`, logged at startup by both processes). "Not configured" is a supported
+  single-container mode and is deliberately NOT reported as a degradation; "configured but
+  unreachable" is.
+- **`Rag` is now lightweight metadata + a `store` reference.** An index with no `store` is
+  PRE-P2 — unreadable, not empty — so the query path throws with a rebuild instruction instead of
+  answering from zero chunks, which would have looked exactly like an honest refusal.
+- **Write order is text-first, then vectors**, and that is not arbitrary: the vector store is what
+  a search reads, so a crash between the two writes leaves text nobody can find (harmless,
+  overwritten on retry) rather than searchable hits whose text is missing.
+- **Eval** now retrieves through the production `vectorRetrieve`; `scoreQuestion` became a pure
+  scorer over the ranking production actually returned (before, it embedded the retrieval
+  primitive itself, which would have kept the eval measuring a brute-force scan while production
+  served something else). An index **sidecar** (`results/<name>.index.json`, runtime-validated)
+  keeps the out-of-band scored run infra-free.
+- Added `pgvector/pgvector:pg16` to the DEV `docker-compose.yml` (dev-infra only, healthchecked)
+  and documented `POSTGRES_URL` in `.env.example` for BOTH processes.
+
+**Acceptance:** no embeddings inline in Mongo — asserted structurally, not trusted: a test walks
+every persisted chunk for `text`/`embedding` and additionally asserts `JSON.stringify(rag)`
+contains no `"embedding"` key, because a round trip through JSON is what persistence actually
+does. Hermetic tests pass via the in-memory store. The homogeneity guard holds at three levels
+now: client-vs-index, client-vs-store (a misconfigured deployment, a different mistake), and
+actual vector length (`assertVectorDimension` — cosine does not throw on a wrong-length vector,
+it truncates to the shorter length and returns a plausible number).
+
+### Task 2 — AST-enriched chunk embeddings (`cf1f118`)
+
+Three failures a user hits immediately: a split symbol's later sub-chunks are body fragments with
+no name in them at all; a method body never mentions its class; nothing says which file or
+language it came from, though paths are dense with intent.
+
+`embedTextFor` prepends path + path-as-words, language, scope chain, symbol, signature and
+docstring to the text that gets **EMBEDDED** — and never to the text that gets **STORED**.
+`RagChunk.text` stays byte-exact for its line range, because that is what a citation resolves to
+and what enters an answer prompt. That separation is why this is a function over the chunk rather
+than a mutation of it, and it is asserted (`enrichedText.endsWith("\n\n" + text)`).
+
+`deriveEnrichment` runs as a **POST-PASS over the planned ranges**, deliberately: V3-P1's
+interval-cover and gap-sweep code is untouched, so chunk ids (`fileId#start-end`) cannot move
+even by accident — the task's stated acceptance condition, held by construction and pinned by a
+test. It is passed EVERY symbol in the file, not just the top-level ones the cover selected,
+because the overlaps are what make a scope chain possible. `InventorySymbol` gained `signature`
+(the parser has produced it since V3-P1; Inventory was dropping it), and since a signature is
+where a typed language states its types, that is how "enriched with types" is satisfied rather
+than by inventing a field nothing could fill.
+
+Two deliberate details worth recording. A **later** sub-chunk gets scope and signature but NOT
+the docstring: repeating one docstring across five sub-chunks makes them near-identical to the
+vector, which is the redundancy MMR then has to undo. And because the embedding cache is
+content-addressed on the embedded text, enabling this **invalidates every document-side cache
+entry exactly once** — correct rather than unfortunate, since the old vectors describe different
+text. `PLAN_CACHE_VERSION` bumped v1 → v2 for the same reason (a v1 cached plan would produce
+un-enriched chunks on the no-disk retry path: silently worse retrieval, not a crash).
+
+**MEASURED, hermetically** (`packages/eval/src/enrichmentAb.ts`): the same chunk plan, the same
+ids, indexed twice — one arm embedding the enriched text, one the raw text — scored through the
+production `vectorRetrieve`.
+
+| metric | raw | enriched | delta |
+|---|---:|---:|---:|
+| recall@3 | 0.500 | **1.000** | **+0.500** |
+| MRR | 0.333 | **0.667** | **+0.333** |
+| questions won / lost | — | — | **3 / 0** |
+
+**What that does and does not establish, stated in the module itself:** the embedder is a
+deterministic bag of words (feature hashing over the SHARED code tokenizer), so it measures the
+MECHANISM and the direction, not the magnitude a real model would show. The golden-set number
+needs a key and is deferred. One question (`ab4`) is reported as a **RANKING** win rather than a
+recall win — the raw arm does find it, at rank 3 — because claiming a recall win there would be
+claiming something that did not happen. `ab5` is a control answerable from raw bytes alone and
+must not regress; nothing was lost.
+
+**A first draft of this A/B was wrong and was fixed rather than accepted.** Three of its
+assertions failed because the corpus did not create the cases the comments claimed: the
+"split-symbol" chunk range started ON the method's signature line, so its raw text contained the
+word the query used. Corrected the corpus (ranges 6-9 / 10-12 / 14-17, so 10-12 is the pure
+body), and one question was reworded after measurement showed the toy embedder's "session"
+collision with `sessionStore.ts`'s path words was what the question actually measured — the
+limitation is documented at the question.
+
+### Task 3 — hybrid + rerank + MMR (`1891823`)
+
+    vector arm  --+
+                  +-- RRF fusion -- text fetch -- reranker -- MMR -- top-k
+    lexical arm --+
+
+- **The lexical arm earns its place, asserted rather than argued.** With the vector arm narrowed
+  to 2 candidates, hybrid still returns the chunk containing `parseJwtHeader` (whose vector is
+  orthogonal to the query) — and in the wide-arm regime that chunk goes from **worst cosine of
+  five to rank 1**. That works only because the lexical arm indexes the NAMESPACE rather than
+  re-ranking arm 1's output.
+- **RRF fuses RANKS, not scores.** A cosine of 0.83 and a BM25 of 11.4 are not comparable
+  quantities, and normalising them invents a scale that shifts with every result set. The cost is
+  stated where it matters: the fused score is ORDINAL.
+- **THE REFUSAL FLOOR IS UNCHANGED**, reading the VECTOR arm's real cosine, before any rerank.
+  Comparing an RRF score (~1/61) to a 0.2 floor would refuse everything; comparing a reranker
+  score would compare a model-specific scale to a cosine. A test asserts every returned chunk's
+  fused score is BELOW the floor that admitted it. A refusal still costs exactly one vector
+  search — no lexical arm, no rerank, no LLM — and now carries the trace, which is the case you
+  most want it for.
+- **BM25** is deterministic and unit-tested directly: code-aware tokenizer (splits punctuation
+  AND camelCase, keeps the whole identifier too, no stemming, no stopwords — `if`/`for`/`class`
+  are keywords), k1=1.2/b=0.75, and **IDF floored at zero** because raw probabilistic IDF goes
+  negative above 50% document frequency, which would make a document containing a common word
+  rank BELOW one that does not contain it at all.
+- **MMR** uses `fileId` as the redundancy key rather than pairwise cosine: the vectors are in the
+  store, and a second round trip for ~40 candidates buys a correction fileId already makes in the
+  right direction. Documented as the coarser mode it is; the exact vector mode exists and is
+  tested.
+- **A reranker failure degrades to the fused order and RECORDS it** (`trace.rerankerError`). The
+  reranker itself rejects rather than falling back, precisely so that decision lives in the
+  caller where the trace can carry it — otherwise "broken" is indistinguishable from "had no
+  opinion". A candidate the reranker omitted is ranked last, never dropped.
+
+**RERANKER DEPENDENCY PROBE** — same discipline V3-P1 used before adopting `web-tree-sitter`.
+Every candidate was installed or inspected, and every one REJECTED:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| `onnxruntime-node@1.24.3` | REJECT | Installed: **211 MB**, prebuilt NAPI `.node` + `.so`/`.dll`/`.dylib` for six platforms, AND `postinstall: node ./script/install` fetching more binaries from a Nuget feed (`adm-zip` + `global-agent` deps). No node-gyp, so it clears that bar — but not a trade worth making in an image that ships nothing native at all. |
+| `@huggingface/transformers@4.2.0` | REJECT | Depends on the above, plus `sharp` (native image lib, irrelevant to text reranking). |
+| `fastembed@2.1.0` | REJECT | Depends on `@anush008/tokenizers`, a native Rust NAPI binding. |
+| `onnxruntime-web@1.29.0` | Viable runtime, NOT adoptable | No install script, no native binaries — the WASM-clean option and exactly the `web-tree-sitter` shape. But a cross-encoder needs WordPiece/BPE and the JS tokenizers are themselves NAPI. That is a real task, not glue → named for P5. |
+
+**So NO new dependency.** What ships is `createLexicalOverlapReranker`: keyless, in-process,
+zero-dependency, deterministic, and honest about it — `kind: "deterministic"` lives in the data,
+so no report can mistake it for a cross-encoder. It earns the default slot by rewarding a
+candidate that literally contains the typed identifier (the same asymmetry that justifies the
+BM25 arm), with symmetric union normalisation so a huge chunk cannot win on vocabulary size.
+`createCrossEncoderReranker` takes an injected `CrossEncoderSession`, so the real model is a
+drop-in and the adapter is ALREADY tested — batching, deterministic truncation (silent tokenizer
+truncation means the model scored a prefix while the caller believed it scored the chunk), and a
+**THROW** on a misaligned score array rather than silently attaching scores to the wrong
+candidates.
+
+### Task 4 — the synthetic-data flywheel (`b83be77`)
+
+The golden set is 18 authored questions across two repositories because every one cost a human
+reading code. But for a whole class of questions the answer is ALREADY A FACT in the result:
+"which files import `src/db.ts`?" is a set of edges, not an opinion.
+
+- **THE RULE: labels come from the ORACLE, never from a model.** `truthFor` derives the answer
+  with the same traversals the product uses. A model-labelled synthetic set would measure how
+  well retrieval agrees with a model's guesses — not what an eval is for, and worse than no eval
+  because it looks like one. A test asserts every generated label EQUALS the oracle's own truth,
+  and another runs **the oracle AS the agent over its own generated set**: 1.0 on every task, no
+  model, no network. If that ever fails, generator and verifier have drifted and every label is
+  suspect. A companion test confirms a wrong answer scores 0 — a perfect score from a grader that
+  cannot fail is not a measurement.
+- **Deterministic:** no RNG. Targets ordered by degree descending then fileId — degree-first
+  deliberately, because a file nothing touches yields an empty answer and a set of those measures
+  nothing.
+- **Hard negatives, one strategy per kind, each a confusion that actually happens:** `imports-of`
+  → files the target IMPORTS (the reverse direction); `blast-radius` → the target's transitive
+  DEPENDENCIES (upstream, not downstream); `who-calls` → same Louvain community with no call edge;
+  `cycle-through` → same community, not in a cycle; `entry-points` → the most-connected files that
+  are NOT entry points. Random negatives teach nothing — any retriever separates `src/db.ts` from
+  `README.md`. Every mined set is filtered against the truth set and the target, so a "negative"
+  can never secretly be correct.
+- **Negative controls are GENERATED, not guessed** — a question whose correct answer is a
+  refusal, known with certainty. **Bounded** per kind: in most repositories most files are
+  imported by nobody, so an unbounded generator would emit an almost entirely negative set whose
+  recall number means nothing.
+- **Generated sets are NOT written into `packages/eval/datasets/`.** That directory is the
+  AUTHORED golden set and its value is that a human stands behind every question; mixing
+  thousands of machine-generated ones in would destroy that guarantee and let the mechanical half
+  dominate the score while the judgement half quietly stopped mattering.
+  `buildSyntheticDataset` maps onto the eval's own `RagEvalQuestion` shape so ONE harness scores
+  both, and it validates its own output with the same `assertDatasetShape` that guards the
+  authored set. An unpinned result yields an empty SHA the loader then REJECTS — no placeholder
+  papering over an unpinnable dataset.
+
+**Verified end to end** via the new `pnpm --filter @codeflow/eval run synthetic <result.json>`:
+from a **4-file fixture graph** it generated **12 questions with exact labels, 4 negative
+controls and 10 hard negatives** across all five oracle kinds, and passed its own shape check.
+For scale: the authored golden set is 18 questions from two real repositories.
+
+Two fixtures were corrected, not worked around: the **eval** fixture claimed `producedBy: [...
+"connect" ...]` but had **no `graph` slice**, which became load-bearing here — with no graph the
+generator produced nothing and every assertion about generated questions passed trivially. A
+guard test now pins that premise. The **arena** fixture gained its Louvain assignments for the
+same reason (community-based hard negatives would otherwise only exercise the empty path).
+
+### Interfaces + the in-memory / prod split (one table)
+
+| interface | hermetic default | production | notes |
+|---|---|---|---|
+| `VectorStore` | `createMemoryVectorStore` (exact cosine scan) | `createPgvectorStore` (HNSW cosine, dimension in the table name) | integration-only; SQL asserted against a recording fake |
+| `ChunkTextStore` | `createMemoryChunkTextStore` | `createPostgresChunkTextStore` | Postgres, not object storage: the access pattern is ~40 primary-key reads on the Q&A hot path, not 40 HTTP GETs |
+| `SqlClientLike` | recording fake | `pg.Pool` via `createPostgresSqlClient` (lazy dynamic import, `'error'` listener attached) | `pg` is pure JS — no node-gyp — so it installs in `node:20-slim` |
+| `Reranker` | `createLexicalOverlapReranker` / `createIdentityReranker` | `createCrossEncoderReranker` + a `CrossEncoderSession` | no session exists yet; see the probe above |
+| `CrossEncoderSession` | fake in tests | — | the entire model (runtime, tokenizer, weights) behind one method |
+
+`createRetrievalStores` also gained a documented **`createClient` test seam**, because the
+degradation paths are the whole point of that factory and exercising them against the real driver
+attempted a real TCP connection — 3.6 s per test, and a network call in a suite that must have
+none. Caught during the run and fixed; a dedicated test now asserts the seam is used at all.
+
+### Determinism
+
+Every new stage is deterministic and total: `VectorStore.search`, BM25, RRF, MMR and both
+rerankers all break ties on id, because RRF fuses RANKS and a wobbling tie-break upstream would
+leak straight into the fused order and therefore into the eval's recall@k. Byte-identical
+run-twice tests cover `hybridSearch`, the enrichment A/B, the generator and the synthetic dataset
+builder.
+
+### Docker (verified INSIDE the pruned image, as V3-P1 did for the WASM grammars)
+
+All three images rebuilt. `pnpm deploy --prod` prunes aggressively, so "it compiles" is not the same
+as "the dependency is there" — the check that matters is running the code in the image:
+
+```
+RETRIEVAL LOADED: true
+memory mode: memory memory-vector-store
+pg driver resolvable in the pruned image: true
+pgvector store id: pgvector:codeflow_vectors_1024
+enrichment: path: src auth token service
+```
+
+Cost of the one new dependency: worker **485 MB → 489 MB (+4 MB)**, api **361 → 365 MB (+4 MB)**,
+web unchanged at 74.2 MB. `pg` is pure JavaScript (no `node-gyp`, no prebuilt binaries), which is the
+whole reason it was acceptable where `onnxruntime-node` at 211 MB was not.
+
+### Verification (per-package, after the phase)
+
+`pnpm -r typecheck`, `pnpm -r lint`, `pnpm test` (serial), `pnpm -r build`,
+`node --test tests/*.mjs`, the keyless `parity` + `check` CI steps and `docker compose config`
+all pass — **742 unit tests**, up from 526 (**+216**):
+
+| package | before | after | delta |
+|---|---:|---:|---:|
+| **retrieval (new)** | — | **155** | +155 |
+| analyzers | 231 | **234** | +3 |
+| eval | 76 | **109** | +33 |
+| arena | 43 | **68** | +25 |
+| web | 60 | 60 | — |
+| api | 39 | 39 | — |
+| graph | 33 | 33 | — |
+| parsers | 28 | 28 | — |
+| worker | 13 | 13 | — |
+| shared-types | 3 | 3 | — |
+| **total** | **526** | **742** | **+216** |
+
+Legacy `node --test`: **25/25**. `tsc --noUnusedLocals --noUnusedParameters` reports **zero**
+unused locals/params across every package (one appeared during the phase — `scoreQuestion`'s `k`
+became unused when retrieval moved out; it is now ENFORCED by slicing, because a metric called
+recall@k must not depend on how many results the caller happened to pass).
+
+### Judgment calls flagged
+
+1. **No cross-encoder dependency**, on the probe evidence above. The deterministic reranker is a
+   real improvement, not a placeholder, but it is not a cross-encoder and the code says so.
+2. **The enrichment A/B measures the mechanism, not the magnitude.** Written at the top of the
+   module and in the commit message rather than left for a reader to infer from a flattering
+   number.
+3. **Postgres for chunk text**, where `V3_PLAN` §Phase-2 said "object storage". The access
+   pattern is a keyed lookup on the hot path, and one instance lets a re-index drop text and
+   vectors together. Object storage stays right for genuinely large cold artefacts (P5).
+4. **The lexical arm builds its BM25 index per query** over the namespace's text — the one place
+   hybrid search does work proportional to the INDEX rather than to k. A persisted inverted index
+   would be a second structure to keep in step with the vector index; bounding it by SAMPLING
+   would be worse than the cost, since the lexical arm's value is finding the rare identifier and
+   a sampled corpus is exactly where a rare thing goes missing. Flagged for P5 with a real
+   corpus.
+5. **`hybridSearch` is wired into the Q&A answer path now**, with the deterministic reranker as
+   the default. The alternative — shipping it unwired — would have left the refusal-floor
+   interaction untested against the real caller, which is the riskiest part of the change.
+
+### Ledger
+
+- **#8 RESOLVED.** Vectors are out of `result.ai.rag.chunks[]` and in a real index; the slice now
+  grows with the chunk COUNT and not with the embedding dimension.
+- **#20 — status reported, deliberately NOT resolved.** `cpgEdges` + `routes` still live in the
+  analysis document. P2 removed the *large* contributor (vectors), which changes the arithmetic
+  substantially, but the graph slice's own growth is unmeasured on a genuinely large repo and
+  externalising it on a guess would be building without evidence. The natural decision point is
+  the first big-repo end-to-end run, which is deferred.
+- **#21 (per-process Q&A answer cache) unchanged** — untouched by this phase.
+
+
+---
+
+## DEFERRED TO MANUAL PHASE (P5/P6)
+
+Everything below is BUILT, hermetically tested and integration-ready, but needs real infra, real
+keys, real spend or a real clock to actually run. Nothing in these phases blocks on any of it.
+
+**Retrieval infra (V3-P2)**
+1. **Real pgvector integration run.** `docker compose up -d postgres` (the `pgvector/pgvector:pg16`
+   service added in V3-P2), set `POSTGRES_URL=postgres://codeflow:codeflow@localhost:5432/codeflow`
+   for BOTH the api and the worker, then analyse a repo and ask a question. What this confirms that
+   the hermetic suite cannot: that Postgres accepts the emitted DDL and SQL, that `CREATE EXTENSION
+   vector` succeeds, and that HNSW recall is acceptable at real scale. The adapter's SQL is already
+   asserted against a recording fake, so this is a confirmation rather than a first check.
+2. **Reranker weights + a real cross-encoder.** Blocked on a WASM-clean tokenizer, not on effort —
+   see the V3-P2 probe table. The path if it becomes worthwhile: `onnxruntime-web` (no install
+   script, no native binaries) + a JS WordPiece implementation, behind the existing
+   `CrossEncoderSession` interface. Nothing else changes.
+3. **The scored eval (#17) + `EVAL_THRESHOLDS` calibration.** Needs `GEMINI_API_KEY` and spends
+   money. Since V3-P2 it needs TWO inputs per dataset: `results/<name>.json` (the `AnalysisResult`)
+   and `results/<name>.index.json` (the chunk text + vectors, which no longer travel inside the
+   result). The CLI names the exact shape when either is missing.
+4. **The real-model enrichment recall@k on the golden set.** The hermetic A/B measured +0.500
+   recall@3 with a bag-of-words embedder; the magnitude a real embedding model shows is unmeasured.
+5. **A big-repo end-to-end run**, which is also the decision point for ledger #20 (whether the
+   graph slice needs externalising too) and for the P4-flagged chunking constants
+   (`MAX_CHUNK_TOKENS`, `WINDOW_CHUNK_LINES`) and the P5-flagged retrieval knobs
+   (`RETRIEVAL_*`, `BM25_*`, `RRF_K`, `MMR_LAMBDA`) — every one of which is a documented default
+   with no calibration against this repo's own eval.
+6. **BullMQ/SSE wire smoke** (`pnpm dev:api` + `pnpm dev:worker` against the dev compose stores).
+
+**Owner setup**
+7. A GitHub `eval` environment + the `GEMINI_API_KEY` secret, for the scored-eval workflow's
+   approval gate.
+8. Hand-label >= 20 (answer, chunks) pairs to promote the judge from advisory to gating. No
+   placeholder labels were shipped on purpose.
+9. `git push` for CI on every V3 branch.

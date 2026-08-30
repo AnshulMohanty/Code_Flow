@@ -3,7 +3,25 @@
 > Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
 > [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
 
-_Last updated: 2026-08-30 — V3-CLEANUP: evidence-based dead-code + orphan-file removal (branch `v3/cleanup-deadcode`)._
+_Last updated: 2026-08-31 — V3-P2: retrieval (real vector store, AST-enriched chunks, hybrid/rerank/MMR, synthetic flywheel) (branch `v3/p2-retrieval`)._
+
+> ✅ **V3-P2 is DONE** — retrieval is a real pipeline and the index has left the Mongo document.
+> New `@codeflow/retrieval` sits BELOW analyzers and owns the ONE `VectorStore` interface: an
+> in-memory exact-cosine pair is the hermetic default the whole suite and the eval run against,
+> pgvector + Postgres is production behind an injected `SqlClientLike`, and one factory
+> (`createRetrievalStores`) serves both the worker and the API so they cannot disagree about which
+> index they are talking to. `Rag` is now metadata + a `store` reference — **ledger #8 resolved**;
+> a pre-P2 index is refused with a rebuild instruction rather than answered from zero chunks.
+> Chunks are AST-enriched on the EMBEDDING side only (`RagChunk.text` stays byte-exact for its line
+> range), measured hermetically at **recall@3 0.500 → 1.000, MRR 0.333 → 0.667, 3 won / 0 lost** —
+> with the mechanism-not-magnitude caveat written into the module. Query time is
+> **BM25 + vector → RRF → rerank → MMR**, and the **similarity-floor refusal is unchanged**: it
+> reads the vector arm's real cosine, before any rerank, asserted by a test. NO cross-encoder
+> dependency: `onnxruntime-node` is 211 MB with a downloading postinstall, transformers.js adds
+> `sharp`, fastembed is native NAPI — so the deterministic lexical reranker ships and the real one
+> is a drop-in behind `CrossEncoderSession`. Plus the **synthetic-data flywheel**: guaranteed-correct
+> Q&A generated from the CPG with labels from the graph oracle (never a model), graph-shaped hard
+> negatives, and generated negative controls. **742 tests** (was 526).
 
 > ✅ **V3-CLEANUP is DONE** — a leaner tree by PROOF, not by eye. The audit lives in
 > [CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md), committed **before** anything was deleted: 13 REMOVE
@@ -563,6 +581,57 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-P2 — retrieval (branch `v3/p2-retrieval`)
+
+> Full detail, including the reranker dependency probe and every judgment call:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P2`).
+
+- **`@codeflow/retrieval` (new, 155 tests).** Owns `VectorStore`, `ChunkTextStore`, `Reranker`, the
+  embedding-space homogeneity guard and the cosine primitive. Depends only on `shared-types` +
+  `config`; **sits BELOW `@codeflow/analyzers`**, which is why `cosineSimilarity`, `retrieve` and
+  `assertEmbeddingSpace` moved DOWN into it — the stores and MMR need them, and keeping them in
+  analyzers would have made the dependency a cycle. Analyzers re-exports all three, so there is
+  still exactly ONE definition of each and every existing import path resolves.
+- **The index left the document (ledger #8).** A 1024-dim vector is ~8KB of JSON per chunk, so a
+  mid-sized repo exceeded Mongo's 16MB BSON limit and every read of an analysis dragged the whole
+  index across the wire. `Rag` is now metadata + a `store` reference; a test walks the persisted
+  slice AND `JSON.stringify`s it to prove no vector survives. An index with no `store` is PRE-P2 —
+  unreadable, not empty — and is refused with a rebuild instruction, because answering from zero
+  chunks would look exactly like an honest refusal.
+- **In-memory vs prod, deliberately.** The in-memory pair is not a stub: it is what the suite and
+  the eval run against, and it is an EXACT cosine scan, so a ranking difference against pgvector is
+  attributable to ANN recall rather than to different maths. pgvector puts **the dimension in the
+  table name** (`codeflow_vectors_1024`), because `vector(n)` is fixed-width and that makes Postgres
+  itself enforce homogeneity. Reached through an injected `SqlClientLike`, so the suite asserts the
+  real emitted SQL against a recording fake — no container, no port, no cleanup.
+- **AST-enriched embeddings.** `embedTextFor` prepends path + path-words, language, scope chain,
+  symbol, signature and docstring to what is EMBEDDED, never to what is STORED. `deriveEnrichment`
+  is a POST-PASS over the planned ranges, so V3-P1's interval-cover is untouched and chunk ids
+  cannot move — the task's acceptance condition, held by construction. `InventorySymbol` gained the
+  `signature` the parser has produced since V3-P1 and Inventory was discarding. Measured
+  hermetically: **recall@3 0.500 → 1.000, MRR +0.333, 3 questions won, 0 lost** — with a
+  bag-of-words embedder, so it establishes the mechanism and the direction, not the magnitude.
+- **Hybrid query path:** BM25 (deterministic, code-aware tokenizer, IDF floored at zero) fused with
+  the vector arm by **RRF over RANKS** (a cosine and a BM25 score are not comparable quantities),
+  then a reranker, then MMR for diversity. The **refusal floor is unchanged** — it reads the vector
+  arm's real cosine BEFORE any rerank, and a test asserts every returned chunk's fused score is
+  below the floor that admitted it. A reranker failure degrades to the fused order and RECORDS it.
+- **No cross-encoder dependency, on probe evidence.** `onnxruntime-node` installs at **211 MB** with
+  a binary-downloading postinstall; transformers.js adds `sharp`; fastembed is native NAPI;
+  `onnxruntime-web` is WASM-clean but needs a tokenizer that is itself NAPI. So
+  `createLexicalOverlapReranker` ships (keyless, in-process, zero-dep, and flagged
+  `kind: "deterministic"` in the data so no report mistakes it for a cross-encoder), and
+  `createCrossEncoderReranker` is already tested behind an injected `CrossEncoderSession`.
+- **The synthetic-data flywheel.** `@codeflow/arena` generates guaranteed-correct Q&A from the code
+  property graph — **labels from the oracle, never from a model** — with graph-shaped hard negatives
+  (reverse-direction imports, upstream dependencies, same-community non-callers) and GENERATED
+  negative controls. The oracle run as the agent over its own set scores 1.0 on every task, which is
+  the flywheel's self-check. Generated sets are deliberately NOT written into
+  `packages/eval/datasets/`: that directory's value is that a human stands behind every question.
+- **Dev infra:** `pgvector/pgvector:pg16` added to `docker-compose.yml` (dev-only), `POSTGRES_URL`
+  documented for both processes. UNSET is a supported single-container mode; configured-but-
+  unreachable is reported as a degradation and logged at startup by the worker and the API.
+
 ### V3-CLEANUP — dead code + orphan files (branch `v3/cleanup-deadcode`)
 
 > Full audit + every verdict with its evidence: **[CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md)**
@@ -811,10 +880,10 @@ driven by injected fakes; in-memory remains the default everywhere.
 
 ## Verification
 
-`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **526 tests**, UNCHANGED across
-V3-CLEANUP (removals touched only code nothing referenced): shared-types 3, graph 33, parsers 28,
-**analyzers 231**, **arena 43**, **eval 76**, **api 39**, **web 60**, worker 13 — confirmed
-**hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
+`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **742 tests** (V3-P2: 526 -> 742,
++216): shared-types 3, graph 33, parsers 28, **retrieval 155 (new package)**, **analyzers 234**,
+**arena 68** (+25 synthetic flywheel), **eval 109** (+33 enrichment A/B, index sidecar, generated
+datasets), **api 39**, **web 60**, worker 13 — confirmed **hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
 LLM/embedding + stubbed `fetch`/`EventSource` + **mocked `react-force-graph-2d`** (canvas never
 rendered in jsdom) throughout — zero real API/network calls/spend). NOTE: `pnpm -r test` (parallel)
 can OOM running all suites back-to-back with the heavier web env; run serially
@@ -842,6 +911,14 @@ V3-CLEANUP ran the FULL gate after every single removal commit (typecheck, lint,
 legacy `node --test`), so a reddened tree would have been caught and reverted at that commit rather
 than at the end — none was. At phase end all three Docker images (worker, api, web) were rebuilt, and
 the keyless `parity` + `check` CI steps and `docker compose config --quiet` are green.
+
+V3-P2 kept the same discipline: the full gate after each of the four task commits. `tsc
+--noUnusedLocals --noUnusedParameters` still reports **zero** unused locals/params repo-wide (one
+appeared mid-phase — `scoreQuestion`'s `k` became unused when retrieval moved out of the scorer — and
+was fixed by ENFORCING it, because a metric called recall@k must not depend on how many results the
+caller happens to pass). The hermetic guarantee needed defending once during this phase: a
+`createRetrievalStores` degradation test was attempting a REAL TCP connection (3.6 s per run), so the
+factory gained a documented `createClient` test seam and a test that asserts the seam is used.
 
 ## Not done here (by design)
 
@@ -940,10 +1017,12 @@ former blocker — is **DONE** this session).
 7. **Synthesis prompt-selection sizes are fixed constants (P4 tuning).** The bounded prompt view uses
    top-30 keyFiles / top-10 impact / top-15 cycles / 1200-char README head. Revisit these against
    real large repos for cost/quality in P4 (they cap the LLM INPUT only; stored slices stay uncapped).
-8. **Result-slice vector size vs Mongo 16MB BSON limit (P4).** Vectors are stored inline in
-   `result.ai.rag.chunks[]`; on a large repo (many chunks × dim-1024 floats) this risks the 16MB
-   document limit. Fix: externalize vectors to a dedicated SHA-keyed collection (and/or quantize).
-   Deferred — flag, don't build now.
+8. **Result-slice vector size vs Mongo 16MB BSON limit. ✅ RESOLVED (V3-P2).** Vectors and chunk
+   text are OUT of `result.ai.rag.chunks[]` and in `@codeflow/retrieval`'s stores (pgvector for
+   vectors, a keyed Postgres table for text), joined back by the unchanged chunk id. `Rag` keeps only
+   the metadata a citation needs, so the slice now grows with the chunk COUNT and no longer with the
+   embedding dimension. Asserted structurally, not assumed: a test walks every persisted chunk and
+   also `JSON.stringify`s the slice, because a round trip through JSON is what persistence does.
 9. **Ask-the-repo query path. ✅ RESOLVED (P18); the budget split RESOLVED in V3-P0.** The Q&A
    path's daily budget now shares ONE Redis counter with the worker (it was per-API-process), so the
    global ceiling is finally global. The answer CACHE is still per-API-process — see ledger #21. `answerQuestion` (retrieve → answer → cite,
@@ -1031,6 +1110,12 @@ former blocker — is **DONE** this session).
     ledger #8 already flags for the inline RAG vectors. Measure both together on a genuinely large
     repo; the Phase 2 move of embeddings out of `analyses` is the natural time to decide whether the
     graph slice needs externalizing too.
+    **STATUS REPORTED, deliberately NOT resolved (V3-P2).** P2 removed the LARGE contributor —
+    the inline vectors (ledger #8) — which changes the arithmetic substantially: the document no
+    longer grows with the embedding dimension at all. What remains is the graph slice's own growth,
+    which is still UNMEASURED on a genuinely large repo, and externalising it on a guess would be
+    building without evidence. The decision point is the first big-repo end-to-end run (see the
+    deferred-manual list in PHASE_LOG).
 21. **The Q&A ANSWER CACHE is still per-API-process (V3-P0).** V3-P0 fixed the wallet half of the old
     #9/14 split — the daily budget is now one shared Redis counter — but `ragQaService` still keeps its
     answer cache in a process-local Map. Consequence: two API replicas each pay for the same repeated

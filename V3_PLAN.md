@@ -177,16 +177,58 @@ calibration are a manual step ⚠️ (needs the owner's key; ledger #17/#24).
 
 ## PHASE 2 — Retrieval (hybrid + rerank + real vector store)
 **Goal:** delete brute-force cosine-in-a-Mongo-doc; ship production retrieval.
-**Entry gate:** Phase 1 `[x]`. **Satisfied on the code side as of 2026-08-30** (Phase 1 and the Phase 0
-backfill are both complete). Still blocked on INFRA: a vector store + object storage must be stood up
-first.
+**Entry gate:** Phase 1 `[x]`. **Satisfied.** **Executed 2026-08-31** (branch `v3/p2-retrieval`, cut
+off `v3/cleanup-deadcode`). The infra blocker was resolved as CODE rather than as a prerequisite:
+`pgvector/pgvector:pg16` is a service in the dev `docker-compose.yml`, both adapters are reached
+through an injected `SqlClientLike`, and the in-memory pair is a first-class implementation — so the
+whole phase is built, tested and integration-ready without a live instance. Standing one up is the
+deferred manual step.
 
-- [ ] **Real vector store.** New `@codeflow/retrieval`; back it with pgvector (hosted) behind an interface (LanceDB for local later). Move embeddings out of the `analyses` doc; store text in object storage, vectors + coords in the index. *Acceptance:* index size no longer bounded by the 16MB BSON limit.
-- [ ] **AST-aware enriched chunks.** Chunk on symbol spans (keep your interval-cover + gap-sweep), enriched with scope/signature/types/docstring. *Acceptance:* eval recall@k improves vs raw chunks.
-- [ ] **Hybrid + rerank.** BM25/symbol + vector, fused (RRF), then a reranker (Voyage/Cohere), then MMR. Keep the similarity-floor refusal. *Acceptance:* eval recall@k + MRR improve; refusal still fires below floor.
-- [ ] **Start the synthetic-data flywheel** (design doc §5.3.3): generate guaranteed-correct Q&A from the graph oracle to grow the eval set + mine hard-negatives. *Acceptance:* eval set grows automatically for any indexed repo.
+- [x] **Real vector store.** New `@codeflow/retrieval`; back it with pgvector (hosted) behind an interface (LanceDB for local later). Move embeddings out of the `analyses` doc; store text in object storage, vectors + coords in the index. *Acceptance:* index size no longer bounded by the 16MB BSON limit.
+      → **DONE** (resolves ledger #8), with one deliberate deviation: chunk text goes to a keyed
+      **Postgres table in the same instance**, not object storage. The access pattern is "give me the
+      text for these ~40 chunk ids, now, on the Q&A hot path" — 40 primary-key reads, not 40 HTTP
+      GETs with 40 round trips of latency — and one instance lets a re-index drop text and vectors
+      together instead of leaving orphans. Object storage stays right for genuinely large cold
+      artefacts (P5). `@codeflow/retrieval` sits BELOW analyzers, so `cosineSimilarity`, `retrieve`
+      and `assertEmbeddingSpace` moved down into it and are re-exported — one definition, every
+      import path intact. Acceptance asserted structurally: the persisted slice is walked AND
+      `JSON.stringify`d for stray vectors.
+- [x] **AST-aware enriched chunks.** Chunk on symbol spans (keep your interval-cover + gap-sweep), enriched with scope/signature/types/docstring. *Acceptance:* eval recall@k improves vs raw chunks.
+      → **DONE.** Enrichment is a POST-PASS over the planned ranges, so the interval-cover and
+      gap-sweep are literally untouched and chunk ids cannot move. It applies to the EMBEDDED text
+      only; `RagChunk.text` stays byte-exact for its line range, because that is what a citation
+      resolves to. "Types" are carried inside the signature — which is where a typed language states
+      them — rather than as a field nothing could fill. **Measured hermetically: recall@3
+      0.500 → 1.000, MRR 0.333 → 0.667, 3 questions won / 0 lost.** Stated limit: the A/B embedder is
+      a deterministic bag of words, so it establishes the mechanism and the direction, not the
+      magnitude a real model would show — that number needs a key and is deferred.
+- [x] **Hybrid + rerank.** BM25/symbol + vector, fused (RRF), then a reranker (Voyage/Cohere), then MMR. Keep the similarity-floor refusal. *Acceptance:* eval recall@k + MRR improve; refusal still fires below floor.
+      → **DONE**, with the reranker deviating from the sketch for a probed reason: no Voyage/Cohere
+      (both need a key, and the brief asked for KEYLESS + in-process), and no ONNX cross-encoder
+      either — `onnxruntime-node` installs at **211 MB** with a binary-downloading postinstall,
+      transformers.js adds `sharp`, fastembed is native NAPI, and `onnxruntime-web` is WASM-clean but
+      needs a tokenizer that is itself NAPI. So a deterministic in-process reranker ships (flagged
+      `kind: "deterministic"` in the data so nothing mistakes it for a cross-encoder) and the real one
+      is a drop-in behind an injected `CrossEncoderSession`, already tested. The refusal floor reads
+      the VECTOR arm's cosine before any rerank — a test asserts every returned chunk's FUSED score is
+      below the floor that admitted it, which is what proves the gate is not reading an ordinal score.
+- [x] **Start the synthetic-data flywheel** (design doc §5.3.3): generate guaranteed-correct Q&A from the graph oracle to grow the eval set + mine hard-negatives. *Acceptance:* eval set grows automatically for any indexed repo.
+      → **DONE.** Labels come from the ORACLE, never from a model — a model-labelled set would
+      measure agreement with a model's guesses and is worse than no eval because it looks like one.
+      Self-checking: the oracle run AS the agent over its own generated set scores 1.0 on every task.
+      Hard negatives are graph-shaped (reverse-direction imports, upstream dependencies,
+      same-community non-callers), and negative controls are GENERATED rather than guessed. Verified
+      end to end: `pnpm --filter @codeflow/eval run synthetic` produced **12 questions, 4 negative
+      controls, 10 hard negatives from a 4-file graph** and validated its own output against the
+      loader's shape check. Generated sets are deliberately NOT written into
+      `packages/eval/datasets/` — that directory's value is that a human stands behind every
+      question.
 
 **Phase 2 DoD:** gates green · measurable retrieval gains recorded · no embeddings stored in `analyses`.
+→ **MET** (2026-08-31). Gates green after each of the four task commits: typecheck, lint, **742
+tests** (526 → 742, +216; retrieval 155 new), build, legacy 25/25, keyless `parity` + `check`, compose
+config. Retrieval gains recorded above. No embeddings in `analyses` — asserted, not assumed.
 
 ---
 
