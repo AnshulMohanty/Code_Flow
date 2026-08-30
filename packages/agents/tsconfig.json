@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "@codeflow/analyzers": ["packages/analyzers/dist/index.d.ts"],
+      "@codeflow/config": ["packages/config/dist/index.d.ts"],
+      "@codeflow/graph": ["packages/graph/dist/index.d.ts"],
+      "@codeflow/memory": ["packages/memory/dist/index.d.ts"],
+      "@codeflow/retrieval": ["packages/retrieval/dist/index.d.ts"],
+      "@codeflow/shared-types": ["packages/shared-types/dist/index.d.ts"]
+    }
+  },
+  "include": ["src"]
+}
