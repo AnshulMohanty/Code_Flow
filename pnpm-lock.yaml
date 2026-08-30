@@ -173,6 +173,15 @@ importers:
         specifier: workspace:*
         version: link:../shared-types
 
+  packages/arena:
+    dependencies:
+      '@codeflow/graph':
+        specifier: workspace:*
+        version: link:../graph
+      '@codeflow/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
+
   packages/config: {}
 
   packages/eval:
