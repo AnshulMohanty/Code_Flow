@@ -1,5 +1,5 @@
 import type { AnalysisResult, RagChunk } from "@codeflow/shared-types";
-import type { EmbeddingClient, EmbeddingRequest } from "@codeflow/analyzers";
+import type { EmbeddingClient, EmbeddingRequest, EmbeddingResult } from "@codeflow/analyzers";
 import type { EvalDataset } from "../dataset.js";
 
 // Synthetic fixture in a TINY 3-d embedding space whose nearest neighbours are known by
@@ -101,9 +101,12 @@ export function mockEmbeddingClient(opts: { model?: string; dimension?: number }
     model: opts.model ?? EMBED_MODEL,
     dimension: opts.dimension ?? EMBED_DIM,
     calls,
-    async embed(request: EmbeddingRequest): Promise<number[][]> {
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
       calls.push(request);
-      return request.texts.map((text) => QUERY_VECTORS[text] ?? new Array(EMBED_DIM).fill(0));
+      return {
+        vectors: request.texts.map((text) => QUERY_VECTORS[text] ?? new Array(EMBED_DIM).fill(0)),
+        usage: { inputTokens: request.texts.length * 5, outputTokens: 0, measured: true },
+      };
     },
   };
 }

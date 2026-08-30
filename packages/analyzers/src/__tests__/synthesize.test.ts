@@ -10,10 +10,12 @@ import type {
   RepoMetrics,
   RepoOrientation,
   RepoStructure,
+  TokenUsage,
 } from "@codeflow/shared-types";
 import { createSynthesizeStage, deriveSynthesis } from "../stages/synthesize.js";
 import { runPipeline } from "../pipeline/orchestrator.js";
-import type { LlmClient, LlmCompletionRequest } from "../llm/llmClient.js";
+import type { LlmClient, LlmCompletionRequest, LlmCompletionResult } from "../llm/llmClient.js";
+import { tokensOf } from "../budget/budgetHandle.js";
 
 const input: PipelineInput = {
   jobId: "job-1",
@@ -98,11 +100,12 @@ function mockClient(responses: Array<string | Error>): MockClient {
     provider: "anthropic",
     model: "mock-model",
     calls,
-    async complete(request: LlmCompletionRequest): Promise<string> {
+    async complete(request: LlmCompletionRequest): Promise<LlmCompletionResult> {
       calls.push(request);
       const next = responses[Math.min(calls.length - 1, responses.length - 1)];
       if (next instanceof Error) throw next;
-      return next;
+      // Mock the provider's usage read-back so the budget records MEASURED tokens.
+      return { text: next, usage: { inputTokens: 200, outputTokens: 40, measured: true } };
     },
   };
 }
@@ -117,22 +120,29 @@ function goodResponse(fileIds: string[], summary = "This is a TypeScript app. St
 
 interface SpyBudget {
   check(n: number): Promise<boolean>;
-  record(n: number): Promise<void>;
+  record(actual: number | TokenUsage): Promise<void>;
   checks: number[];
   records: number[];
+  /** The provider TokenUsage records handed to `record()`. */
+  usages: TokenUsage[];
 }
 function spyBudget(allow: boolean): SpyBudget {
   const checks: number[] = [];
   const records: number[] = [];
+  const usages: TokenUsage[] = [];
   return {
     checks,
     records,
+    usages,
     async check(n: number) {
       checks.push(n);
       return allow;
     },
-    async record(n: number) {
-      records.push(n);
+    // V3-P0: `record` now takes a number OR a provider TokenUsage. Normalize to a count so
+    // the existing assertions keep meaning, and capture the usage for the new ones.
+    async record(actual: number | TokenUsage) {
+      records.push(tokensOf(actual));
+      if (typeof actual !== "number") usages.push(actual);
     },
   };
 }

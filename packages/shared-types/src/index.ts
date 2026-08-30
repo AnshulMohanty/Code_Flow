@@ -920,11 +920,46 @@ export interface AnalysisCacheHandle {
  * `check(estimate)` → call the provider → `record(actual)`. When `check` returns false the
  * AI stage degrades gracefully ("partial" + budget-exhausted), it does NOT call the provider.
  */
+/**
+ * What a paid call actually cost, as reported by the provider (V3-P0).
+ *
+ * `measured` is the load-bearing field: the cost invariant is "measured, not estimated",
+ * and the only way to keep that claim honest is to record whether the provider actually
+ * told us. A provider that reports nothing usable (e.g. the Gemini embedding endpoint)
+ * yields `measured: false` with an estimate, and that shows up in the budget ledger rather
+ * than being quietly indistinguishable from a real number.
+ */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  /** True only when these numbers came from the provider's response. */
+  measured: boolean;
+  /** Prompt-cache tokens READ (billed at a discount), when the provider reports them. */
+  cacheReadTokens?: number;
+  /** Prompt-cache tokens WRITTEN (billed at a premium), when the provider reports them. */
+  cacheWriteTokens?: number;
+}
+
+/**
+ * Separate counters per BILLING UNIT. Chat tokens and embedding tokens are priced
+ * differently and exhaust independently, so a single pooled number cannot express either
+ * ceiling correctly.
+ */
+export type BudgetUnit = "chat" | "embedding";
+
 export interface BudgetHandle {
   /** True if spending `estimatedTokens` more this UTC day stays within budget. */
-  check(estimatedTokens: number): Promise<boolean>;
-  /** Add actually-spent tokens to the current UTC day's running total. */
-  record(actualTokens: number): Promise<void>;
+  check(estimatedTokens: number, unit?: BudgetUnit): Promise<boolean>;
+  /**
+   * Add actually-spent tokens to the current UTC day's running total.
+   *
+   * Prefer the `TokenUsage` overload — it carries the provider's real numbers and the
+   * `measured` flag. The plain-number form remains for callers that genuinely have only a
+   * count (and for back-compat with existing tests).
+   */
+  record(actual: number | TokenUsage, unit?: BudgetUnit): Promise<void>;
+  /** Current spend for a unit this UTC day, when the implementation can report it. */
+  spent?(unit?: BudgetUnit): Promise<number>;
 }
 
 /** Immutable trigger for a pipeline run — the same for every stage. */

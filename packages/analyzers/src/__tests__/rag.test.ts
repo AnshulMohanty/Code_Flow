@@ -8,12 +8,14 @@ import type {
   ProgressEvent,
   RepoGraph,
   RepoStructure,
+  TokenUsage,
 } from "@codeflow/shared-types";
 import { createRagStage } from "../stages/rag.js";
 import { createSynthesizeStage } from "../stages/synthesize.js";
 import { createIngestStage, type RepoCloner } from "../stages/ingest.js";
 import { runPipeline, type CachedAnalysisLookup } from "../pipeline/orchestrator.js";
-import type { EmbeddingClient, EmbeddingRequest } from "../embedding/embeddingClient.js";
+import type { EmbeddingClient, EmbeddingRequest, EmbeddingResult } from "../embedding/embeddingClient.js";
+import { tokensOf } from "../budget/budgetHandle.js";
 import type { LlmClient } from "../llm/llmClient.js";
 
 const input: PipelineInput = {
@@ -107,13 +109,15 @@ function mockEmbedClient(dim = 4, provider: "voyage" | "gemini" = "voyage", mode
     model,
     dimension: dim,
     calls,
-    async embed(request: EmbeddingRequest): Promise<number[][]> {
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
       calls.push(request);
-      return request.texts.map((text) => {
+      const vectors = request.texts.map((text) => {
         let seed = 0;
         for (let i = 0; i < text.length; i++) seed = (seed * 31 + text.charCodeAt(i)) >>> 0;
         return Array.from({ length: dim }, (_, i) => ((seed + i) % 97) / 97);
       });
+      // Provider-reported usage, so the budget path records MEASURED tokens.
+      return { vectors, usage: { inputTokens: request.texts.length * 10, outputTokens: 0, measured: true } };
     },
   };
 }
@@ -123,11 +127,28 @@ interface SpyBudget {
   record(n: number): Promise<void>;
   checks: number[];
   records: number[];
+  /** The provider TokenUsage records handed to `record()` (empty if only counts were). */
+  usages: TokenUsage[];
 }
 function spyBudget(allow: boolean): SpyBudget {
   const checks: number[] = [];
   const records: number[] = [];
-  return { checks, records, async check(n) { checks.push(n); return allow; }, async record(n) { records.push(n); } };
+  const usages: TokenUsage[] = [];
+  return {
+    checks,
+    records,
+    usages,
+    async check(n) {
+      checks.push(n);
+      return allow;
+    },
+    // V3-P0: `record` now takes a number OR a provider TokenUsage. Normalize to a count so
+    // the existing assertions keep meaning, and capture the usage separately below.
+    async record(actual) {
+      records.push(tokensOf(actual));
+      if (typeof actual !== "number") usages.push(actual);
+    },
+  };
 }
 
 function ctxFor(
@@ -402,7 +423,10 @@ function goodLlm(): LlmClient {
     provider: "anthropic",
     model: "mock-llm",
     async complete() {
-      return JSON.stringify({ summary: "An app.", readingOrder: [{ fileId: "src/a.ts", order: 1, reason: "entry" }] });
+      return {
+        text: JSON.stringify({ summary: "An app.", readingOrder: [{ fileId: "src/a.ts", order: 1, reason: "entry" }] }),
+        usage: { inputTokens: 50, outputTokens: 10, measured: true },
+      };
     },
   };
 }

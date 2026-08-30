@@ -76,7 +76,7 @@ export async function runEval(
     assertHomogeneity(embeddingClient, dataset, rag);
 
     // Embed every question on the QUERY side (matches the document-side index build).
-    const queryVectors = await embeddingClient.embed({
+    const { vectors: queryVectors } = await embeddingClient.embed({
       texts: dataset.questions.map((q) => q.question),
       inputType: "query",
     });

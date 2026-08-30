@@ -22,6 +22,7 @@
     "@codeflow/shared-types": "workspace:*",
     "bullmq": "^5.34.5",
     "dotenv": "^16.4.7",
+    "ioredis": "^6.0.0",
     "mongoose": "^9.6.1"
   },
   "devDependencies": {

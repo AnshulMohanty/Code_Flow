@@ -3,9 +3,10 @@ import dotenv from "dotenv";
 import mongoose from "mongoose";
 import { Worker } from "bullmq";
 import type { AnalysisJobPayload } from "@codeflow/shared-types";
-import { createEmbeddingClientFromEnv, createLlmClientFromEnv } from "@codeflow/analyzers";
+import { createEmbeddingClientFromEnv, createLlmClientFromEnv, createRedisBudgetHandle } from "@codeflow/analyzers";
+import { Redis } from "ioredis";
 import { ANALYSIS_QUEUE_NAME, createRedisConnectionOptions, env } from "./services/workerAnalysisService.js";
-import { createMongoBudgetHandle, createMongoCacheHandle, createMongoEventLogStore, createMongoWorkerAnalysisService } from "./services/workerAnalysisService.js";
+import { createMongoCacheHandle, createMongoEventLogStore, createMongoWorkerAnalysisService } from "./services/workerAnalysisService.js";
 import { runAnalysisJob } from "./processors/pipelineJobProcessor.js";
 import { createGitRepoCloner } from "./services/gitRepoCloner.js";
 import { createBullmqProgressPublisher } from "./services/progressPublisher.js";
@@ -40,7 +41,18 @@ async function main() {
   const service = createMongoWorkerAnalysisService();
   const cloner = createGitRepoCloner();
   const cache = createMongoCacheHandle(); // persistent LLM-output cache (wallet defense)
-  const budget = createMongoBudgetHandle(); // Guard 5 — global daily LLM-spend ceiling
+  // Guard 5 — the global daily LLM-spend ceiling, now on the SAME Redis counter the API's
+  // Q&A path uses (V3-P0). It was a Mongo counter here and a per-process one there, so the
+  // "global" ceiling was two independent ceilings that could not see each other's spend.
+  // Redis is already a hard requirement for this process (BullMQ runs on it), so there is no
+  // fallback path to justify: if Redis is down the worker has no jobs to run anyway.
+  const budgetRedis = new Redis(createRedisConnectionOptions({ forWorker: true }));
+  budgetRedis.on("error", (error: Error) => {
+    // An unhandled ioredis 'error' event would kill the process; the handle fails open.
+    console.error("[worker] budget Redis error:", error.message);
+  });
+  const budget = createRedisBudgetHandle(budgetRedis);
+  console.log("Guard 5 — daily LLM budget ledger: Redis (shared with the API Q&A path).");
   const eventLog = createMongoEventLogStore(); // SSE replay buffer (#20)
 
   // AI providers are selected by env (LLM_PROVIDER / EMBEDDING_PROVIDER, else inferred

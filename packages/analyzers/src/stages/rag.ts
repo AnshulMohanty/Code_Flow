@@ -11,10 +11,12 @@ import type {
   RepoStructure,
   StageEmbeddingTarget,
   StageResult,
+  TokenUsage,
 } from "@codeflow/shared-types";
-import type { EmbeddingClient } from "../embedding/embeddingClient.js";
+import type { EmbeddingClient, EmbeddingResult } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { embedCacheKey, type CachedEmbedding } from "../rag/embedCache.js";
+import { estimateTokens, sumUsage } from "../util/tokens.js";
 
 export interface RagDependencies {
   /** Injectable embedding client — tests mock it (no real API calls). */
@@ -437,13 +439,15 @@ async function embedChunks(
   // a deterministic estimate (summed chunk tokenCount); if exhausted, degrade gracefully
   // (throw budget-exhausted ⇒ orchestrator "partial") WITHOUT calling the provider.
   const estimatedTokens = missing.reduce((sum, i) => sum + plan[i].tokenCount, 0);
-  if (missing.length > 0 && ctx.budget && !(await ctx.budget.check(estimatedTokens))) {
+  if (missing.length > 0 && ctx.budget && !(await ctx.budget.check(estimatedTokens, "embedding"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; RAG embedding skipped (demo at capacity).");
   }
 
+  const usageParts: TokenUsage[] = [];
   for (const batch of batchIndices(missing, plan)) {
     const texts = batch.map((i) => plan[i].text);
-    const vectors = await embedWithRetry(client, texts, maxAttempts, ctx);
+    const { vectors, usage } = await embedWithRetry(client, texts, maxAttempts, ctx);
+    usageParts.push(usage);
     for (let j = 0; j < batch.length; j++) {
       const i = batch[j];
       embeddings[i] = vectors[j];
@@ -452,9 +456,18 @@ async function embedChunks(
     }
   }
 
-  // Record actual spend AFTER successful embedding. (Estimate-based for now; wiring the
-  // provider's real usage.total_tokens through EmbeddingClient is a P7 refinement.)
-  if (missing.length > 0 && ctx.budget) await ctx.budget.record(estimatedTokens);
+  // Record the provider's REAL usage after successful embedding — not the estimate above
+  // (which exists only to admit the call). `measured: false` means a provider reported no
+  // usage (today: Gemini's batch-embed endpoint), and that is logged rather than hidden.
+  if (missing.length > 0 && ctx.budget) {
+    const usage = sumUsage(usageParts);
+    await ctx.budget.record(usage, "embedding");
+    if (!usage.measured) {
+      ctx.logger.warn("RAG: embedding provider reported no usage; budget recorded an ESTIMATE.", {
+        provider: client.provider,
+      });
+    }
+  }
 
   return embeddings.map((value, i) => {
     if (value === null) throw new Error(`RAG: chunk ${plan[i].id} was never embedded.`);
@@ -487,7 +500,7 @@ async function embedWithRetry(
   texts: string[],
   maxAttempts: number,
   ctx: PipelineContext,
-): Promise<number[][]> {
+): Promise<EmbeddingResult> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -514,9 +527,7 @@ async function embedWithRetry(
  * NOT billed. Deterministic (byte-stable) so the embedding cache key stays stable.
  * Flagged for P4 tuning against measured Voyage token counts.
  */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));

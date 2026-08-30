@@ -4,6 +4,7 @@ import type { AnalysisCacheHandle, BudgetHandle, Rag, RagChunk } from "@codeflow
 import type { LlmClient } from "../llm/llmClient.js";
 import type { EmbeddingClient } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
+import { estimateTokens } from "../util/tokens.js";
 import { embedCacheKey, type CachedEmbedding } from "./embedCache.js";
 import { assertEmbeddingSpace } from "./homogeneity.js";
 import { cosineSimilarity, retrieve } from "./retrieve.js";
@@ -86,15 +87,25 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
 
   const prompt = buildAnswerPrompt(question, retrieved);
   const estimate = estimateTokens(`${SYSTEM_PROMPT}\n${prompt}`);
-  if (deps.budget && !(await deps.budget.check(estimate))) {
+  if (deps.budget && !(await deps.budget.check(estimate, "chat"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; Q&A skipped (demo at capacity).");
   }
 
-  const completion = await chatClient.complete({ system: SYSTEM_PROMPT, prompt, temperature: 0, maxTokens: deps.maxTokens });
-  const answer = deriveAnswer(completion, retrieved, retrievedChunkIds);
+  // `cachePrefix` marks SYSTEM_PROMPT for the provider's prompt cache — it is the only part
+  // stable across questions (the retrieved chunks differ per question by design). An
+  // identical question on the same SHA never reaches here at all: the qa cache above serves
+  // it for zero tokens, which beats any provider cache discount.
+  const completed = await chatClient.complete({
+    cachePrefix: SYSTEM_PROMPT,
+    prompt,
+    temperature: 0,
+    maxTokens: deps.maxTokens,
+  });
+  const answer = deriveAnswer(completed.text, retrieved, retrievedChunkIds);
 
   await cache.set(qaKey, answer);
-  if (deps.budget) await deps.budget.record(estimate);
+  // Record the provider's REAL usage, not the pre-flight estimate.
+  if (deps.budget) await deps.budget.record(completed.usage, "chat");
   return answer;
 }
 
@@ -106,12 +117,13 @@ async function embedQuery(deps: AnswerQuestionDeps): Promise<number[]> {
   if (hit && Array.isArray(hit.embedding)) return hit.embedding;
 
   const estimate = estimateTokens(question);
-  if (deps.budget && !(await deps.budget.check(estimate))) {
+  if (deps.budget && !(await deps.budget.check(estimate, "embedding"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; Q&A skipped (demo at capacity).");
   }
-  const [vector] = await embeddingClient.embed({ texts: [question], inputType: "query" });
+  const { vectors, usage } = await embeddingClient.embed({ texts: [question], inputType: "query" });
+  const [vector] = vectors;
   await cache.set(key, { embedding: vector, model: embeddingClient.model, dim: embeddingClient.dimension });
-  if (deps.budget) await deps.budget.record(estimate);
+  if (deps.budget) await deps.budget.record(usage, "embedding");
   return vector;
 }
 
@@ -174,9 +186,7 @@ function stripCodeFences(text: string): string {
   return fence ? fence[1] : text;
 }
 
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");

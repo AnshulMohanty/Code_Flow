@@ -2,6 +2,9 @@
 // mock it and make ZERO real API calls (mirrors LlmClient). The model + key are
 // configuration (owner's keys per the plan) — never hardcoded.
 
+import type { TokenUsage } from "@codeflow/shared-types";
+import { estimatedUsage, measuredUsage, sumUsage, usageNumber } from "../util/tokens.js";
+
 export interface EmbeddingRequest {
   /** Texts to embed, in order. The returned vectors align 1:1 with this array. */
   texts: string[];
@@ -16,14 +19,25 @@ export interface EmbeddingRequest {
  *  homogeneity check, so vectors from different spaces are never mixed or mis-served). */
 export type EmbeddingProvider = "voyage" | "gemini";
 
-/** Returns one vector per input text, in input order (the stage stores them as-is). */
+/**
+ * One vector per input text plus what the call cost. Widened from a bare `number[][]` in
+ * V3-P0 so embedding spend is measured rather than estimated (mirrors LlmCompletionResult).
+ */
+export interface EmbeddingResult {
+  /** One vector per input text, in input order (the stage stores them as-is). */
+  vectors: number[][];
+  /** Provider-reported usage where available; `measured: false` when estimated. */
+  usage: TokenUsage;
+}
+
+/** Returns one vector per input text, in input order, with its real token cost. */
 export interface EmbeddingClient {
   /** Vendor identifier — scopes the embedding cache key (see rag.ts). */
   readonly provider: EmbeddingProvider;
   readonly model: string;
   /** The model's vector length — stored as `Rag.embeddingDim`. */
   readonly dimension: number;
-  embed(request: EmbeddingRequest): Promise<number[][]>;
+  embed(request: EmbeddingRequest): Promise<EmbeddingResult>;
 }
 
 export interface VoyageClientOptions {
@@ -64,8 +78,10 @@ export function createVoyageClient(options: VoyageClientOptions): EmbeddingClien
     provider: "voyage",
     model,
     dimension,
-    async embed(request: EmbeddingRequest): Promise<number[][]> {
-      if (request.texts.length === 0) return [];
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
+      if (request.texts.length === 0) {
+        return { vectors: [], usage: { inputTokens: 0, outputTokens: 0, measured: true } };
+      }
 
       const response = await fetch(`${baseUrl}/v1/embeddings`, {
         method: "POST",
@@ -88,6 +104,7 @@ export function createVoyageClient(options: VoyageClientOptions): EmbeddingClien
 
       const json = (await response.json()) as {
         data?: Array<{ embedding?: number[]; index?: number }>;
+        usage?: { total_tokens?: unknown };
       };
       const data = json.data ?? [];
       if (data.length !== request.texts.length) {
@@ -104,7 +121,15 @@ export function createVoyageClient(options: VoyageClientOptions): EmbeddingClien
         }
         vectors[at] = entry.embedding;
       });
-      return vectors;
+
+      // Voyage reports `usage.total_tokens` — all input (embeddings have no output tokens).
+      const totalTokens = usageNumber(json.usage?.total_tokens);
+      const usage =
+        totalTokens !== undefined
+          ? measuredUsage(totalTokens, 0)
+          : estimatedUsage(request.texts.join("\n"));
+
+      return { vectors, usage };
     },
   };
 }
@@ -149,11 +174,14 @@ export function createGeminiEmbeddingClient(options: GeminiEmbeddingClientOption
     provider: "gemini",
     model,
     dimension,
-    async embed(request: EmbeddingRequest): Promise<number[][]> {
-      if (request.texts.length === 0) return [];
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
+      if (request.texts.length === 0) {
+        return { vectors: [], usage: { inputTokens: 0, outputTokens: 0, measured: true } };
+      }
       const taskType = request.inputType === "query" ? "RETRIEVAL_QUERY" : "RETRIEVAL_DOCUMENT";
 
       const vectors: number[][] = [];
+      const usageParts: TokenUsage[] = [];
       for (let offset = 0; offset < request.texts.length; offset += GEMINI_EMBED_MAX_BATCH) {
         const batch = request.texts.slice(offset, offset + GEMINI_EMBED_MAX_BATCH);
         const response = await fetch(`${baseUrl}/v1beta/models/${model}:batchEmbedContents`, {
@@ -177,7 +205,12 @@ export function createGeminiEmbeddingClient(options: GeminiEmbeddingClientOption
           throw new Error(`Gemini embeddings API error ${response.status}: ${detail.slice(0, 500)}`);
         }
 
-        const json = (await response.json()) as { embeddings?: Array<{ values?: number[] }> };
+        const json = (await response.json()) as {
+          embeddings?: Array<{ values?: number[] }>;
+          // Not documented for batchEmbedContents today; read it opportunistically so the
+          // usage becomes MEASURED for free if Google starts reporting it.
+          usageMetadata?: { totalTokenCount?: unknown; promptTokenCount?: unknown };
+        };
         const embeddings = json.embeddings ?? [];
         if (embeddings.length !== batch.length) {
           throw new Error(`Gemini API returned ${embeddings.length} embeddings for ${batch.length} inputs.`);
@@ -188,8 +221,17 @@ export function createGeminiEmbeddingClient(options: GeminiEmbeddingClientOption
           }
           vectors.push(entry.values);
         }
+
+        // HONEST GAP: the Gemini batch-embed endpoint reports no usage today, so this batch
+        // is ESTIMATED and flagged `measured: false` rather than recorded as if it were
+        // real. That flag is what keeps the "cost is measured" claim truthful instead of
+        // making an estimate indistinguishable from a provider number.
+        const reported =
+          usageNumber(json.usageMetadata?.totalTokenCount) ?? usageNumber(json.usageMetadata?.promptTokenCount);
+        usageParts.push(reported !== undefined ? measuredUsage(reported, 0) : estimatedUsage(batch.join("\n")));
       }
-      return vectors;
+
+      return { vectors, usage: sumUsage(usageParts) };
     },
   };
 }

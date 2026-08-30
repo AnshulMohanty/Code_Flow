@@ -3,10 +3,12 @@ import {
   createEmbeddingClientFromEnv,
   createInMemoryBudgetHandle,
   createLlmClientFromEnv,
+  createRedisBudgetHandle,
   type RagAnswer,
 } from "@codeflow/analyzers";
 import { RAG_TOP_K } from "@codeflow/config";
 import type { AnalysisCacheHandle, AnalysisResult, BudgetHandle } from "@codeflow/shared-types";
+import { getSharedRedis, isSharedRedisEnabled } from "../queues/redisClient.js";
 
 /** Answers a question against a stored analysis' RAG index. Injectable so tests supply a mock
  *  (with mock chat/embedding clients) and the suite makes zero real calls. */
@@ -25,8 +27,44 @@ export function getAskHandler(): AskHandler {
   return productionHandler;
 }
 
-// In-process caches for the query path. The answer cache + the per-UTC-day budget are
-// per-process here; sharing them with the worker (Mongo/Redis) is a P7 wiring task (ledger).
+/**
+ * The daily LLM budget for the API's Q&A path (V3-P0).
+ *
+ * Before this, the API kept a PER-PROCESS in-memory ledger while the worker kept a Mongo
+ * one, so "the global daily ceiling" was actually two independent ceilings: a Q&A call could
+ * not see what the pipeline had spent, and vice versa. Both now decrement the SAME Redis
+ * counter. Falling back to in-memory when Redis is absent is honest degradation, not the
+ * intended path, and it is logged.
+ *
+ * Memoized: one handle per process, resolved on first use (the Redis connection is async
+ * while `answerQuestion` needs a `BudgetHandle` synchronously).
+ */
+let sharedBudget: BudgetHandle | null = null;
+
+async function resolveBudget(): Promise<BudgetHandle> {
+  if (sharedBudget) return sharedBudget;
+  const redis = await getSharedRedis();
+  if (redis) {
+    sharedBudget = createRedisBudgetHandle(redis);
+  } else {
+    if (isSharedRedisEnabled()) {
+      console.warn(
+        "[codeflow] Q&A budget: Redis unavailable — falling back to a PER-PROCESS ceiling. " +
+          "The daily LLM budget is no longer shared with the worker.",
+      );
+    }
+    sharedBudget = createInMemoryBudgetHandle();
+  }
+  return sharedBudget;
+}
+
+/** Test seam: forget the memoized budget so a suite can re-resolve it. */
+export function resetQaBudgetForTests(): void {
+  sharedBudget = null;
+}
+
+// In-process answer cache for the query path. (Sharing the answer CACHE with the worker is
+// still open — see the deferred ledger; the BUDGET is now shared, which was the wallet risk.)
 function createInMemoryCache(): AnalysisCacheHandle {
   const store = new Map<string, unknown>();
   return {
@@ -47,8 +85,8 @@ function createInMemoryCache(): AnalysisCacheHandle {
  */
 function createProductionAskHandler(): AskHandler {
   const cache = createInMemoryCache();
-  const budget: BudgetHandle = createInMemoryBudgetHandle();
   return async ({ result, question }) => {
+    const budget = await resolveBudget();
     const ragIndex = result.ai?.rag;
     if (!ragIndex) {
       throw new Error("This analysis has no Q&A index.");

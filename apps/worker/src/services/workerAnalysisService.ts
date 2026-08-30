@@ -221,30 +221,12 @@ export function createMongoCacheHandle(): AnalysisCacheHandle {
   };
 }
 
-/**
- * Mongo-backed `BudgetHandle` for the global daily LLM-spend ceiling (Guard 5). Persists
- * across worker instances/restarts; the per-UTC-day document IS the reset boundary. Mirrors
- * the in-memory handle's mechanics (check estimate ≤ remaining; record adds to the day's
- * total). Integration-only — exercised against real Mongo, not the hermetic suite.
- */
-export function createMongoBudgetHandle(limitTokens: number = DAILY_LLM_BUDGET): BudgetHandle {
-  const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-  return {
-    async check(estimatedTokens: number): Promise<boolean> {
-      const doc = await LlmBudgetModel.findOne({ day: utcDay(Date.now()) }).lean();
-      const spent = doc ? (doc.spent as number) : 0;
-      return spent + estimatedTokens <= limitTokens;
-    },
-    async record(actualTokens: number): Promise<void> {
-      const day = utcDay(Date.now());
-      await LlmBudgetModel.findOneAndUpdate(
-        { day },
-        { $inc: { spent: actualTokens }, $setOnInsert: { day } },
-        { upsert: true },
-      );
-    },
-  };
-}
+// NOTE (V3-P0): the Mongo-backed `createMongoBudgetHandle` was REMOVED here. Guard 5's
+// ledger now lives in Redis (`createRedisBudgetHandle` in @codeflow/analyzers), shared with
+// the API's Q&A path — previously the worker counted in Mongo and the API counted in process
+// memory, so the "global daily ceiling" was two ceilings that could not see each other.
+// Keeping a second persistent implementation of one counter would only invite drift.
+// The `llmbudget` collection is left in place for historical data; nothing writes it now.
 
 export function createMongoWorkerAnalysisService(): WorkerAnalysisService {
   return {

@@ -23,7 +23,23 @@ export {
   BudgetExceededError,
   statusReasonOf,
 } from "./pipeline/errors.js";
-export { createInMemoryBudgetHandle } from "./budget/budgetHandle.js";
+export {
+  createInMemoryBudgetHandle,
+  createRedisBudgetHandle,
+  tokensOf,
+  type BudgetRedisLike,
+  type RedisBudgetOptions,
+} from "./budget/budgetHandle.js";
+// V3-P0: the ONE token-accounting module (replaces three duplicated estimators).
+export {
+  estimateTokens,
+  estimatedUsage,
+  measuredUsage,
+  sumUsage,
+  totalTokens,
+  usageNumber,
+  TOKEN_ESTIMATE_CHARS_PER_TOKEN,
+} from "./util/tokens.js";
 export { createOrientStage, type OrientDependencies } from "./stages/orient.js";
 export {
   createMapStructureStage,
@@ -56,6 +72,7 @@ export {
   type LlmClient,
   type LlmProvider,
   type LlmCompletionRequest,
+  type LlmCompletionResult,
   type AnthropicClientOptions,
   type GeminiClientOptions,
 } from "./llm/llmClient.js";
@@ -65,6 +82,7 @@ export {
   type EmbeddingClient,
   type EmbeddingProvider,
   type EmbeddingRequest,
+  type EmbeddingResult,
   type VoyageClientOptions,
   type GeminiEmbeddingClientOptions,
 } from "./embedding/embeddingClient.js";

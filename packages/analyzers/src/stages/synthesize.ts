@@ -9,9 +9,11 @@ import type {
   RepoGraph,
   Synthesis,
   StageResult,
+  TokenUsage,
 } from "@codeflow/shared-types";
 import type { LlmClient } from "../llm/llmClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
+import { estimateTokens } from "../util/tokens.js";
 
 export interface SynthesizeDependencies {
   /** Injectable LLM client — tests mock it (no real API calls). */
@@ -99,13 +101,21 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
       let lastError: unknown;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let completion: string;
+        let usage: TokenUsage;
         try {
-          completion = await deps.client.complete({
-            system: SYSTEM_PROMPT,
+          // `cachePrefix` marks the STABLE prefix for the provider's prompt cache. Only
+          // SYSTEM_PROMPT is stable across repos; the per-repo facts are already protected
+          // by the SHA-keyed completion cache above, which is strictly cheaper than a
+          // provider cache hit (zero tokens vs discounted tokens). Whether the provider
+          // actually cached is read back below, never assumed.
+          const completed = await deps.client.complete({
+            cachePrefix: SYSTEM_PROMPT,
             prompt,
             temperature: 0,
             maxTokens: deps.maxTokens,
           });
+          completion = completed.text;
+          usage = completed.usage;
         } catch (error) {
           lastError = error;
           ctx.logger.warn("Synthesis LLM call failed; retrying if attempts remain.", {
@@ -118,9 +128,14 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
         try {
           const synthesis = deriveSynthesis(completion, nodeIds);
           await ctx.cache.set(cacheKey, completion); // cache only valid+grounded completions
-          // Record actual spend AFTER a successful call. (Estimate-based for now; wiring the
-          // provider's real usage.total_tokens through LlmClient is a P7 refinement.)
-          if (ctx.budget) await ctx.budget.record(estimatedTokens);
+          // Record the provider's REAL usage after a successful call — not the estimate.
+          // The estimate above is admission control only (you must guess before calling).
+          if (ctx.budget) await ctx.budget.record(usage, "chat");
+          if (!usage.measured) {
+            ctx.logger.warn("Synthesis: provider reported no usage; budget recorded an ESTIMATE.", {
+              provider: deps.client.provider,
+            });
+          }
           return finish(synthesis, { cached: false });
         } catch (error) {
           lastError = error;
@@ -240,9 +255,7 @@ function sha256(value: string): string {
 
 /** Deterministic token estimate for the budget pre-check (~4 chars/token). Precise
  *  provider tokenization is a P7 refinement; this is the wallet-guard estimate. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+
 
 // --- Bounded prompt construction (reads uncapped slices read-only) ----------
 

@@ -153,8 +153,8 @@ describe("runAnalysisJob", () => {
       now: makeClock(),
       // Stage factories only need these to register; the stages themselves are unit-tested
       // elsewhere and fail softly (AI failure => "partial"), which is not what we assert here.
-      synthesisClient: { provider: "anthropic", model: "test", complete: vi.fn(async () => "{}") },
-      embeddingClient: { provider: "voyage", model: "test", dimension: 3, embed: vi.fn(async () => [[0, 0, 0]]) },
+      synthesisClient: { provider: "anthropic", model: "test", complete: vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } })) },
+      embeddingClient: { provider: "voyage", model: "test", dimension: 3, embed: vi.fn(async () => ({ vectors: [[0, 0, 0]], usage: { inputTokens: 1, outputTokens: 0, measured: true } })) },
     });
 
     expect(outcome.skippedStages).toEqual([]);

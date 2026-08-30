@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AnalysisCacheHandle, BudgetHandle, Rag } from "@codeflow/shared-types";
 import { answerQuestion } from "../rag/answer.js";
+import { tokensOf } from "../budget/budgetHandle.js";
 import { embedCacheKey } from "../rag/embedCache.js";
 import type { LlmClient, LlmCompletionRequest } from "../llm/llmClient.js";
 import type { EmbeddingClient, EmbeddingRequest } from "../embedding/embeddingClient.js";
@@ -37,7 +38,11 @@ function mockEmbed(dim = 3): MockEmbed {
     calls,
     async embed(req) {
       calls.push(req);
-      return req.texts.map((t) => QUERY_VECTORS[t] ?? new Array(dim).fill(0));
+      return {
+        vectors: req.texts.map((t) => QUERY_VECTORS[t] ?? new Array(dim).fill(0)),
+        // Mocks report MEASURED usage so the budget assertions exercise the real path.
+        usage: { inputTokens: 7, outputTokens: 0, measured: true },
+      };
     },
   };
 }
@@ -54,7 +59,9 @@ function mockChat(response?: string, opts: { throwIfCalled?: boolean } = {}): Mo
     async complete(req) {
       calls.push(req);
       if (opts.throwIfCalled) throw new Error("LLM must not be called");
-      return response ?? JSON.stringify({ answer: "Auth uses tokens.", answered: true, citations: [{ chunkId: "src/auth.ts#1-10" }] });
+      const text =
+        response ?? JSON.stringify({ answer: "Auth uses tokens.", answered: true, citations: [{ chunkId: "src/auth.ts#1-10" }] });
+      return { text, usage: { inputTokens: 100, outputTokens: 20, measured: true } };
     },
   };
 }
@@ -78,7 +85,18 @@ interface SpyBudget extends BudgetHandle {
 function spyBudget(allow: boolean): SpyBudget {
   const checks: number[] = [];
   const records: number[] = [];
-  return { checks, records, async check(n) { checks.push(n); return allow; }, async record(n) { records.push(n); } };
+  return {
+    checks,
+    records,
+    async check(n) {
+      checks.push(n);
+      return allow;
+    },
+    // `record` now takes a number OR a TokenUsage — normalize so assertions stay simple.
+    async record(actual) {
+      records.push(tokensOf(actual));
+    },
+  };
 }
 
 describe("answerQuestion — retrieval + prompt isolation", () => {
