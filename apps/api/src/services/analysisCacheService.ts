@@ -204,6 +204,75 @@ export async function getAnalysisById(id: string): Promise<CachedAnalysisRecord 
   return doc ? await withOverflow(fromMongoDocument(doc)) : null;
 }
 
+/**
+ * Repositories this deployment has ACTUALLY analysed, newest first (V3-FINAL).
+ *
+ * For the workbench's "indexed:" recents row. A hardcoded list there would be the prototype's sample
+ * repositories shipped as though they were the user's own history, which is the single most
+ * convincing way to lie in a UI. So: real records, newest first, bounded, and an EMPTY list when
+ * this deployment has analysed nothing — which the component renders as an honest empty state.
+ *
+ * Reads the same two paths every other function here does, so it is correct with or without Mongo.
+ */
+export interface IndexedAnalysis {
+  analysisId: string;
+  repoFullName: string;
+  commitSha: string;
+  /** Files in the analysed graph — enough for the row to be informative without a second fetch. */
+  fileCount: number;
+  completedAt: string;
+}
+
+export async function listIndexedAnalyses(limit: number): Promise<IndexedAnalysis[]> {
+  const bounded = Math.max(0, Math.min(limit, 50));
+  if (bounded === 0) return [];
+
+  if (!isMongoConnected()) {
+    return [...analysesById.values()]
+      .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+      .slice(0, bounded)
+      .map(toIndexed);
+  }
+
+  // Projected, not hydrated: the recents row needs five fields, and pulling whole analysis documents
+  // (plus their overflow) to render a list would be a heavy read for a convenience feature.
+  const docs = await AnalysisModel.find({}, { repoFullName: 1, commitSha: 1, summary: 1, completedAt: 1 })
+    .sort({ completedAt: -1 })
+    .limit(bounded)
+    .lean();
+  return docs.map((doc) => {
+    const record = doc as unknown as {
+      _id: unknown;
+      repoFullName?: string;
+      commitSha?: string;
+      summary?: { files?: number };
+      completedAt?: string | Date;
+    };
+    return {
+      analysisId: String(record._id),
+      repoFullName: record.repoFullName ?? "unknown",
+      commitSha: record.commitSha ?? "",
+      fileCount: record.summary?.files ?? 0,
+      completedAt: toIso(record.completedAt),
+    };
+  });
+}
+
+function toIndexed(record: CachedAnalysisRecord): IndexedAnalysis {
+  return {
+    analysisId: record.id,
+    repoFullName: record.repoFullName,
+    commitSha: record.commitSha,
+    fileCount: record.result.summary?.files ?? 0,
+    completedAt: record.completedAt,
+  };
+}
+
+function toIso(value: string | Date | undefined): string {
+  if (!value) return new Date(0).toISOString();
+  return typeof value === "string" ? value : value.toISOString();
+}
+
 export function clearAnalysisCacheForTests() {
   inMemoryAnalyses.clear();
   analysesById.clear();

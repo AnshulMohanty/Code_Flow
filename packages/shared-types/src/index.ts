@@ -924,6 +924,54 @@ export interface Rag {
 export interface AiAnalysis {
   synthesis?: Synthesis; // synthesize
   rag?: Rag; // rag (stage 8 — RAG index)
+  /**
+   * DOMAIN LANES — what the specialist fan-out found, per community (V3-FINAL).
+   *
+   * INFERENCE, NOT FACT, and that is why it lives under `result.ai` with everything else a model
+   * produced. Any surface rendering it must label it as inferred; a domain lane presented next to
+   * the parser's structural roles without that label would read as the same kind of claim, and it
+   * is not.
+   *
+   * WHY IT IS PERSISTED AT ALL. The fan-out's findings existed only for the duration of the run: the
+   * supervisor read a bounded selection of twelve and the rest was paid for and discarded. V3-P5
+   * consolidated them into a knowledge base — inside the run, because that is the only moment they
+   * are all in hand — and then dropped that too, so nothing a user could see was ever produced from
+   * five specialists' work.
+   *
+   * BOUNDED BY CONSTRUCTION, because ledger #20 tracks this document's growth: at most
+   * `FANOUT_MAX_COMMUNITIES` lanes, each with a bounded module list and no free text beyond a
+   * headline. The findings' full detail is NOT here — that is what would grow without limit.
+   */
+  domains?: DomainLane[];
+}
+
+/**
+ * One inferred domain: a community, the specialists that reported on it, and its modules.
+ *
+ * `moduleIds` are GROUNDED — every one is a real `graph.nodes[].id`, re-checked when the lane is
+ * built. A domain lane citing a file the graph does not contain would be the same failure the three
+ * grounding passes exist to prevent, one layer later.
+ */
+export interface DomainLane {
+  /** The community id this lane came from. */
+  cluster: number;
+  /** A short human title, derived from the community's own modules — never invented prose. */
+  title: string;
+  /**
+   * The specialist that contributed most to this lane, as a tag ("auth-surface", "storage-shape").
+   * Named so a reader knows WHICH lens produced the inference rather than "an agent".
+   */
+  agentTag: string;
+  /** Every specialist that reported on this community, sorted. */
+  specialists: string[];
+  /** Grounded module ids, bounded and sorted. */
+  moduleIds: string[];
+  /** How many of those modules are entry-probable — a derived flag from the graph, not inference. */
+  entryProbable: number;
+  /** The lane's strongest headlines, bounded. Model-written prose; labelled as such wherever shown. */
+  headlines: string[];
+  /** Findings two or more independent lenses agreed on. The strongest signal a fan-out produces. */
+  corroborated: number;
 }
 
 /**
@@ -955,6 +1003,12 @@ export interface AnalysisResultSlices {
   // NOTE: `aiProjectSummary` was removed in V3-P0 — see AiAnalysis.
   aiSynthesis: Synthesis;
   aiRag: Rag;
+  /**
+   * Inferred domain lanes (V3-FINAL). Owned by the SAME stage as `aiSynthesis` — the fan-out is the
+   * only thing that produces them, and giving them a stage of their own would put a second stage in
+   * the coverage partition for one derived field of an existing one.
+   */
+  aiDomains: DomainLane[];
 }
 
 export type AnalysisSliceKey = keyof AnalysisResultSlices;

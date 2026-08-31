@@ -117,12 +117,15 @@ function fanOutChat(supervisor?: string) {
 }
 
 describe("createFanOutSynthesizeStage — the stage contract is unchanged", () => {
-  it("owns aiSynthesis and emits a `synthesize` event, like the single-shot stage", async () => {
-    // The orchestrator's coverage partition, cache lookup and partial handling all key off these.
+  it("keeps the synthesize IDENTITY and adds aiDomains, which only the fan-out produces", async () => {
+    // The orchestrator's coverage partition, cache lookup and partial handling all key off the ID —
+    // that must not change. `owns` widening is additive and required: `aiDomains` (V3-FINAL) is the
+    // durable projection of the fan-out's findings, and a stage that does not declare a key cannot
+    // write it, which is how five specialists' output reached no user at all.
     const stage = createFanOutSynthesizeStage({ chatClient: fanOutChat(), now: () => 1000 });
     expect(stage.id).toBe("synthesize");
     expect(stage.kind).toBe("ai");
-    expect(stage.owns).toEqual(["aiSynthesis"]);
+    expect(stage.owns).toEqual(["aiSynthesis", "aiDomains"]);
 
     const { partial, event } = await stage.run(input, ctxFor());
     expect(partial.aiSynthesis?.readingOrder.length).toBeGreaterThan(0);
@@ -339,12 +342,13 @@ describe("createAdaptiveSynthesizeStage — the choice is made at RUN time", () 
     expect(reasons[0]).toMatch(/no communities/);
   });
 
-  it("keeps the SAME id/kind/owns as its delegates", () => {
+  it("keeps the SAME id/kind as its delegates, and declares the union of what they write", () => {
     // A new id would silently take stage 7 out of the orchestrator's coverage partition, its cache
-    // lookup and its "AI failure ⇒ partial" handling.
+    // lookup and its "AI failure ⇒ partial" handling. `owns` must be the UNION: the single-shot
+    // delegate writes no domain lanes, but omitting the key here would drop them on every fan-out.
     const stage = createAdaptiveSynthesizeStage({ fanOut: stubStage("a"), singleShot: stubStage("b") });
     expect(stage.id).toBe("synthesize");
     expect(stage.kind).toBe("ai");
-    expect(stage.owns).toEqual(["aiSynthesis"]);
+    expect(stage.owns).toEqual(["aiSynthesis", "aiDomains"]);
   });
 });

@@ -21,6 +21,16 @@ export type {
   UnparseableAction,
 } from "./contracts.js";
 
+// V3-FINAL: the durable projection of the fan-out's per-community findings. Inference, and every
+// surface that renders it labels it as such.
+export {
+  buildDomainLanes,
+  LANE_MAX_HEADLINES,
+  LANE_MAX_MODULES,
+  SPECIALIST_TAGS,
+  type DomainLaneInput,
+} from "./orchestrator/domainLanes.js";
+
 export { askAgent, entitiesFrom, type AskAgentDeps } from "./askAgent.js";
 export { extractJsonObject, parseAgentAction } from "./parseAction.js";
 

@@ -693,6 +693,7 @@ function seedSlicesFromResult(
   // returned stale if that re-run fails.
   // (V3-P0 removed `aiProjectSummary`: it had no producer and no consumer — see AiAnalysis.)
   if (covered.has("synthesize") && result.ai?.synthesis) slices.aiSynthesis = result.ai.synthesis;
+  if (covered.has("synthesize") && result.ai?.domains) slices.aiDomains = result.ai.domains;
   if (covered.has("rag") && result.ai?.rag) slices.aiRag = result.ai.rag;
 }
 
@@ -756,13 +757,16 @@ function assembleResult(
 }
 
 function buildAi(slices: Partial<AnalysisResultSlices>): AiAnalysis | undefined {
-  const { aiSynthesis, aiRag } = slices;
-  if (!aiSynthesis && !aiRag) {
+  const { aiSynthesis, aiRag, aiDomains } = slices;
+  if (!aiSynthesis && !aiRag && !aiDomains) {
     return undefined;
   }
   return {
     synthesis: aiSynthesis,
     rag: aiRag,
+    // Omitted rather than set to [] when the fan-out did not run: an empty array would say "no
+    // domains were detected", which is a different claim from "no fan-out happened".
+    ...(aiDomains && aiDomains.length > 0 ? { domains: aiDomains } : {}),
   };
 }
 

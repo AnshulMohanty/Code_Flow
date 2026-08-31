@@ -22,15 +22,17 @@ import type {
  * the older path to have "one path" would have made those analyses worse to serve tidiness.
  */
 export interface AdaptiveSynthesizeDependencies {
-  /** Used when `metrics.clusters` is present. */
-  fanOut: PipelineStage<"aiSynthesis">;
+  /** Used when `metrics.clusters` is present. Also produces `aiDomains`. */
+  fanOut: PipelineStage<"aiSynthesis" | "aiDomains">;
   /** Used otherwise (no communities — e.g. a pre-V3-P1 cached analysis, or an edgeless repo). */
   singleShot: PipelineStage<"aiSynthesis">;
   /** Called with which path ran, so a run is explainable. */
   onChoice?(choice: "fan-out" | "single-shot", reason: string): void;
 }
 
-export function createAdaptiveSynthesizeStage(deps: AdaptiveSynthesizeDependencies): PipelineStage<"aiSynthesis"> {
+export function createAdaptiveSynthesizeStage(
+  deps: AdaptiveSynthesizeDependencies,
+): PipelineStage<"aiSynthesis" | "aiDomains"> {
   return {
     // Deliberately the SAME id/kind/owns as either delegate: the orchestrator's coverage
     // partition, its cache lookup and its "AI failure ⇒ partial" handling all key off these, and a
@@ -38,8 +40,12 @@ export function createAdaptiveSynthesizeStage(deps: AdaptiveSynthesizeDependenci
     id: "synthesize",
     kind: "ai",
     label: "Synthesizing",
-    owns: ["aiSynthesis"],
-    async run(input: PipelineInput, ctx: PipelineContext): Promise<StageResult<"aiSynthesis">> {
+    // Includes `aiDomains` because the FAN-OUT delegate produces it. The single-shot delegate does
+    // not, and that is fine: `owns` is what the stage MAY write, and the orchestrator assigns only
+    // the keys a run actually returned. Omitting it here would silently drop the domain lanes on
+    // every fan-out run, which is the failure this whole pass exists to stop repeating.
+    owns: ["aiSynthesis", "aiDomains"],
+    async run(input: PipelineInput, ctx: PipelineContext): Promise<StageResult<"aiSynthesis" | "aiDomains">> {
       const clusters = ctx.prior.metrics?.clusters;
       const communityCount = clusters?.clusters.length ?? 0;
 

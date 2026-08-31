@@ -3,6 +3,7 @@ import { BudgetExceededError, type RagAnswer } from "@codeflow/analyzers";
 import { getAnalysisJob } from "../services/analysisJobService.js";
 import { getAnalysisById } from "../services/analysisCacheService.js";
 import { getAskHandler } from "../services/ragQaService.js";
+import { recordAnswerLatency } from "../services/answerLatency.js";
 import { ApiError } from "../middleware/errorHandler.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
@@ -67,12 +68,17 @@ export function askRouter(rateLimit: RequestHandler): Router {
       }
 
       try {
+        const startedAt = Date.now();
         const answer = await getAskHandler()({
           result: cached.result,
           question,
           analysisId: job.analysisId,
           ...(sessionId ? { sessionId } : {}),
         });
+        // MEASURED HERE because this is the only place that knows (V3-FINAL). Only an ANSWERED
+        // response is sampled: a refusal is fast because it does no work, and letting refusals into
+        // the window would make the p50 improve the more often the service failed to answer.
+        if (answer.answered) recordAnswerLatency(Date.now() - startedAt);
         res.json({ ...answer, ...(sessionId ? { sessionId } : {}) } satisfies AskResponse);
       } catch (error) {
         if (error instanceof BudgetExceededError) {

@@ -10,6 +10,7 @@ import type {
 import type { LlmClient } from "@codeflow/analyzers";
 import { renderBlackboardHistory } from "@codeflow/observability";
 import { summarizeBlackboard } from "./blackboard.js";
+import { buildDomainLanes } from "./domainLanes.js";
 import type { FanOutResult } from "./contracts.js";
 import { runFanOut, type FanOutDeps } from "./runFanOut.js";
 
@@ -55,15 +56,19 @@ const FANOUT_CACHE_VERSION = "v1";
 /** The version log's first line. Named so the intent reads clearly at the call site. */
 const FIRST_LINE = /^[^\r\n]*/;
 
-export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies): PipelineStage<"aiSynthesis"> {
+export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies): PipelineStage<"aiSynthesis" | "aiDomains"> {
   const now = deps.now ?? Date.now;
 
   return {
     id: "synthesize",
     kind: "ai",
     label: "Synthesizing",
-    owns: ["aiSynthesis"],
-    async run(input: PipelineInput, ctx: PipelineContext): Promise<StageResult<"aiSynthesis">> {
+    // `aiDomains` rides the SAME stage rather than getting one of its own: the fan-out is the only
+    // thing that produces domain lanes, and a second stage id would put a second entry in the
+    // orchestrator's coverage partition, its cache lookup and its AI-failure handling for one
+    // derived field of an existing slice.
+    owns: ["aiSynthesis", "aiDomains"],
+    async run(input: PipelineInput, ctx: PipelineContext): Promise<StageResult<"aiSynthesis" | "aiDomains">> {
       const startedAt = now();
       const graph = ctx.prior.graph;
       if (!graph) {
@@ -80,6 +85,33 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
 
       const nodeIds = new Set(graph.nodes.map((node) => node.id));
 
+      /**
+       * ENTRY-PROBABLE, derived from the GRAPH — a fact, computed here rather than accepted from an
+       * agent. A module is a probable door when something outside its own directory imports it; a
+       * module only its siblings use is internal. That distinction is what makes the number useful
+       * on a real repository, and it is not something a model should be trusted to count.
+       */
+      const importersByFile = new Map<string, Set<string>>();
+      for (const edge of graph.edges) {
+        if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) continue;
+        const bucket = importersByFile.get(edge.to) ?? new Set<string>();
+        bucket.add(edge.from);
+        importersByFile.set(edge.to, bucket);
+      }
+      const directoryOf = (fileId: string) => {
+        const slash = fileId.lastIndexOf("/");
+        return slash === -1 ? "" : fileId.slice(0, slash);
+      };
+      const declaredEntryPoints = new Set((ctx.prior.entryPoints ?? []).map((entry) => entry.fileId));
+      const entryProbable = (fileId: string): boolean => {
+        if (declaredEntryPoints.has(fileId)) return true;
+        const own = directoryOf(fileId);
+        for (const importer of importersByFile.get(fileId) ?? []) {
+          if (directoryOf(importer) !== own) return true;
+        }
+        return false;
+      };
+
       // The result the agents read. Assembled from the PRIOR slices, so the fan-out sees exactly
       // what the pipeline has produced so far and cannot reach for anything else.
       const result = {
@@ -94,6 +126,8 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
         graph,
         metrics,
       } as unknown as FanOutDeps["result"];
+      /** The same frozen view the lanes are grounded against — one source, not two. */
+      const resultForLanes = result;
 
       // Keyed by SHA + provider/model + the community partition, because a different partition is a
       // different fan-out even at the same commit — serving the old synthesis would be serving an
@@ -143,7 +177,20 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
 
       return finish(fanOut.synthesis, { cached: false, fanOut });
 
-      function finish(synthesis: Synthesis, meta: { cached: boolean; fanOut: FanOutResult | null }): StageResult<"aiSynthesis"> {
+      function finish(
+        synthesis: Synthesis,
+        meta: { cached: boolean; fanOut: FanOutResult | null },
+      ): StageResult<"aiSynthesis" | "aiDomains"> {
+        // The projection of the fan-out's knowledge base — the ONLY durable trace of what five
+        // specialists found. Absent on a cache hit, deliberately: the cached unit is the synthesis,
+        // and inventing lanes to go with it would be presenting inference nobody produced this run.
+        const domains = meta.fanOut
+          ? buildDomainLanes({
+              knowledgeBase: meta.fanOut.knowledgeBase,
+              result: resultForLanes,
+              isEntryProbable: entryProbable,
+            })
+          : undefined;
         const summary = meta.fanOut ? summarizeBlackboard(meta.fanOut.blackboard) : null;
         const event: ProgressEvent = {
           jobId: input.jobId,
@@ -209,7 +256,7 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
           ...(meta.fanOut?.usage ? { usage: meta.fanOut.usage } : {}),
           emittedAt: new Date(now()).toISOString(),
         };
-        return { partial: { aiSynthesis: synthesis }, event };
+        return { partial: { aiSynthesis: synthesis, ...(domains && domains.length > 0 ? { aiDomains: domains } : {}) }, event };
       }
     },
   };
