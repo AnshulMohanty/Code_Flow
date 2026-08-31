@@ -20,6 +20,7 @@ import type {
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
 import { computeLayers, describeSchedule, STAGE_READS } from "./schedule.js";
+import { createSpeculator, isSpeculationSource, type SpeculationStats, type Speculator } from "./speculation.js";
 import { deriveIssues } from "./issues.js";
 import { deriveSummary } from "./summary.js";
 
@@ -74,12 +75,42 @@ export interface RunPipelineOptions {
    * hatch costs one line.
    */
   schedule?: "sequential" | "layered";
+  /**
+   * Speculative prefetch (V3-P5 task 1 — wired V3-FINAL). Default ON.
+   *
+   * WHAT IT DOES. Once a stage's declared reads are satisfied but before the stage runs, the
+   * orchestrator asks that stage (if it implements `StageSpeculationSource`) what it will want, and
+   * launches those tasks in the background. The stage then `claim()`s them when it runs. On this
+   * pipeline the one that pays for itself is RAG's chunk plan: a pure disk+CPU pass over every
+   * source file, which becomes computable the moment `connect` lands and is otherwise paid AFTER
+   * `synthesize` has finished waiting on a provider. Computing it during that wait costs wall-clock
+   * nothing.
+   *
+   * WHY IT IS SAFE TO DEFAULT ON, where layered scheduling is not. A speculation is the SAME
+   * function over the SAME inputs — the staged value is byte-identical to the one the stage would
+   * have computed, which a test asserts by running both ways and comparing the slice. And nothing
+   * unvalidated can leak: staged values reach the shared cache only through `commit()`, and only for
+   * keys a stage actually asked for. A run that fails rolls back and the cache never sees them.
+   *
+   * `false` turns it off entirely — no speculator is created, `ctx.speculator` is absent, and every
+   * stage computes its own inputs exactly as it did before.
+   */
+  speculate?: boolean;
 }
 
 export interface PipelineRunResult {
   result: AnalysisResult;
   /** True when Ingest found a cached analysis and short-circuited the run. */
   cached: boolean;
+  /**
+   * What speculation actually did, when it ran. Absent when `speculate: false` or on a cache
+   * short-circuit (nothing was speculated).
+   *
+   * `hitRate` is the number that decides whether speculating is worth doing at all: a rate near zero
+   * means the prediction is wrong and the CPU is being burned for nothing. Reported rather than
+   * assumed, because a latency feature nobody measures is a latency feature nobody can retire.
+   */
+  speculation?: SpeculationStats;
 }
 
 const SLICE_VERSION = 1;
@@ -119,13 +150,25 @@ export async function runPipeline(
   const records: StageRunRecord[] = [];
   const warnings: string[] = [];
 
+  const cache = options.cache ?? createMemoryCache();
+  // Created here, not per stage: staging is per RUN, and a speculator per stage could not stage a
+  // value for a LATER stage — which is the only kind of speculation this pipeline has.
+  //
+  // maxConcurrent 1, deliberately below the module default of 3. The declared task on this pipeline
+  // is a full disk+CPU pass over the repository, and running two of those beside `connect` (which is
+  // itself parse-bound) would take CPU from the critical path to save time off it. Speculation must
+  // never starve the work it is trying to speed up.
+  const speculator: Speculator | null =
+    options.speculate === false ? null : createSpeculator({ cache, maxConcurrent: 1, logger });
+
   const ctx: PipelineContext = {
     prior: {},
-    cache: options.cache ?? createMemoryCache(),
+    cache,
     budget: options.budget,
     logger,
     signal: signal ?? new AbortController().signal,
     emit,
+    ...(speculator ? { speculator } : {}),
   };
 
   /** Real elapsed span per layered stage, captured at launch (see the consume path). */
@@ -154,6 +197,10 @@ export async function runPipeline(
       logger.info("Cache full hit (pre-ingest); returning cached result, no stages run.", {
         commitSha: input.requestedCommitSha,
       });
+      // Nothing has been speculated yet (no stage has run), but rolling back is unconditional rather
+      // than conditional on that staying true — a future reordering must not be able to leak a
+      // staged value into the cache on a path that ran no stages.
+      speculator?.rollback();
       return { result: decision.result, cached: true };
     }
     if (decision.action === "ai-retry") {
@@ -245,6 +292,55 @@ export async function runPipeline(
     }
   };
 
+  /** Stage ids whose speculations have already been launched — never speculate the same twice. */
+  const speculated = new Set<PipelineStageId>();
+
+  /**
+   * Launch the declared speculations of every stage that COULD run but has not started.
+   *
+   * "Could run but has not started" is the whole window, and it is why this lives in the
+   * orchestrator: it is the only place that knows both facts. Called in sequential mode as well as
+   * layered — and sequential is where it matters most, because there `rag` runs strictly AFTER
+   * `synthesize` has finished waiting on a provider, so the wait is entirely unused.
+   */
+  const launchSpeculations = () => {
+    if (!speculator) return;
+    if (aborted || signal?.aborted || deterministicFailed) return;
+    for (const candidate of stages) {
+      if (speculated.has(candidate.id) || settled.has(candidate.id)) continue;
+      if (coveredStageIds.has(candidate.id)) continue;
+      // Already in flight (layered) ⇒ the window has closed; it is computing the thing itself now.
+      if (launched.has(candidate.id)) continue;
+      // Ingest MUTATES ctx, so it cannot be speculated for — same reason it is never launched.
+      if (candidate.id === "ingest") continue;
+      if (!isSpeculationSource(candidate)) continue;
+      if (!readyToLaunch(candidate)) continue;
+
+      speculated.add(candidate.id);
+      let tasks;
+      try {
+        tasks = candidate.speculations({
+          // The SAME snapshot the stage will receive, so a speculation cannot be computed from
+          // slices the stage itself will not see.
+          prior: { ...slices },
+          ...(ctx.repoPath !== undefined ? { repoPath: ctx.repoPath } : {}),
+          ...(ctx.commitSha !== undefined ? { commitSha: ctx.commitSha } : {}),
+        });
+      } catch (error) {
+        // A declaration that throws is a non-event, like a failed speculation: this is an
+        // optimisation asking a question, and it must not be able to fail the run.
+        logger.warn(`Speculation declaration for stage "${candidate.id}" threw (ignored).`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      for (const task of tasks) speculator.speculate(task);
+      if (tasks.length > 0) {
+        logger.info(`Speculating ${tasks.length} task(s) for stage "${candidate.id}": ${tasks.map((task) => task.label).join(", ")}`);
+      }
+    }
+  };
+
   for (let i = 0; i < stages.length; i++) {
     const stage = stages[i];
     const stageIndex = i + 1;
@@ -317,6 +413,7 @@ export async function runPipeline(
       // launched stage gets its OWN ctx with its own frozen `prior` — never the shared mutable one,
       // or reaching the next stage would reassign `ctx.prior` while an earlier one was mid-await.
       launchReady();
+      launchSpeculations();
 
       const pending = launched.get(stage.id);
       let stageResult: StageResultLike;
@@ -374,6 +471,9 @@ export async function runPipeline(
         const decision = decideCacheAction(cached, stages);
         if (decision.action === "full-hit") {
           logger.info("Cache full hit (post-ingest); short-circuiting the pipeline.", { commitSha: ctx.commitSha });
+          // ROLLBACK, not commit: a full hit means no stage will run, so nothing staged was ever
+          // validated. Committing here would write an unclaimed guess into the shared cache.
+          speculator?.rollback();
           return { result: decision.result, cached: true };
         }
         if (decision.action === "ai-retry") {
@@ -394,6 +494,7 @@ export async function runPipeline(
       // Now that this stage's slice is assigned AND the cache decision has settled, anything whose
       // reads are satisfied can start — while this loop moves on to the next declared stage.
       launchReady();
+      launchSpeculations();
     } catch (error) {
       const durationMs = layerDurations.get(stage.id) ?? now() - startedAt;
       const message = error instanceof Error ? error.message : "Unknown stage error.";
@@ -453,8 +554,26 @@ export async function runPipeline(
     completedAt: iso(now()),
   };
 
+  // --- Settle speculation -----------------------------------------------------
+  // COMMIT promotes only what a stage actually claimed; everything else is discarded. On a failed or
+  // aborted run, ROLLBACK: nothing was validated by a real request, so nothing may reach the shared
+  // cache. That asymmetry is the whole point of the staging layer — a wrong guess costs the CPU it
+  // used and nothing else.
+  let speculation: SpeculationStats | undefined;
+  if (speculator) {
+    speculation =
+      deterministicFailed || aborted ? speculator.rollback() : await speculator.commit();
+    if (speculation.launched > 0) {
+      logger.info(
+        `Speculation: ${speculation.hits}/${speculation.launched} claimed ` +
+          `(hit rate ${(speculation.hitRate * 100).toFixed(0)}%), ${speculation.discarded} discarded, ` +
+          `${speculation.failed} failed.`,
+      );
+    }
+  }
+
   const result = assembleResult(input, ctx, slices, runSummary, warnings, now);
-  return { result, cached: false };
+  return { result, cached: false, ...(speculation ? { speculation } : {}) };
 }
 
 /**

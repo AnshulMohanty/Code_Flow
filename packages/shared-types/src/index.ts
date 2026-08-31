@@ -1082,6 +1082,31 @@ export interface PipelineContext {
   /** Optional interim progress (e.g. "parsed 200/5000"). The canonical, terminal
    *  event for a stage is the one returned in StageResult. */
   emit?(event: ProgressEvent): void;
+  /**
+   * Speculative prefetch, if the orchestrator is running one (V3-P5 task 1, wired V3-FINAL).
+   *
+   * A stage that DECLARED a speculation asks for it back here. Absent ⇒ speculation is off for this
+   * run, and a stage must behave exactly as it did before — computing the thing itself.
+   *
+   * Narrowed to `claim` on purpose. A stage has no business promoting or discarding a speculation:
+   * `commit()`/`rollback()` decide what reaches the shared cache, and that decision belongs to
+   * whoever owns the run, not to one of its stages. Widening this to the full `Speculator` would let
+   * a stage write an unvalidated entry into the cache, which is the one hazard the staging layer
+   * exists to prevent.
+   */
+  speculator?: SpeculationClaim;
+}
+
+/**
+ * The half of a speculator a STAGE is allowed to touch: ask for a staged value by key.
+ *
+ * Structural, and declared here rather than imported, because `PipelineContext` lives in
+ * shared-types while the speculator implementation lives in `@codeflow/analyzers` — and
+ * shared-types depends on nothing. `Speculator` satisfies this without declaring that it does.
+ */
+export interface SpeculationClaim {
+  /** The staged value for `key`, or null when nothing was staged (or it failed). */
+  claim<T>(key: string): Promise<T | null>;
 }
 
 /** What a stage returns: the slice(s) it owns + its terminal progress event. */

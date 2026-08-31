@@ -790,3 +790,122 @@ describe("runLatencyBench — the four tiers, measured end to end", () => {
     expect(report.notes.join(" ")).toMatch(/not sampled/);
   }, 30_000);
 });
+
+describe("createSpeculator — the bound must not turn a hit into a miss (fixed V3-FINAL)", () => {
+  function memCache(): AnalysisCacheHandle & { store: Map<string, unknown> } {
+    const store = new Map<string, unknown>();
+    return {
+      store,
+      async get<T = unknown>(key: string) {
+        return store.has(key) ? (store.get(key) as T) : null;
+      },
+      async set<T = unknown>(key: string, value: T) {
+        store.set(key, value);
+      },
+    };
+  }
+
+  it("claims a task still WAITING on the concurrency bound, instead of reporting a miss", async () => {
+    // The bug wiring this up exposed: `staged` was populated when `pump()` dequeued a task, so
+    // anything past the bound was invisible to `claim`. The caller got null, recomputed the work
+    // itself, and the queued task ran anyway and was discarded — a miss PLUS a duplicate.
+    let computed = 0;
+    const speculator = createSpeculator({ cache: memCache(), maxConcurrent: 1 });
+    for (let i = 0; i < 4; i++) {
+      speculator.speculate({
+        key: `k${i}`,
+        label: `k${i}`,
+        compute: async () => {
+          computed += 1;
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          return `v${i}`;
+        },
+      });
+    }
+    // k3 was queued behind three others, and must still resolve to its value.
+    expect(await speculator.claim<string>("k3")).toBe("v3");
+    const stats = await speculator.commit();
+    expect(stats.hits).toBe(1);
+    // Fewer than 4 ran, and that is CORRECT rather than a shortfall: `commit()` drains the queue,
+    // so an unclaimed task nobody will ever read is never started. Speculation that kept computing
+    // after the run decided what it wanted would be burning the CPU it is supposed to be sparing.
+    expect(computed).toBeLessThan(4);
+    expect(computed).toBeGreaterThanOrEqual(2); // the first one plus the claimed one
+  });
+
+  it("DRAINS the queue on settle, so an unclaimed queued task is never started at all", async () => {
+    let computed = 0;
+    const speculator = createSpeculator({ cache: memCache(), maxConcurrent: 1 });
+    for (let i = 0; i < 5; i++) {
+      speculator.speculate({
+        key: `k${i}`,
+        label: `k${i}`,
+        compute: async () => {
+          computed += 1;
+          await new Promise((resolve) => setTimeout(resolve, 2));
+          return i;
+        },
+      });
+    }
+    speculator.rollback();
+    const startedByRollback = computed;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Nothing new started after the rollback: the drain is real, not merely a cleared map.
+    expect(computed).toBe(startedByRollback);
+    expect(computed).toBeLessThan(5);
+  });
+
+  it("every claim resolves even when the queue is deeper than the bound", async () => {
+    const speculator = createSpeculator({ cache: memCache(), maxConcurrent: 2 });
+    for (let i = 0; i < 6; i++) {
+      speculator.speculate({ key: `k${i}`, label: `k${i}`, compute: async () => i });
+    }
+    const values = [];
+    for (let i = 0; i < 6; i++) values.push(await speculator.claim<number>(`k${i}`));
+    expect(values).toEqual([0, 1, 2, 3, 4, 5]);
+    const stats = await speculator.commit();
+    expect(stats.hits).toBe(6);
+    expect(stats.discarded).toBe(0);
+  });
+
+  it("a CLAIM jumps the queue, because a claim is proof the guess was right", async () => {
+    const order: string[] = [];
+    const speculator = createSpeculator({ cache: memCache(), maxConcurrent: 1 });
+    const slow = (key: string) => ({
+      key,
+      label: key,
+      compute: async () => {
+        order.push(key);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        return key;
+      },
+    });
+    speculator.speculate(slow("first"));
+    speculator.speculate(slow("second"));
+    speculator.speculate(slow("wanted"));
+    // "first" is already running; of the two still queued, the claimed one runs next.
+    expect(await speculator.claim<string>("wanted")).toBe("wanted");
+    expect(order.indexOf("wanted")).toBeLessThan(order.indexOf("second"));
+  });
+
+  it("still HONOURS the bound for a claimed task — the guarantee is not bypassed", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const speculator = createSpeculator({ cache: memCache(), maxConcurrent: 2 });
+    for (let i = 0; i < 6; i++) {
+      speculator.speculate({
+        key: `k${i}`,
+        label: `k${i}`,
+        compute: async () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 3));
+          inFlight -= 1;
+          return i;
+        },
+      });
+    }
+    await Promise.all(Array.from({ length: 6 }, (_, i) => speculator.claim(`k${i}`)));
+    expect(peak).toBeLessThanOrEqual(2);
+  });
+});

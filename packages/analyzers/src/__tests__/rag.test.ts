@@ -662,3 +662,109 @@ describe("rag — index homogeneity (mismatched embedding space ⇒ rebuild, not
     expect(result.ai?.rag?.embeddingDim).toBe(768);
   });
 });
+
+describe("rag — SPECULATIVE chunk plan (V3-P5 task 1, wired V3-FINAL)", () => {
+  /** The real stage set, with the real RAG stage — so these assertions are about production code. */
+  function realStages(embed: EmbeddingClient) {
+    const graph = graphFor(GRAPH_NODE_IDS);
+    const connect = fakeStage("connect", "graph", { graph });
+    const struct = fakeStage("map-structure", "structure", { structure });
+    const inv = fakeStage("inventory", "inventory", { inventory });
+    const cloner: RepoCloner = { clone: async () => ({ repoPath: "/repo", commitSha: "sha-1" }) };
+    const ingest = createIngestStage({ cloner, now: () => 1 });
+    const synth = createSynthesizeStage({ client: goodLlm(), now: () => 1 });
+    const readFile = fakeReadFile();
+    const rag = createRagStage({ client: embed, ...storesFor(embed), readFile, now: () => 1 });
+    return { stages: [ingest, struct.stage, inv.stage, connect.stage, synth, rag], readFile };
+  }
+
+  it("builds the plan ONCE — the stage claims the speculation instead of rebuilding", async () => {
+    const embed = mockEmbedClient();
+    const { stages, readFile } = realStages(embed);
+    const { result, speculation } = await runPipeline(stages, input, { now: makeClock(), cache: memCache() });
+
+    expect(result.ai?.rag).toBeDefined();
+    expect(speculation).toMatchObject({ launched: 1, hits: 1, failed: 0, hitRate: 1 });
+    // The whole point: the disk pass happened once, during synthesis, not twice.
+    const readsOfA = readFile.mock.calls.filter((call) => call[1] === "src/a.ts").length;
+    expect(readsOfA).toBe(1);
+  });
+
+  it("reports it on the stage event, distinctly from a CACHE hit", async () => {
+    // A cache hit means an EARLIER RUN produced the plan; speculation means THIS run produced it
+    // early. Different latency facts, so they are different fields.
+    const embed = mockEmbedClient();
+    const events: ProgressEvent[] = [];
+    const { stages } = realStages(embed);
+    await runPipeline(stages, input, { now: makeClock(), cache: memCache(), emit: (event) => events.push(event) });
+    const ragEvent = events.find((event) => event.stage === "rag" && event.status === "completed");
+    expect(ragEvent?.preview?.planFromSpeculation).toBe(true);
+    expect(ragEvent?.preview?.planFromCache).toBe(false);
+    expect(ragEvent?.detail).toContain("prefetched during synthesis");
+  });
+
+  it("produces a BYTE-IDENTICAL rag slice with and without speculation", async () => {
+    // The invariant. Same function, same frozen prior slices — so the staged plan cannot differ from
+    // the one the stage would have built. Asserted rather than argued, because this is the
+    // deterministic spine's neighbourhood and "should be identical" is not evidence.
+    const withSpec = await runPipeline(realStages(mockEmbedClient()).stages, input, {
+      now: makeClock(),
+      cache: memCache(),
+    });
+    const withoutSpec = await runPipeline(realStages(mockEmbedClient()).stages, input, {
+      now: makeClock(),
+      cache: memCache(),
+      speculate: false,
+    });
+    expect(JSON.stringify(withSpec.result.ai?.rag)).toBe(JSON.stringify(withoutSpec.result.ai?.rag));
+  });
+
+  it("still GROUNDS a claimed plan against the graph — not trusted because it came from us", async () => {
+    // src/orphan.ts is a real source file that is NOT a graph node. It must be dropped whether the
+    // plan came from disk, from the cache, or from a speculation.
+    const embed = mockEmbedClient();
+    const { stages } = realStages(embed);
+    const { result } = await runPipeline(stages, input, { now: makeClock(), cache: memCache() });
+    expect(result.ai?.rag?.chunks.some((chunk) => chunk.fileId === "src/orphan.ts")).toBe(false);
+  });
+
+  it("persists the plan to the shared cache BEFORE embedding, exactly as the disk path does", async () => {
+    // The guarantee that line exists for: a mid-embed failure must leave a reusable plan behind.
+    const cache = memCache();
+    const failing: EmbeddingClient = {
+      provider: "voyage",
+      model: "mock-embed",
+      dimension: 4,
+      async embed() {
+        throw new Error("voyage down");
+      },
+    };
+    const { stages } = realStages(failing);
+    const { result } = await runPipeline(stages, input, { now: makeClock(), cache });
+    expect(result.pipeline?.status).toBe("partial");
+    expect(await cache.get("rag/v2/sha-1")).not.toBeNull();
+  });
+
+  it("declares NOTHING when there is no working tree — a no-clone retry has nothing to prefetch", async () => {
+    // Staging something the stage would not claim is the failure `hitRate` exists to expose, so the
+    // declaration returns [] rather than guessing.
+    const embed = mockEmbedClient();
+    const rag = createRagStage({ client: embed, ...storesFor(embed), readFile: fakeReadFile(), now: () => 1 });
+    const declared = (rag as unknown as { speculations(context: unknown): unknown[] }).speculations({
+      prior: { graph: graphFor(GRAPH_NODE_IDS), structure },
+      commitSha: "sha-1",
+    });
+    expect(declared).toEqual([]);
+  });
+
+  it("declares NOTHING before the graph slice exists", async () => {
+    const embed = mockEmbedClient();
+    const rag = createRagStage({ client: embed, ...storesFor(embed), readFile: fakeReadFile(), now: () => 1 });
+    const declared = (rag as unknown as { speculations(context: unknown): unknown[] }).speculations({
+      prior: { structure },
+      repoPath: "/repo",
+      commitSha: "sha-1",
+    });
+    expect(declared).toEqual([]);
+  });
+});

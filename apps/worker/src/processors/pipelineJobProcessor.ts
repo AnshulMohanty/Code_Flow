@@ -315,7 +315,7 @@ export async function runAnalysisJob(
         }),
       );
     }
-    const { result: ranResult, cached } = await runPipeline(stages, input, {
+    const { result: ranResult, cached, speculation } = await runPipeline(stages, input, {
       emit: (event) => {
         // Spans are derived from the EXISTING progress events rather than by instrumenting each
         // stage: the events already carry stage, status, duration and a preview, so a second
@@ -345,6 +345,20 @@ export async function runAnalysisJob(
       now,
       ...(deps.parallelStages ? { schedule: "layered" as const } : {}),
     });
+
+    // Speculation onto the run SPAN, so the hit rate is queryable in the trace rather than only
+    // greppable in stdout. This is the number that decides whether the prefetch is worth keeping: a
+    // rate near zero means the prediction is wrong and the CPU is being burned for nothing.
+    if (speculation && speculation.launched > 0) {
+      runSpan.setAttributes({
+        "speculation.launched": speculation.launched,
+        "speculation.hits": speculation.hits,
+        "speculation.discarded": speculation.discarded,
+        "speculation.failed": speculation.failed,
+        "speculation.hitRate": speculation.hitRate,
+      });
+      runSpan.addEvent("speculation", { claimed: speculation.labels.hit.join(", ") || "(none)" });
+    }
 
     // An unconfigured AI stage is recorded on the result itself (warnings, persisted with
     // the analysis) as well as on the job record below, so the omission survives a reload

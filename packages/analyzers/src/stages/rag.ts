@@ -1,4 +1,5 @@
 import type {
+  AnalysisResultSlices,
   FileRole,
   Inventory,
   InventorySymbol,
@@ -26,6 +27,7 @@ import {
 import type { EmbeddingClient, EmbeddingResult } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { embedCacheKey, type CachedEmbedding } from "../rag/embedCache.js";
+import type { StageSpeculationSource } from "../pipeline/speculation.js";
 import { estimateTokens, sumUsage } from "../util/tokens.js";
 
 export interface RagDependencies {
@@ -119,18 +121,71 @@ interface CachedChunkPlan {
  * grounding makes the stage THROW → orchestrator records an AI failure → run "partial"
  * with deterministic + synthesis slices intact.
  */
-export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & StageEmbeddingTarget {
+export function createRagStage(
+  deps: RagDependencies,
+): PipelineStage<"aiRag"> & StageEmbeddingTarget & StageSpeculationSource {
   const now = deps.now ?? Date.now;
   const maxAttempts = deps.maxAttempts ?? 3;
   const maxChunkTokens = deps.maxChunkTokens ?? MAX_CHUNK_TOKENS;
   const windowLines = deps.windowLines ?? WINDOW_CHUNK_LINES;
   const client = deps.client;
 
+  /** Where a plan lives in the shared cache. One definition, used by both the stage and its
+   *  speculation — two string templates would be a silent cache miss waiting to happen. */
+  const planKeyFor = (commitSha: string | undefined) => `rag/${PLAN_CACHE_VERSION}/${commitSha ?? "no-sha"}`;
+
   return {
     id: "rag",
     kind: "ai",
     label: "Indexing for Q&A",
     owns: ["aiRag"],
+
+    /**
+     * SPECULATION (V3-P5 task 1, wired V3-FINAL): build the chunk plan early.
+     *
+     * WHY THIS TASK AND NOT ANOTHER. The plan is a pure disk+CPU pass over every source file —
+     * read, split, interval-cover the symbol spans, sweep the gaps. It costs no money and calls no
+     * provider, which is exactly the rule speculation must obey. And it becomes computable the
+     * moment `connect` lands (it needs graph node ids, structure and inventory), while the stage
+     * that needs it runs LAST — after `synthesize` has spent seconds blocked on a chat provider.
+     * In sequential mode that entire wait is currently unused; here it pays for the plan.
+     *
+     * THE VALUE IS BYTE-IDENTICAL, which is what makes it safe on a deterministic-adjacent path:
+     * same function, same inputs, and the inputs are the FROZEN prior slices the stage itself will
+     * receive. A test runs the pipeline with and without speculation and compares the rag slice.
+     *
+     * Returns [] rather than a task when it cannot honestly stage one — no working tree (a no-clone
+     * AI-only retry, which reads the cache anyway) or a missing slice. Staging something this stage
+     * would not claim is the failure mode `hitRate` exists to expose.
+     */
+    speculations(context) {
+      const prior = context.prior as Partial<AnalysisResultSlices> | undefined;
+      const graph = prior?.graph;
+      const structure = prior?.structure;
+      if (!context.repoPath || !graph || !structure) return [];
+      const nodeIds = new Set(graph.nodes.map((node) => node.id));
+      const inventory = prior?.inventory;
+      const repoPath = context.repoPath;
+      return [
+        {
+          key: planKeyFor(context.commitSha),
+          label: `rag chunk plan (${structure.files.length} file(s))`,
+          async compute(): Promise<CachedChunkPlan> {
+            const built = await buildChunkPlan({
+              repoPath,
+              structure,
+              inventory,
+              nodeIds,
+              readFile: deps.readFile,
+              maxChunkTokens,
+              windowLines,
+            });
+            return { chunks: built.chunks, ...(built.droppedChunks ? { droppedChunks: built.droppedChunks } : {}) };
+          },
+        },
+      ];
+    },
+
     // Exposes the (model, dim) this stage will produce so the orchestrator can reject a
     // cached rag slice from a different embedding space (index homogeneity).
     embeddingTarget: { model: client.model, dim: client.dimension },
@@ -143,14 +198,34 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
       const structure = ctx.prior.structure;
       const inventory = ctx.prior.inventory;
       const nodeIds = new Set(graph.nodes.map((node) => node.id));
-      const planCacheKey = `rag/${PLAN_CACHE_VERSION}/${ctx.commitSha ?? "no-sha"}`;
+      const planCacheKey = planKeyFor(ctx.commitSha);
 
-      // --- Resolve the chunk plan: disk → cache → throw -----------------------
+      // --- Resolve the chunk plan: speculation → disk → cache → throw ---------
       let plan: ChunkPlan[];
       let droppedChunks: Rag["droppedChunks"];
       let fromCache = false;
+      let fromSpeculation = false;
 
-      if (ctx.repoPath) {
+      // CLAIM first. A staged plan is the SAME computation this stage would run next, already done
+      // during `synthesize`'s provider wait — so claiming it is not a shortcut, it is collecting work
+      // already paid for. `claim` awaits an in-flight speculation rather than racing it, which is
+      // what stops the plan from ever being built twice.
+      //
+      // Grounding is deliberately NOT skipped: the claimed plan is re-filtered against `nodeIds`
+      // below exactly like a cached one, because "computed from the same slices" is a strong reason
+      // to expect it to hold and not a reason to stop checking.
+      const staged = ctx.speculator ? await ctx.speculator.claim<CachedChunkPlan>(planCacheKey) : null;
+      if (staged) {
+        plan = staged.chunks.filter((chunk) => nodeIds.has(chunk.fileId));
+        droppedChunks = staged.droppedChunks;
+        fromSpeculation = true;
+        // Still WRITTEN to the shared cache here, unchanged from the non-speculative path. The
+        // orchestrator's `commit()` also promotes this key, so it is one redundant write per run —
+        // paid deliberately, because the alternative is weakening the guarantee this line exists for:
+        // the plan must be persisted BEFORE embedding so it survives a mid-embed failure, and
+        // `commit()` runs at the END of the run.
+        await ctx.cache.set(planCacheKey, staged);
+      } else if (ctx.repoPath) {
         if (!structure) {
           throw new Error("RAG requires the structure slice; Map-structure must run first.");
         }
@@ -266,7 +341,7 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
           deps.vectorStore.id
         }${droppedChunks ? `, ${droppedChunks.count} ungrounded dropped` : ""}${
           fromCache ? ", plan reused from cache" : ""
-        }.`,
+        }${fromSpeculation ? ", plan prefetched during synthesis" : ""}.`,
         progress: 0,
         startedAt: new Date(startedAt).toISOString(),
         durationMs: now() - startedAt,
@@ -275,6 +350,10 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
           embeddingModel: client.model,
           droppedChunks: droppedChunks?.count ?? 0,
           planFromCache: fromCache,
+          // Distinct from `planFromCache`: a cache hit means an EARLIER RUN produced the plan, while
+          // this means THIS run produced it early, during a wait it was going to spend anyway. They
+          // are different facts about latency and collapsing them would hide which one happened.
+          planFromSpeculation: fromSpeculation,
           vectorStore: deps.vectorStore.id,
         },
         emittedAt: new Date(now()).toISOString(),

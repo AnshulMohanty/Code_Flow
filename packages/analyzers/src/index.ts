@@ -38,10 +38,12 @@ export {
 } from "./pipeline/warmup.js";
 export {
   createSpeculator,
+  isSpeculationSource,
   type SpeculationStats,
   type SpeculationTask,
   type Speculator,
   type SpeculatorOptions,
+  type StageSpeculationSource,
 } from "./pipeline/speculation.js";
 export {
   createRoutedLlmClient,
