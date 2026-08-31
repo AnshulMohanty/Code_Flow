@@ -1,3 +1,4 @@
+import { citationInRetrieved } from "@codeflow/arena";
 import type { ScoredCoords } from "./score.js";
 import type { RagAnswer, RagAnswerCitation } from "@codeflow/analyzers";
 import type { RagEvalQuestion } from "./dataset.js";
@@ -78,7 +79,11 @@ export function scoreAnswer(
   // A citation is VALID when its (fileId, startLine..endLine) falls inside a chunk that was
   // actually RETRIEVED. Production already grounds citations to file+line before they reach
   // here, so this is the independent check that the grounding held — not a duplicate of it.
-  const valid = citations.filter((citation) => containedInRetrieved(retrieved, citation));
+  // ONE definition of the rule, shared with `@codeflow/arena` (V3-FINAL). This file used to carry
+  // its own copy — the exact duplicate V3-P0's verifier wrappers were built to remove, which
+  // survived because a `Verifier` is async and `scoreAnswer` is a synchronous pure function. The
+  // shareable thing turned out to be the PREDICATE, not the wrapper.
+  const valid = citations.filter((citation) => citationInRetrieved(retrieved, citation));
 
   const citedFiles = [...new Set(citations.map((citation) => citation.fileId))];
   const relevantCited = citedFiles.filter((fileId) => expectedFiles.has(fileId));
@@ -101,16 +106,6 @@ export function scoreAnswer(
     droppedCitations: answer.droppedCitations?.count ?? 0,
     refusalJustified,
   };
-}
-
-/** Does this citation's file + line span sit inside a chunk the answer actually retrieved? */
-function containedInRetrieved(retrieved: readonly ScoredCoords[], citation: RagAnswerCitation): boolean {
-  return retrieved.some(
-    (chunk) =>
-      chunk.fileId === citation.fileId &&
-      citation.startLine >= chunk.startLine &&
-      citation.endLine <= chunk.endLine,
-  );
 }
 
 /**

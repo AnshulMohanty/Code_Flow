@@ -18,6 +18,33 @@ export const LINE_RANGE_VERIFIER_ID = "grounding.lineRanges";
 export const CITATION_VERIFIER_ID = "grounding.citations";
 
 /**
+ * THE RULE, exported on its own (V3-FINAL): is this citation inside a chunk that was actually
+ * retrieved?
+ *
+ * WHY THE PREDICATE AND NOT JUST THE VERIFIER. V3-P0 wrapped these three passes so "the eval and the
+ * Arena stop needing their own copies" — and then the eval kept its own copy anyway, because
+ * `Verifier.verify` is ASYNC and `scoreAnswer` is a synchronous pure function. The wrapper was the
+ * wrong shape to share, so the duplicate survived and the stated benefit never arrived.
+ *
+ * A verifier is an async, sandbox-aware, reward-shaped envelope AROUND a rule. The RULE is a pure
+ * predicate. Exporting the predicate is what actually lets two callers share one definition: the
+ * verifier below uses it, and `@codeflow/eval`'s `scoreAnswer` now uses it too.
+ */
+export function citationInRetrieved(
+  retrieved: ReadonlyArray<{ fileId: string; startLine: number; endLine: number }>,
+  citation: { fileId: string; startLine?: number; endLine?: number },
+): boolean {
+  return retrieved.some(
+    (chunk) =>
+      chunk.fileId === citation.fileId &&
+      // An absent line bound means the citation claims the whole file, which a chunk of that file
+      // satisfies. A citation with lines must sit INSIDE the chunk's span.
+      (citation.startLine === undefined || citation.startLine >= chunk.startLine) &&
+      (citation.endLine === undefined || citation.endLine <= chunk.endLine),
+  );
+}
+
+/**
  * PASS 1 — every claimed fileId must be a real graph node.
  *
  * The failure it catches: a model inventing a plausible path (`src/services/authService.ts`)
@@ -117,15 +144,7 @@ export function createCitationVerifier(
     supports: () => true,
     async verify(_task: TaskSpec, output: AgentOutput): Promise<VerificationResult> {
       const citations = output.citations ?? [];
-      const outside = citations.filter(
-        (citation) =>
-          !retrievedChunks.some(
-            (chunk) =>
-              chunk.fileId === citation.fileId &&
-              (citation.startLine === undefined || citation.startLine >= chunk.startLine) &&
-              (citation.endLine === undefined || citation.endLine <= chunk.endLine),
-          ),
-      );
+      const outside = citations.filter((citation) => !citationInRetrieved(retrievedChunks, citation));
       const score = citations.length === 0 ? 1 : (citations.length - outside.length) / citations.length;
       return {
         verifierId: CITATION_VERIFIER_ID,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ScoredCoords } from "../score.js";
 import type { RagAnswer } from "@codeflow/analyzers";
+import { citationInRetrieved, createCitationVerifier } from "@codeflow/arena";
 import { aggregateAnswers, scoreAnswer } from "../answerScore.js";
 import {
   calibrateJudge,
@@ -266,5 +267,81 @@ describe("parseJudgeVerdict", () => {
     // the judge's mistake.
     expect(() => parseJudgeVerdict("not json")).toThrow();
     expect(() => parseJudgeVerdict('{"rationale":"forgot the number"}')).toThrow(/faithfulness/);
+  });
+});
+
+describe("citation validity uses the ARENA's rule, not a private copy (V3-FINAL)", () => {
+  // V3-P0 wrapped the three grounding passes as verifiers so "the eval and the Arena stop needing
+  // their own copies". The eval kept its copy anyway -- `Verifier.verify` is async and `scoreAnswer`
+  // is a synchronous pure function, so the wrapper was the wrong shape to share. The RULE is now
+  // exported on its own and both callers use it; these assertions pin that they agree.
+
+  const retrieved: ScoredCoords[] = [
+    { id: "c1", fileId: "src/a.ts", startLine: 10, endLine: 20 },
+    { id: "c2", fileId: "src/b.ts", startLine: 1, endLine: 5 },
+  ];
+
+  it("agrees with the Arena verifier on a citation INSIDE a retrieved chunk", async () => {
+    const citation = { fileId: "src/a.ts", startLine: 12, endLine: 15 };
+    expect(citationInRetrieved(retrieved, citation)).toBe(true);
+
+    const verifier = createCitationVerifier(retrieved);
+    const verdict = await verifier.verify(
+      { id: "t", kind: "who-calls", question: "q", repo: { provider: "github", name: "r" }, commitSha: "a".repeat(40) } as never,
+      { answer: "a", citations: [citation] } as never,
+      {} as never,
+    );
+    expect(verdict.passed).toBe(true);
+  });
+
+  it("agrees on a citation OUTSIDE every retrieved chunk", async () => {
+    const citation = { fileId: "src/a.ts", startLine: 40, endLine: 45 };
+    expect(citationInRetrieved(retrieved, citation)).toBe(false);
+
+    const verifier = createCitationVerifier(retrieved);
+    const verdict = await verifier.verify(
+      { id: "t", kind: "who-calls", question: "q", repo: { provider: "github", name: "r" }, commitSha: "a".repeat(40) } as never,
+      { answer: "a", citations: [citation] } as never,
+      {} as never,
+    );
+    expect(verdict.passed).toBe(false);
+  });
+
+  it("scoreAnswer's validity is computed from that same rule", () => {
+    const scored = scoreAnswer(
+      { id: "q1", question: "q", expectedFiles: ["src/a.ts"] } as never,
+      {
+        answer: "grounded",
+        answered: true,
+        // One inside a retrieved chunk, one outside it.
+        citations: [
+          { fileId: "src/a.ts", startLine: 12, endLine: 15 },
+          { fileId: "src/a.ts", startLine: 40, endLine: 45 },
+        ],
+        retrievedChunkIds: ["c1"],
+      } as never,
+      retrieved,
+    );
+    expect(scored.citationValidity).toBe(0.5);
+  });
+
+  it("keeps the eval's OWN zero-citation policy, which the verifier deliberately does not have", () => {
+    // The Arena scores a citation-free output 1 (it invented nothing). The eval distinguishes an
+    // ANSWER that cited nothing (0 -- it claimed something with no evidence) from a REFUSAL (1 --
+    // citing nothing is correct there). That difference is the eval's job, not the rule's, which is
+    // why only the predicate is shared.
+    const answered = scoreAnswer(
+      { id: "q1", question: "q", expectedFiles: ["src/a.ts"] } as never,
+      { answer: "confident", answered: true, citations: [], retrievedChunkIds: [] } as never,
+      retrieved,
+    );
+    expect(answered.citationValidity).toBe(0);
+
+    const refused = scoreAnswer(
+      { id: "q1", question: "q", expectedFiles: ["src/a.ts"] } as never,
+      { answer: "cannot answer", answered: false, citations: [], retrievedChunkIds: [] } as never,
+      retrieved,
+    );
+    expect(refused.citationValidity).toBe(1);
   });
 });
