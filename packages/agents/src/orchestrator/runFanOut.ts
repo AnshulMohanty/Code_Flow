@@ -13,6 +13,7 @@ import type {
 } from "./contracts.js";
 import { SPECIALIST_IDS } from "./contracts.js";
 import { planRouting } from "./routing.js";
+import { consolidateKnowledge } from "./consolidate.js";
 import {
   buildSpecialistPrompt,
   buildSpecialistTask,
@@ -83,6 +84,12 @@ export interface FanOutDeps {
    * make best-of-N unaffordable and unreproducible at once.
    */
   scoreCandidate?: (findings: readonly SpecialistFinding[], task: SpecialistTask) => number;
+  /**
+   * ISO timestamp stamped on the consolidated knowledge base. Supplied rather than read from a
+   * clock, so a fan-out driven by an injected clock stays fully reproducible — the same rule
+   * `snapshotOf` and `consolidateKnowledge` follow.
+   */
+  capturedAt?: string;
 }
 
 export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
@@ -91,6 +98,9 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
   const maxConcurrency = Math.max(1, deps.maxConcurrency ?? FANOUT_MAX_CONCURRENCY);
   const scoreCandidate = deps.scoreCandidate ?? createGroundingScorer();
   const warnings: string[] = [];
+  // Deliberately NOT `new Date()` when unset: a fixed sentinel keeps an un-stamped run reproducible
+  // instead of silently making every KB differ. A caller that wants a real timestamp passes one.
+  const capturedAt = deps.capturedAt ?? "1970-01-01T00:00:00.000Z";
 
   if (clusters.length === 0) {
     // No communities ⇒ nothing to fan out over. Honest rather than clever: the deterministic
@@ -108,6 +118,10 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
       bestOfNExtraCalls: 0,
       supervisorContext: meterContext({ instructions: "", retrieval: "", memory: "", tools: "", transcript: "", question: "" }),
       supervised: false,
+      // Still built, and it is not empty: the deterministic FACTS and the FAQ come from the graph,
+      // so a repository with no communities still gets a usable KB. Returning nothing here would
+      // make "no communities" look like "consolidation failed".
+      knowledgeBase: consolidateKnowledge({ result: deps.result, blackboard: board, capturedAt }),
       warnings,
     };
   }
@@ -325,6 +339,7 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
     bestOfNExtraCalls,
     supervisorContext: supervisorPrompt.context,
     supervised,
+    knowledgeBase: consolidateKnowledge({ result: deps.result, blackboard: board, capturedAt }),
     warnings,
   };
 }

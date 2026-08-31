@@ -78,6 +78,25 @@ export {
   type BlackboardSummary,
 } from "./orchestrator/blackboard.js";
 export { complexityOf, planRouting, type ComplexitySignals, type RoutingPlan } from "./orchestrator/routing.js";
+// V3-P5 task 6 — OFFLINE CONSOLIDATION. Extractive, deterministic, no provider: it compresses the
+// findings the fan-out already paid for into a compact queryable repo KB.
+export {
+  consolidateKnowledge,
+  queryKnowledgeBase,
+  renderKnowledgeBase,
+  KB_MAX_COMMUNITIES,
+  KB_MAX_DETAIL_CHARS,
+  KB_MAX_FAQ,
+  KB_MAX_KEY_FILES,
+  KB_MAX_POINTS_PER_COMMUNITY,
+  type CommunityDigest,
+  type ConsolidateInput,
+  type ConsolidatedPoint,
+  type KbHit,
+  type KbQuestion,
+  type RepoFact,
+  type RepoKnowledgeBase,
+} from "./orchestrator/consolidate.js";
 export {
   buildSpecialistPrompt,
   buildSpecialistTask,

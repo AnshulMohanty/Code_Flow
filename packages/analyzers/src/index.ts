@@ -61,6 +61,10 @@ export {
   type LatencyReport,
   type TierSample,
 } from "./bench/latencyTiers.js";
+// The bench RUNNER, separate from the tier arithmetic: the latter is pure and unit tested, this one
+// has to wait for things. Everything slow is injected, so it measures orchestration and never a
+// network (see runLatencyBench.ts).
+export { runLatencyBench, type LatencyBenchDeps } from "./bench/runLatencyBench.js";
 export { countIssues, deriveIssues, type DeriveIssuesInput } from "./pipeline/issues.js";
 export {
   PipelineReasonError,

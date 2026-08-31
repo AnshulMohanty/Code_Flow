@@ -11,6 +11,7 @@ import { createWarmupRegistry } from "../pipeline/warmup.js";
 import { createSpeculator } from "../pipeline/speculation.js";
 import { createRoutedLlmClient, maybeRouted, routeTier } from "../llm/modelRouter.js";
 import { renderLatencyReport, summarizeTiers, timed } from "../bench/latencyTiers.js";
+import { runLatencyBench } from "../bench/runLatencyBench.js";
 import { runPipeline } from "../pipeline/orchestrator.js";
 import type { LlmClient } from "../llm/llmClient.js";
 
@@ -738,3 +739,54 @@ function withoutTimings(result: Awaited<ReturnType<typeof runPipeline>>["result"
       : result.pipeline,
   };
 }
+
+// ── V3-P5 task 1 acceptance: the four tiers, REPORTED, from a hermetic bench ──────────
+
+describe("runLatencyBench — the four tiers, measured end to end", () => {
+  it("samples all four tiers independently and reports the schedule speedup", async () => {
+    // The acceptance for task 1 was four numbers reported INDEPENDENTLY, not one blended figure:
+    // a rise in coreAnalysis is a parser problem, in aiSynthesis a provider or scheduling problem,
+    // and in qaCoreHit a cache that stopped working. One average hides all three.
+    //
+    // 20ms of simulated provider latency per AI call, which is the smallest delay that reliably
+    // exceeds Windows' short-timer clamp -- the same clamp that made a V3-P4 concurrency test flaky.
+    const report = await runLatencyBench({
+      input,
+      stages: () => fullStages({ aiDelayMs: 20 }),
+      async ask({ cached }) {
+        // A cache hit is not merely "fast": it is a different code path, so the bench is TOLD which
+        // one it is measuring rather than inferring it from the duration. Inferring it is how a
+        // broken cache would pass a benchmark.
+        if (!cached) await new Promise((resolve) => setTimeout(resolve, 20));
+        return { answer: "x" };
+      },
+      runs: 3,
+    });
+
+    for (const tier of ["coreAnalysis", "aiSynthesis", "qaCoreHit", "qaGenerate"] as const) {
+      expect(report.tiers[tier], `${tier} must be sampled`).not.toBeNull();
+      expect(report.tiers[tier]!.runs).toBe(3);
+    }
+
+    // The AI tier must reflect the injected provider latency; the deterministic tier must not.
+    expect(report.tiers.aiSynthesis!.median).toBeGreaterThanOrEqual(20);
+    // A cache hit must be dramatically cheaper than a generate. Asserted as a RELATIONSHIP rather
+    // than an absolute, because absolute milliseconds are machine-dependent and a threshold would
+    // make this test fail on a slow CI box for no real reason.
+    expect(report.tiers.qaCoreHit!.median).toBeLessThan(report.tiers.qaGenerate!.median);
+
+    // Layered scheduling must actually beat sequential on the AI layer, or its complexity is not
+    // paying for itself. Ratio, not milliseconds, so the assertion survives a different machine.
+    expect(report.scheduleComparison!.speedup).toBeGreaterThan(1);
+
+    // Printed so the numbers land in the phase log and the engineering log rather than living only
+    // in an assertion.
+    console.log(renderLatencyReport(report));
+  }, 60_000);
+
+  it("says so when Q&A was not sampled, rather than reporting zeros", async () => {
+    const report = await runLatencyBench({ input, stages: () => fullStages({ aiDelayMs: 1 }), runs: 1 });
+    expect(report.tiers.qaGenerate).toBeNull();
+    expect(report.notes.join(" ")).toMatch(/not sampled/);
+  }, 30_000);
+});

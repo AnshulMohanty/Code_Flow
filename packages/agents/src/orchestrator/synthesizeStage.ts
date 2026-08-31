@@ -162,6 +162,19 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
                   failedLenses: summary?.failed ?? 0,
                   hardCommunities: meta.fanOut.routes.filter((route) => route.difficulty === "hard").length,
                   skippedCommunities: meta.fanOut.skippedClusters.length,
+                  // V3-P5 task 6 — the consolidation numbers, on the SAME event rather than a
+                  // separate log line. The blackboard is not persisted, so without this the only
+                  // record that the findings were consolidated at all would be a console write.
+                  // `kbCorroborated` is the one worth watching: it counts findings two independent
+                  // lenses agreed on, which is the strongest signal the fan-out produces.
+                  kbPoints: meta.fanOut.knowledgeBase.reduction.pointsOut,
+                  kbMerged: meta.fanOut.knowledgeBase.reduction.mergedDuplicates,
+                  kbCorroborated: meta.fanOut.knowledgeBase.communities.reduce(
+                    (sum, community) => sum + community.points.filter((point) => point.corroboratedBy.length > 1).length,
+                    0,
+                  ),
+                  kbBytes: meta.fanOut.knowledgeBase.reduction.jsonBytes,
+                  kbFaq: meta.fanOut.knowledgeBase.faq.length,
                 }
               : {}),
           },

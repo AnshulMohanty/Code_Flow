@@ -774,3 +774,45 @@ function slowChat(ms: number) {
     },
   ]);
 }
+
+// ── V3-P5 task 6: the fan-out consolidates its own findings before they are lost ──────
+
+describe("consolidated knowledge base (V3-P5 task 6)", () => {
+  it("is produced by every fan-out run, because the BLACKBOARD is never persisted", () => {
+    // The findings exist only for the duration of the run: the supervisor reads a bounded selection
+    // and the rest is paid for and discarded. Inside the run is the only point at which all of them
+    // are still in hand.
+    return runFanOut({ result: clusteredResult({ clusters: 3 }), chatClient: fanOutChat(), capturedAt: "2026-03-01T00:00:00.000Z" }).then(
+      (run) => {
+        expect(run.knowledgeBase).toBeDefined();
+        expect(run.knowledgeBase.capturedAt).toBe("2026-03-01T00:00:00.000Z");
+        expect(run.knowledgeBase.reduction.findingsIn).toBe(run.blackboard.findings.length);
+      },
+    );
+  });
+
+  it("is still produced with NO communities, from deterministic graph facts alone", async () => {
+    // Otherwise "no communities" would be indistinguishable from "consolidation failed".
+    const single = clusteredResult({ clusters: 0 });
+    const run = await runFanOut({ result: single, chatClient: fanOutChat(), capturedAt: "2026-03-01T00:00:00.000Z" });
+    expect(run.knowledgeBase).toBeDefined();
+    expect(run.knowledgeBase.communities).toEqual([]);
+    // The FAQ still answers something, because the graph facts do not need an agent.
+    expect(run.knowledgeBase.faq.length).toBeGreaterThan(0);
+  });
+
+  it("uses a FIXED sentinel timestamp when none is supplied, keeping a run reproducible", async () => {
+    // `new Date()` here would silently make every KB differ, which is the property the whole
+    // extractive design exists to preserve.
+    const run = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    expect(run.knowledgeBase.capturedAt).toBe("1970-01-01T00:00:00.000Z");
+  });
+
+  it("is COMPACT relative to the blackboard it came from", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 4 }), chatClient: fanOutChat(), capturedAt: "2026-03-01T00:00:00.000Z" });
+    const blackboardBytes = Buffer.byteLength(JSON.stringify(run.blackboard), "utf8");
+    // Not a fixed ratio — that would depend on the fixture. The claim is that consolidation reduces,
+    // and the KB carries its own measurement so the claim is checkable rather than asserted.
+    expect(run.knowledgeBase.reduction.jsonBytes).toBeLessThan(blackboardBytes);
+  });
+});

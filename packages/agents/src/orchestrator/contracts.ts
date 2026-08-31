@@ -1,5 +1,6 @@
 import type { AnalysisResult, RepoCluster, Synthesis } from "@codeflow/shared-types";
 import type { ContextBreakdown } from "../contracts.js";
+import type { RepoKnowledgeBase } from "./consolidate.js";
 
 /**
  * BOUNDED AGENT FAN-OUT (V3-P4) — the orchestrator/worker contracts.
@@ -114,6 +115,20 @@ export interface FanOutResult {
   supervisorContext: ContextBreakdown;
   /** True when the supervisor produced the synthesis; false when a deterministic fallback did. */
   supervised: boolean;
+  /**
+   * The consolidated repository knowledge base (V3-P5 task 6), derived from the blackboard above.
+   *
+   * Produced here rather than left to a caller for a specific reason: the BLACKBOARD is not
+   * persisted, so the findings exist only for the duration of the run. The supervisor reads a
+   * bounded selection of 12 and the rest is paid for and then discarded. Consolidating inside the
+   * run is the only point at which all of them are still in hand.
+   *
+   * Typed as `unknown`-free but declared here rather than in `shared-types` on purpose: it
+   * references `SpecialistId`, which is an agent-layer concept, and hoisting the whole chain into
+   * shared-types to persist a derived artefact would be a wide change for the sake of a field that
+   * ledger #20 has just spent effort NOT adding to the analysis document.
+   */
+  knowledgeBase: RepoKnowledgeBase;
   warnings: string[];
 }
 
