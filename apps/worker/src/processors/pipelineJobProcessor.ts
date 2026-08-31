@@ -321,6 +321,30 @@ export async function runAnalysisJob(
         // stage: the events already carry stage, status, duration and a preview, so a second
         // instrumentation path would be a second thing to keep in step — and it would miss any
         // stage that forgot to call it.
+        // COST ATTRIBUTION (V3-FINAL). `recordUsage` had no production call site at all: the
+        // recording tracer's headline claim — "cost is MEASURED, not estimated" — reported $0.00 for
+        // every run because nothing ever fed it a number.
+        //
+        // Handled for EVERY event, not just terminal ones, and that is the load-bearing part: an AI
+        // stage's terminal event only exists on the success path, so attributing cost only there
+        // would report zero for a run that spent money across three rejected attempts and then
+        // failed. The stages emit an interim event per provider call carrying its usage.
+        //
+        // `model` rides `preview` because that is where a flat JSON-safe attribute belongs, and the
+        // pricing table is keyed by it; without it `computeCost` reports an UNPRICED total rather
+        // than a wrong one.
+        if (event.usage) {
+          const open = stageSpans.get(event.stage);
+          const span = open ?? runSpan.child(`stage:${event.stage}`, "stage", { kind: event.kind });
+          // Kept OPEN: an interim event means the stage is still running, and ending its span here
+          // would make the trace's durations lower bounds again.
+          stageSpans.set(event.stage, span);
+          span.recordUsage(event.usage);
+          // `model` is set BARE, not namespaced under `preview.`, because that is the attribute
+          // `computeCost` looks up in the pricing table. Namespacing it (as every other preview key
+          // is) would leave every span unpriced with no visible cause.
+          if (typeof event.preview?.model === "string") span.setAttribute("model", event.preview.model);
+        }
         if (event.status === "completed" || event.status === "failed" || event.status === "skipped") {
           const open = stageSpans.get(event.stage);
           const span = open ?? runSpan.child(`stage:${event.stage}`, "stage", { kind: event.kind });
@@ -330,6 +354,12 @@ export async function runAnalysisJob(
               span.setAttribute(`preview.${key}`, value);
             }
           }
+          // Same reason as above: the pricing lookup keys on a bare `model`.
+          if (typeof event.preview?.model === "string") span.setAttribute("model", event.preview.model);
+          // Recorded here too for a stage that reports usage only on its terminal event (RAG, whose
+          // spend is one aggregate). `addUsage` sums, so a stage that reported interim usage as well
+          // is not double-counted — the terminal event of such a stage carries no `usage`.
+          if (event.usage && !open) span.recordUsage(event.usage);
           if (event.status === "failed") span.setStatus("error", event.error?.message ?? "stage failed");
           else if (event.status === "skipped") span.addEvent("skipped", { detail: event.detail ?? "" });
           span.end();
@@ -377,6 +407,17 @@ export async function runAnalysisJob(
     const status: PipelineRunStatus = cached ? "completed" : withWarnings.pipeline?.status ?? "completed";
     const statusReasonForMode = cached ? undefined : withWarnings.pipeline?.statusReason;
 
+    // MEASURED COST ONTO THE RESULT (V3-FINAL). Read from the tracer, which by now holds every AI
+    // stage's provider read-back — the stage spans were ended by the emitter as their events arrived.
+    // Attached BEFORE `saveAnalysis`, because a cost computed after persistence is a cost no reader
+    // ever sees; that is precisely why nothing durable carried one before.
+    //
+    // Omitted when nothing was spent, so absent means "not known / nothing spent" and never "free".
+    // `usd` stays NULL when a contributing model has no configured price (see `pricingFromEnv`) —
+    // visibly incomplete beats confidently wrong, and the TOKENS are measured regardless.
+    const runCost = tracer.report().cost;
+    const spentSomething = runCost.inputTokens > 0 || runCost.outputTokens > 0;
+
     // V3-P0: classify the delivered SCOPE, not just the status. A no-key run is a legitimate
     // "completed" that is nonetheless not a full analysis; `runMode` says so in a form the UI
     // can branch on, and it rides the RESULT so it survives persistence and a later cache hit.
@@ -385,6 +426,7 @@ export async function runAnalysisJob(
       ...withWarnings,
       runMode,
       ...(degradations.length ? { degradations } : {}),
+      ...(spentSomething ? { cost: runCost } : {}),
     };
     let analysisId = cached ? result.id : undefined;
 

@@ -13,6 +13,7 @@ import {
   createMultiExporter,
   createOtelReplayExporter,
   exportersFromEnv,
+  pricingFromEnv,
   toExportPayload,
   type OtelSpanLike,
 } from "../exporters.js";
@@ -627,3 +628,53 @@ function emptyReport() {
     complete: true,
   };
 }
+
+describe("pricingFromEnv — visibly incomplete beats confidently wrong", () => {
+  it("returns an EMPTY table when nothing is configured, so costs report as UNPRICED", () => {
+    // Not a default price table: prices change per account and region, and a stale constant reports
+    // a confident wrong number where an empty table reports `usd: null` and names the models.
+    expect(pricingFromEnv({})).toEqual({});
+    expect(pricingFromEnv({ LLM_PRICING: "   " })).toEqual({});
+  });
+
+  it("parses a configured table", () => {
+    const table = pricingFromEnv({
+      LLM_PRICING: JSON.stringify({
+        "claude-x": { inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3 },
+      }),
+    });
+    expect(table["claude-x"]).toEqual({ inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3 });
+  });
+
+  it("reports malformed JSON and applies NO prices, rather than a partial table", () => {
+    const errors: unknown[] = [];
+    expect(pricingFromEnv({ LLM_PRICING: "{not json" }, { onError: (error) => errors.push(error) })).toEqual({});
+    expect(String(errors[0])).toMatch(/not valid JSON/);
+  });
+
+  it("rejects a non-object blob", () => {
+    const errors: unknown[] = [];
+    expect(pricingFromEnv({ LLM_PRICING: "[1,2]" }, { onError: (error) => errors.push(error) })).toEqual({});
+    expect(String(errors[0])).toMatch(/must be a JSON object/);
+  });
+
+  it("SKIPS a model with a non-numeric price instead of charging it zero", () => {
+    // Defaulting to 0 would make an unreadable price look free; skipping keeps the model in
+    // `unpricedModels`, where a reader can see the gap.
+    const errors: unknown[] = [];
+    const table = pricingFromEnv(
+      { LLM_PRICING: JSON.stringify({ good: { inputPerMillion: 1, outputPerMillion: 2 }, bad: { inputPerMillion: "3" } }) },
+      { onError: (error) => errors.push(error) },
+    );
+    expect(Object.keys(table)).toEqual(["good"]);
+    expect(String(errors[0])).toMatch(/"bad"/);
+  });
+
+  it("an unpriced model makes usd NULL, not 0 — and names itself", () => {
+    // The distinction the whole design turns on: null means "we do not know", zero means "free".
+    const cost = computeCost([{ usage: { inputTokens: 1000, outputTokens: 100, measured: true }, model: "unknown-x" }], {});
+    expect(cost.usd).toBeNull();
+    expect(cost.unpricedModels).toEqual(["unknown-x"]);
+    expect(cost.inputTokens).toBe(1000); // tokens are measured either way
+  });
+});

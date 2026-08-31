@@ -13,7 +13,7 @@ import type {
 } from "@codeflow/shared-types";
 import type { LlmClient } from "../llm/llmClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
-import { estimateTokens } from "../util/tokens.js";
+import { estimateTokens, sumUsage } from "../util/tokens.js";
 
 export interface SynthesizeDependencies {
   /** Injectable LLM client — tests mock it (no real API calls). */
@@ -99,6 +99,8 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
       }
 
       let lastError: unknown;
+      /** Every attempt's usage — so the terminal event reports what the STAGE spent, not one call. */
+      const totalUsage: TokenUsage[] = [];
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let completion: string;
         let usage: TokenUsage;
@@ -125,18 +127,44 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
           continue;
         }
 
+        // CHARGED THE MOMENT THE CALL SUCCEEDS, before the output is judged — FIXED V3-FINAL.
+        //
+        // This used to sit AFTER `deriveSynthesis`, inside the try below, so a completion rejected by
+        // the schema or grounding check was never recorded. The provider charged for it either way,
+        // which meant three rejected attempts spent real money against a daily ceiling that never saw
+        // a token of it: the wallet guard was blind to exactly the failure mode that retries most.
+        // The retry loop makes this a multiple, not a rounding error.
+        totalUsage.push(usage);
+        if (ctx.budget) await ctx.budget.record(usage, "chat");
+        if (!usage.measured) {
+          ctx.logger.warn("Synthesis: provider reported no usage; budget recorded an ESTIMATE.", {
+            provider: deps.client.provider,
+          });
+        }
+        // An INTERIM event carrying the usage, so a failed or retried stage's spend still reaches the
+        // trace. The terminal event only exists on the success path, so without this a run that spent
+        // money and then failed would report a cost of zero — the same dishonesty in a new place.
+        ctx.emit?.({
+          jobId: input.jobId,
+          stage: "synthesize",
+          stageIndex: 7,
+          stageCount: 7,
+          kind: "ai",
+          status: "running",
+          label: "Synthesizing",
+          detail: `Provider call ${attempt}/${maxAttempts} completed.`,
+          progress: 0,
+          startedAt: new Date(startedAt).toISOString(),
+          // The pricing table is keyed by model, so a usage report without it prices as UNKNOWN.
+          preview: { model: deps.client.model, attempt },
+          usage,
+          emittedAt: new Date(now()).toISOString(),
+        });
+
         try {
           const synthesis = deriveSynthesis(completion, nodeIds);
           await ctx.cache.set(cacheKey, completion); // cache only valid+grounded completions
-          // Record the provider's REAL usage after a successful call — not the estimate.
-          // The estimate above is admission control only (you must guess before calling).
-          if (ctx.budget) await ctx.budget.record(usage, "chat");
-          if (!usage.measured) {
-            ctx.logger.warn("Synthesis: provider reported no usage; budget recorded an ESTIMATE.", {
-              provider: deps.client.provider,
-            });
-          }
-          return finish(synthesis, { cached: false });
+          return finish(synthesis, { cached: false, usage: sumUsage(totalUsage) });
         } catch (error) {
           lastError = error;
           ctx.logger.warn("Synthesis output rejected (schema/grounding); retrying if attempts remain.", {
@@ -150,7 +178,10 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
         `Synthesis failed after ${maxAttempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
       );
 
-      function finish(synthesis: Synthesis, meta: { cached: boolean }): StageResult<"aiSynthesis"> {
+      function finish(
+        synthesis: Synthesis,
+        meta: { cached: boolean; usage?: TokenUsage },
+      ): StageResult<"aiSynthesis"> {
         const event: ProgressEvent = {
           jobId: input.jobId,
           stage: "synthesize",
@@ -169,7 +200,11 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
             readingSteps: synthesis.readingOrder.length,
             droppedCitations: synthesis.droppedCitations ?? 0,
             cached: meta.cached,
+            model: deps.client.model,
           },
+          // Absent on a cache hit, which is the honest shape: a served completion spent nothing, and
+          // reporting zero tokens would be indistinguishable from a free provider call.
+          ...(meta.usage ? { usage: meta.usage } : {}),
           emittedAt: new Date(now()).toISOString(),
         };
         return { partial: { aiSynthesis: synthesis }, event };

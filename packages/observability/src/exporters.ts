@@ -1,4 +1,4 @@
-import type { AttributeValue, RecordedSpan, TraceExporter, TraceReport } from "./contracts.js";
+import type { AttributeValue, PricingTable, RecordedSpan, TraceExporter, TraceReport } from "./contracts.js";
 
 /**
  * OPTIONAL trace exporters (V3-P5 task 2). Off in tests, never a hard dependency.
@@ -259,4 +259,71 @@ function safeHost(endpoint: string): string {
   } catch {
     return endpoint;
   }
+}
+
+/**
+ * A PRICING TABLE FROM ENV (wired V3-FINAL).
+ *
+ * WHY PRICES ARE NOT BAKED IN. They change, they differ per account and per region, and a stale
+ * constant in a repo is worse than no constant at all: an unpriced total reports `usd: null` and
+ * names the models, which is visibly incomplete, whereas a wrong constant reports a confident wrong
+ * number. `computeCost` is built around exactly that distinction — null when a contributing model
+ * has no entry, never a silent zero — and this function preserves it by returning an EMPTY table
+ * when nothing is configured.
+ *
+ * WHY IT EXISTS AT ALL. `RecordingTracerOptions.pricing` was an accepted option no composition root
+ * ever supplied, which meant every trace reported `usd: null` for a reason nobody had chosen. Now
+ * the absence is a deployment decision with a documented way to fix it (see GO_LIVE.md), and the
+ * tokens — which ARE measured either way — are unaffected.
+ *
+ * FORMAT: `LLM_PRICING` as JSON, model id → USD per million tokens.
+ *   LLM_PRICING={"claude-sonnet-4-5":{"inputPerMillion":3,"outputPerMillion":15,
+ *                                     "cacheReadPerMillion":0.3}}
+ *
+ * Parsed DEFENSIVELY, because this is an untrusted external boundary (the contract invariant's one
+ * place runtime validation belongs): a malformed blob yields an empty table plus a reported error,
+ * never a partially-applied table. A price that silently became NaN would make every cost figure
+ * NaN and look like a bug in the tracer.
+ */
+export function pricingFromEnv(
+  env: Record<string, string | undefined>,
+  options: { onError?(error: unknown): void } = {},
+): PricingTable {
+  const raw = env.LLM_PRICING;
+  if (!raw || raw.trim() === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    options.onError?.(new Error(`LLM_PRICING is not valid JSON; no prices applied. (${String(error)})`));
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    options.onError?.(new Error("LLM_PRICING must be a JSON object of model -> price; no prices applied."));
+    return {};
+  }
+
+  const table: PricingTable = {};
+  for (const [model, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const price = value as Record<string, unknown> | null;
+    const input = price?.inputPerMillion;
+    const output = price?.outputPerMillion;
+    const cacheRead = price?.cacheReadPerMillion;
+    if (!isFinitePositive(input) || !isFinitePositive(output)) {
+      // Skipped, not defaulted: a model whose price we cannot read must stay UNPRICED so it shows up
+      // in `unpricedModels`, rather than being quietly charged at zero.
+      options.onError?.(new Error(`LLM_PRICING entry for "${model}" is missing a numeric inputPerMillion/outputPerMillion; skipped.`));
+      continue;
+    }
+    table[model] = {
+      inputPerMillion: input,
+      outputPerMillion: output,
+      ...(isFinitePositive(cacheRead) ? { cacheReadPerMillion: cacheRead } : {}),
+    };
+  }
+  return table;
+}
+
+function isFinitePositive(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }

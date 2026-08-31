@@ -201,9 +201,12 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
                   blackboardReadVersion:
                     meta.fanOut.blackboardHistory.reads.find((read) => read.reader === "supervisor")?.version ?? 0,
                   blackboardTrimmedBefore: meta.fanOut.blackboardHistory.trimmedBefore,
+                  model: deps.chatClient.model,
                 }
               : {}),
           },
+          // Absent on a cache hit and on a fully budget-skipped run — see `FanOutResult.usage`.
+          ...(meta.fanOut?.usage ? { usage: meta.fanOut.usage } : {}),
           emittedAt: new Date(now()).toISOString(),
         };
         return { partial: { aiSynthesis: synthesis }, event };

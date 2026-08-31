@@ -1,4 +1,4 @@
-import type { TokenUsage } from "@codeflow/shared-types";
+import type { CostBreakdown, TokenUsage } from "@codeflow/shared-types";
 
 /**
  * `@codeflow/observability` — traces, cost and replay (V3-P5 task 2).
@@ -101,17 +101,13 @@ export interface ModelPricing {
 
 export type PricingTable = Record<string, ModelPricing>;
 
-export interface CostBreakdown {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  /** Null when no price is known for the model — distinct from 0, which would mean free. */
-  usd: number | null;
-  /** False when ANY contributing usage was an estimate. The honesty flag, propagated. */
-  measured: boolean;
-  /** Models that had no price entry, so an unpriced total is explainable. */
-  unpricedModels: string[];
-}
+/**
+ * Re-exported from shared-types rather than declared here: the ANALYSIS RESULT carries a cost too,
+ * and two structurally identical cost types is how a `measured` flag ends up honoured on one and
+ * dropped on the other. Computation still lives in this package (`computeCost`); only the shape is
+ * shared.
+ */
+export type { CostBreakdown } from "@codeflow/shared-types";
 
 // -- The interaction graph -------------------------------------------------------------
 

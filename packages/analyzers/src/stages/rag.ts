@@ -266,7 +266,7 @@ export function createRagStage(
       }
 
       // --- Embed (embedding cache → batch the misses, transient retry) --------
-      const embeddings = await embedChunks(plan, ctx, client, maxAttempts);
+      const { embeddings, usage: embedUsage } = await embedChunks(plan, ctx, client, maxAttempts);
 
       // GUARD (V3-P2): the store must live in the SAME embedding space as the client that
       // just produced these vectors. Checked here rather than at wiring time because the
@@ -355,7 +355,10 @@ export function createRagStage(
           // are different facts about latency and collapsing them would hide which one happened.
           planFromSpeculation: fromSpeculation,
           vectorStore: deps.vectorStore.id,
+          model: client.model,
         },
+        // Absent when every chunk came from the embedding cache — see `embedChunks`.
+        ...(embedUsage ? { usage: embedUsage } : {}),
         emittedAt: new Date(now()).toISOString(),
       };
 
@@ -622,7 +625,7 @@ async function embedChunks(
   ctx: PipelineContext,
   client: EmbeddingClient,
   maxAttempts: number,
-): Promise<number[][]> {
+): Promise<{ embeddings: number[][]; usage: TokenUsage | null }> {
   // V3-P2: what gets EMBEDDED is the enriched text (path + scope + signature + docstring,
   // then the raw bytes) — see `embedTextFor`. What gets STORED stays byte-exact for the line
   // range, because that is what a citation resolves to.
@@ -660,6 +663,15 @@ async function embedChunks(
     const texts = batch.map((i) => embedTexts[i]);
     const { vectors, usage } = await embedWithRetry(client, texts, maxAttempts, ctx);
     usageParts.push(usage);
+    // CHARGED PER BATCH — FIXED V3-FINAL. The budget used to be recorded once, after the whole loop,
+    // so a throw on batch 7 discarded the usage of batches 1-6: real embedding spend that the daily
+    // ceiling never saw. The provider charged for them regardless of whether the stage finished.
+    if (ctx.budget) await ctx.budget.record(usage, "embedding");
+    if (!usage.measured) {
+      ctx.logger.warn("RAG: embedding provider reported no usage; budget recorded an ESTIMATE.", {
+        provider: client.provider,
+      });
+    }
     for (let j = 0; j < batch.length; j++) {
       const i = batch[j];
       embeddings[i] = vectors[j];
@@ -668,23 +680,20 @@ async function embedChunks(
     }
   }
 
-  // Record the provider's REAL usage after successful embedding — not the estimate above
-  // (which exists only to admit the call). `measured: false` means a provider reported no
-  // usage (today: Gemini's batch-embed endpoint), and that is logged rather than hidden.
-  if (missing.length > 0 && ctx.budget) {
-    const usage = sumUsage(usageParts);
-    await ctx.budget.record(usage, "embedding");
-    if (!usage.measured) {
-      ctx.logger.warn("RAG: embedding provider reported no usage; budget recorded an ESTIMATE.", {
-        provider: client.provider,
-      });
-    }
-  }
+  // Summed unconditionally, not only when a budget exists: the budget is one CONSUMER of this
+  // number and the trace is another, so computing it inside the budget branch is what made the
+  // trace's cost structurally $0.00 whenever the budget was unset.
+  const usage = sumUsage(usageParts);
 
-  return embeddings.map((value, i) => {
-    if (value === null) throw new Error(`RAG: chunk ${plan[i].id} was never embedded.`);
-    return value;
-  });
+  return {
+    embeddings: embeddings.map((value, i) => {
+      if (value === null) throw new Error(`RAG: chunk ${plan[i].id} was never embedded.`);
+      return value;
+    }),
+    // Null when nothing was embedded (every chunk came from the embedding cache). Distinct from a
+    // zero-token usage: one means "spent nothing", the other means "a provider charged us nothing".
+    usage: missing.length > 0 ? usage : null,
+  };
 }
 
 /** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS.

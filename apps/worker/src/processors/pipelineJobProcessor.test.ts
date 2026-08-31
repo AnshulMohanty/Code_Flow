@@ -316,3 +316,160 @@ function makeClock() {
   let t = 0;
   return () => ++t;
 }
+
+describe("runAnalysisJob — MEASURED cost reaches the trace AND the result (V3-FINAL)", () => {
+  /** A synthesis client that reports a real, non-zero, provider-read-back usage. */
+  const paidChat = () => ({
+    provider: "anthropic" as const,
+    model: "priced-model",
+    complete: vi.fn(async () => ({
+      text: JSON.stringify({ summary: "s", readingOrder: [] }),
+      usage: { inputTokens: 1_000_000, outputTokens: 500_000, measured: true },
+    })),
+  });
+
+  // This fixture has an EMPTY graph (no files), so the synthesis grounding check rejects every
+  // completion and the stage exhausts its three attempts. That is not a limitation here, it is the
+  // exact case that mattered: three provider calls were paid for and the run then failed, and BOTH
+  // the daily budget and the trace used to see nothing at all.
+  const PAID_ATTEMPTS = 3;
+
+  it("RECORDS usage onto the stage span — the call site `recordUsage` never had", async () => {
+    // The bug: `Span.recordUsage` existed with NO production caller, so the recording tracer's
+    // headline claim ("cost is MEASURED, not estimated") reported $0.00 for every run. The AI stages
+    // had the provider's real usage in hand and dropped it.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+      onTrace: (report) => traces.push(report),
+    });
+
+    const synthesizeSpan = traces[0].spans.find((span) => span.name === "stage:synthesize");
+    expect(synthesizeSpan?.usage).toEqual({
+      inputTokens: 1_000_000 * PAID_ATTEMPTS,
+      outputTokens: 500_000 * PAID_ATTEMPTS,
+      measured: true,
+    });
+    // 3M in at $3/M + 1.5M out at $15/M = $9 + $22.50.
+    expect(traces[0].cost.usd).toBeCloseTo(31.5, 6);
+    expect(traces[0].cost.measured).toBe(true);
+  });
+
+  it("CHARGES a rejected completion — the retry loop used to spend for free", async () => {
+    // The wallet half of the same bug: `budget.record` sat AFTER the schema/grounding check, so a
+    // rejected completion was never recorded. The provider charged either way, which made the daily
+    // ceiling blind to exactly the failure mode that retries most.
+    const recorded: number[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      budget: {
+        async check() {
+          return true;
+        },
+        async record(actual) {
+          // `record` accepts a raw token count OR a full usage read-back; the AI stages pass the
+          // latter, which is the whole point of V3-P0's provider read-back.
+          recorded.push(typeof actual === "number" ? actual : actual.inputTokens + actual.outputTokens);
+        },
+      },
+    });
+    // One record per provider call, not one per successful stage.
+    expect(recorded).toHaveLength(PAID_ATTEMPTS);
+    expect(recorded.every((tokens) => tokens === 1_500_000)).toBe(true);
+  });
+
+  it("PERSISTS the cost on the result, so a reader can see a real figure", async () => {
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost).toMatchObject({ inputTokens: 1_000_000 * PAID_ATTEMPTS, measured: true });
+    expect(saved.cost?.usd).toBeCloseTo(31.5, 6);
+  });
+
+  it("reports usd NULL and NAMES the model when no price is configured — never a silent zero", async () => {
+    // The unconfigured-price case, which is the DEFAULT. Tokens stay measured; the dollar figure
+    // says "we do not know" rather than "it was free".
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      // No `pricing` at all — exactly what a deployment without LLM_PRICING gets.
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost?.usd).toBeNull();
+    expect(saved.cost?.unpricedModels).toEqual(["priced-model"]);
+    expect(saved.cost?.inputTokens).toBe(1_000_000 * PAID_ATTEMPTS);
+  });
+
+  it("OMITS cost entirely on a run that spent nothing — absent means unknown, never free", async () => {
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      // Deterministic-only: no provider, so no paid call.
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved).not.toHaveProperty("cost");
+  });
+
+  it("propagates measured:false rather than smoothing an estimate into a measurement", async () => {
+    const estimating = {
+      provider: "gemini" as const,
+      model: "priced-model",
+      complete: vi.fn(async () => ({
+        text: JSON.stringify({ summary: "s", readingOrder: [] }),
+        usage: { inputTokens: 100, outputTokens: 10, measured: false },
+      })),
+    };
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: estimating,
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost?.measured).toBe(false);
+  });
+});

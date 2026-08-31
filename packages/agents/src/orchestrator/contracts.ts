@@ -1,5 +1,5 @@
 import type { VersionedBlackboardReport } from "@codeflow/observability";
-import type { AnalysisResult, RepoCluster, Synthesis } from "@codeflow/shared-types";
+import type { AnalysisResult, RepoCluster, Synthesis, TokenUsage } from "@codeflow/shared-types";
 import type { ContextBreakdown } from "../contracts.js";
 import type { RepoKnowledgeBase } from "./consolidate.js";
 
@@ -129,6 +129,15 @@ export interface FanOutResult {
   supervisorContext: ContextBreakdown;
   /** True when the supervisor produced the synthesis; false when a deterministic fallback did. */
   supervised: boolean;
+  /**
+   * The REAL provider usage of every call this fan-out made — specialists, best-of-N samples and the
+   * supervisor — summed, with `measured` propagated (false if ANY contributing call was an estimate).
+   *
+   * Null when no provider call happened at all: every lens skipped on budget, or the outcome came
+   * from cache. Null and a zero-token usage are deliberately different, because the second would
+   * claim a provider charged nothing for work it did.
+   */
+  usage: TokenUsage | null;
   /**
    * The consolidated repository knowledge base (V3-P5 task 6), derived from the blackboard above.
    *

@@ -50,6 +50,7 @@ export {
   createMultiExporter,
   createOtelReplayExporter,
   exportersFromEnv,
+  pricingFromEnv,
   toExportPayload,
   type HttpExporterOptions,
   type OtelSpanLike,

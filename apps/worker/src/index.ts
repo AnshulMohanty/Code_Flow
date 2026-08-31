@@ -220,6 +220,7 @@ async function main() {
           budget,
           eventLog,
           traceExporter: traceExport.exporter,
+          pricing: traceExport.pricing,
         });
         console.log(`Completed analysis job ${job.data.jobId}.`);
       } finally {

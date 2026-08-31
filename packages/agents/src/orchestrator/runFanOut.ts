@@ -1,6 +1,6 @@
 import { FANOUT_MAX_CONCURRENCY, SUPERVISOR_MAX_FINDINGS, SUPERVISOR_MAX_READING_STEPS } from "@codeflow/config";
-import { BudgetExceededError, estimateTokens, type LlmClient } from "@codeflow/analyzers";
-import type { AnalysisResult, BudgetHandle, RepoCluster } from "@codeflow/shared-types";
+import { BudgetExceededError, estimateTokens, sumUsage, type LlmClient } from "@codeflow/analyzers";
+import type { AnalysisResult, BudgetHandle, RepoCluster, TokenUsage } from "@codeflow/shared-types";
 import { meterContext } from "../contextMeter.js";
 import {
   createVersionedBlackboard,
@@ -156,6 +156,8 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
       synthesis: fallbackSynthesis(board, deps.result, deps.maxReadingSteps ?? SUPERVISOR_MAX_READING_STEPS),
       blackboard: board,
       blackboardHistory: versioned.report(),
+      // No community ⇒ no specialist call ⇒ nothing spent. Null, not a zero-token usage.
+      usage: null,
       routes: [],
       skippedClusters: [],
       peakConcurrency: 0,
@@ -189,6 +191,12 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
 
   // --- Fan out -------------------------------------------------------------
   const tracker = createConcurrencyTracker();
+  /**
+   * Every provider call's REAL usage, summed. Collected here rather than left to the budget, because
+   * the budget is optional and the TRACE is not: computing cost only inside `if (deps.budget)` is
+   * exactly what made the recording tracer report $0.00 for a keyless-budget run.
+   */
+  const usageParts: TokenUsage[] = [];
   let specialistCalls = 0;
   let bestOfNExtraCalls = 0;
   let budgetExhausted = false;
@@ -249,6 +257,7 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
             temperature: sample === 0 ? 0 : 0.7,
             ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
           });
+          usageParts.push(completed.usage);
           if (deps.budget) await deps.budget.record(completed.usage, "chat");
           return completed.text;
         });
@@ -384,6 +393,7 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
         temperature: 0,
         ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
       });
+      usageParts.push(completed.usage);
       if (deps.budget) await deps.budget.record(completed.usage, "chat");
       synthesis = deriveSupervisedSynthesis(completed.text, nodeIds, maxSteps);
       supervised = true;
@@ -420,6 +430,9 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
     synthesis: synthesis ?? fallbackSynthesis(board, deps.result, maxSteps),
     blackboard: board,
     blackboardHistory: history,
+    // Null when no provider call was made at all (every lens skipped on budget, or a cache hit
+    // upstream). Distinct from zero tokens, which would claim a provider charged us nothing.
+    usage: usageParts.length > 0 ? sumUsage(usageParts) : null,
     routes: plan.routes,
     skippedClusters: plan.skippedClusters,
     peakConcurrency: tracker.peak,

@@ -192,6 +192,17 @@ export interface AnalysisResult {
 
   // --- Pipeline run bookkeeping (assembly) ------------------------------------
   pipeline?: PipelineRunSummary;
+  /**
+   * What this run actually SPENT, read back from the providers (V3-FINAL).
+   *
+   * Absent on a run that made no paid call (a cache hit, a keyless deterministic-only run) and on
+   * every result produced before the field existed — so absent means "not known", never "free".
+   *
+   * Six numbers, so this cannot become the growth ledger #20 tracks. It exists because the cost was
+   * being measured per call, recorded against the budget, and then discarded: nothing durable
+   * carried it, so no UI could report a real figure and every "cost" claim would have been a guess.
+   */
+  cost?: CostBreakdown;
 }
 
 export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "generic" | "unknown";
@@ -974,6 +985,18 @@ export interface ProgressEvent {
   /** Small, flat, JSON-safe teaser for the UI — NEVER the full slice. */
   preview?: Record<string, string | number | boolean | null>;
   error?: { message: string; retriable?: boolean };
+  /**
+   * Provider usage this stage actually spent (V3-FINAL). Present only on a stage that made a paid
+   * call and did not serve it from cache — absent means "spent nothing", which is a different and
+   * equally important fact from "spent zero tokens".
+   *
+   * A FIRST-CLASS FIELD rather than three numbers smuggled through `preview`, for two reasons: it
+   * carries `measured`, and an honesty flag that can be dropped by a loose record is an honesty flag
+   * that will be. And it is what lets the worker attribute cost to the right SPAN — without it the
+   * recording tracer's headline claim ("cost is measured, not estimated") reported $0.00 for every
+   * run, because nothing ever called `recordUsage`.
+   */
+  usage?: TokenUsage;
   emittedAt: string; // ISO-8601
 }
 
@@ -1107,6 +1130,31 @@ export interface PipelineContext {
 export interface SpeculationClaim {
   /** The staged value for `key`, or null when nothing was staged (or it failed). */
   claim<T>(key: string): Promise<T | null>;
+}
+
+/**
+ * Measured provider spend, aggregated. The shape both `@codeflow/observability` (per span, per
+ * trace) and `AnalysisResult.cost` (per run) use.
+ *
+ * DECLARED HERE rather than in observability, even though observability is where cost is COMPUTED:
+ * the analysis result carries it, and shared-types is the package a result's contract may depend on.
+ * Observability re-exports this rather than defining a twin, because two structurally identical cost
+ * types is how a `measured` flag ends up set on one and dropped on the other.
+ *
+ * `usd: null` and `usd: 0` are DIFFERENT and must stay so: null means no price is known for a
+ * contributing model, zero means the work was genuinely free. Collapsing them would let an
+ * unconfigured price table read as "this run cost nothing".
+ */
+export interface CostBreakdown {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** Null when no price is known for a contributing model — distinct from 0, which means free. */
+  usd: number | null;
+  /** False when ANY contributing usage was a provider ESTIMATE rather than a read-back. */
+  measured: boolean;
+  /** Models that had no price entry, so an unpriced total is explainable rather than mysterious. */
+  unpricedModels: string[];
 }
 
 /** What a stage returns: the slice(s) it owns + its terminal progress event. */

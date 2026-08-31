@@ -456,6 +456,10 @@ export async function runPipeline(
         now,
         detail: stageResult.event.detail,
         preview: stageResult.event.preview,
+        // The stage's PROVIDER USAGE, forwarded (V3-FINAL). The orchestrator rebuilds the emitted
+        // event rather than passing the stage's through, so a field it does not copy is a field that
+        // never leaves the stage — which is why the measured cost reached nothing before.
+        usage: stageResult.event.usage,
       });
 
       // Post-Ingest cache decision (by the RESOLVED sha) — the fallback for when the SHA
@@ -786,6 +790,8 @@ interface EmitArgs {
   detail?: string;
   preview?: ProgressEvent["preview"];
   error?: ProgressEvent["error"];
+  /** Provider usage the stage reported. Forwarded verbatim — see the call site. */
+  usage?: ProgressEvent["usage"];
 }
 
 /** Build the authoritative ProgressEvent (orchestrator owns index/count/progress/timing). */
@@ -805,6 +811,7 @@ function emitEvent(emit: PipelineEmitter | undefined, args: EmitArgs): void {
     durationMs: args.durationMs,
     preview: args.preview,
     error: args.error,
+    ...(args.usage ? { usage: args.usage } : {}),
     emittedAt: iso(args.now()),
   };
   emit(event);

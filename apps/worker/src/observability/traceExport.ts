@@ -2,7 +2,9 @@ import {
   createMemoryTraceExporter,
   createMultiExporter,
   exportersFromEnv,
+  pricingFromEnv,
   type MemoryTraceExporter,
+  type PricingTable,
   type TraceExporter,
 } from "@codeflow/observability";
 
@@ -39,6 +41,12 @@ export interface ResolvedTraceExport {
   remoteConfigured: boolean;
   /** One line for the boot log — an operator should not have to guess which backends are live. */
   description: string;
+  /**
+   * Model prices from `LLM_PRICING`. EMPTY when unconfigured, which makes every cost report
+   * `usd: null` plus the unpriced model names — visibly incomplete rather than confidently wrong.
+   * Tokens are measured either way.
+   */
+  pricing: PricingTable;
 }
 
 export interface ResolveTraceExportOptions {
@@ -65,17 +73,23 @@ export function resolveTraceExport(
       console.warn(`[worker] trace export failed (ignored): ${error instanceof Error ? error.message : String(error)}`);
     });
 
+  const pricing = pricingFromEnv(env, { onError });
+
   const remote = exportersFromEnv(env, {
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     onError,
   });
+
+  const priced = Object.keys(pricing).length;
+  const priceNote = priced > 0 ? `, ${priced} model price(s) loaded` : ", NO model prices (costs report as unpriced)";
 
   if (!remote) {
     return {
       exporter: buffer,
       buffer,
       remoteConfigured: false,
-      description: "trace export: in-memory replay buffer only (no LANGFUSE_*/HELICONE_API_KEY configured)",
+      pricing,
+      description: `trace export: in-memory replay buffer only (no LANGFUSE_*/HELICONE_API_KEY configured)${priceNote}`,
     };
   }
 
@@ -85,6 +99,7 @@ export function resolveTraceExport(
     exporter: createMultiExporter([buffer, remote]),
     buffer,
     remoteConfigured: true,
-    description: `trace export: in-memory replay buffer + ${remote.id}`,
+    pricing,
+    description: `trace export: in-memory replay buffer + ${remote.id}${priceNote}`,
   };
 }
