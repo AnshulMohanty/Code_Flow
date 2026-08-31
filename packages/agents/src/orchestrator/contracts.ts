@@ -1,3 +1,4 @@
+import type { VersionedBlackboardReport } from "@codeflow/observability";
 import type { AnalysisResult, RepoCluster, Synthesis } from "@codeflow/shared-types";
 import type { ContextBreakdown } from "../contracts.js";
 import type { RepoKnowledgeBase } from "./consolidate.js";
@@ -102,6 +103,19 @@ export interface CommunityRoute {
 export interface FanOutResult {
   synthesis: Synthesis;
   blackboard: Blackboard;
+  /**
+   * The blackboard's APPEND-ONLY version log (V3-P5 task 2e, wired V3-FINAL).
+   *
+   * One version per posted entry plus the opening state, and a recorded READ for the supervisor —
+   * which is the pairing that makes a synthesis explainable: `at(read.version)` returns exactly the
+   * board the supervisor reasoned over, not the fuller board that existed by the end of the run.
+   *
+   * IN-PROCESS ONLY, and that is a decision rather than an oversight: this is a per-write history of
+   * a run that can post 60 entries, and writing it into the analysis document is precisely the kind
+   * of growth ledger #20 tracks and V3-P2 spent effort removing. A caller that wants it durable can
+   * export it through the trace exporter, where a bounded observability artefact belongs.
+   */
+  blackboardHistory: VersionedBlackboardReport<Blackboard>;
   routes: CommunityRoute[];
   /** Communities NOT analysed because of `FANOUT_MAX_COMMUNITIES`. Reported, never silent. */
   skippedClusters: number[];

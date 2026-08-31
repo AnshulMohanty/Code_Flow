@@ -816,3 +816,118 @@ describe("consolidated knowledge base (V3-P5 task 6)", () => {
     expect(run.knowledgeBase.reduction.jsonBytes).toBeLessThan(blackboardBytes);
   });
 });
+
+// ── V3-P5 task 2e: the VERSIONED BLACKBOARD, on the live fan-out path (wired V3-FINAL) ──
+//
+// `createVersionedBlackboard` shipped in V3-P5 with a full test suite and ZERO production call
+// sites: the fan-out kept folding an unversioned immutable value, so "what did the supervisor
+// actually see?" stayed unanswerable in production while being answerable in a unit test. These
+// assertions are specifically about the LIVE path — that a real `runFanOut` produces a version log,
+// that the supervisor's read is recorded against a version that still exists, and that replaying
+// that version returns the board the supervisor was shown rather than the fuller final one.
+
+describe("versioned blackboard — replay on the LIVE fan-out path", () => {
+  it("produces a version log from a real run, not an empty one", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    // 2 communities x 5 specialists = 10 posted entries, plus the opening empty state.
+    expect(run.blackboardHistory.totalWrites).toBe(11);
+    expect(run.blackboardHistory.versions[0].writer).toBe("orchestrator");
+    expect(run.blackboardHistory.versions[0].state.findings).toEqual([]);
+  });
+
+  it("names the WRITER of every version as the specialist and community that posted it", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    const writers = run.blackboardHistory.versions.slice(1).map((version) => version.writer);
+    // A version log whose writer was "the orchestrator" throughout would be a log nobody can use to
+    // attribute a claim.
+    expect(writers).toContain("architecture@c0");
+    expect(writers).toContain("architecture@c1");
+    expect(new Set(writers).size).toBe(10);
+  });
+
+  it("records the SUPERVISOR's read, with what it was shown", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 3 }), chatClient: fanOutChat() });
+    const read = run.blackboardHistory.reads.find((entry) => entry.reader === "supervisor");
+    expect(read).toBeDefined();
+    // The note is the whole point: "shown 12 of 15" is the fact a replay needs, and it does not
+    // exist anywhere else once the run ends.
+    expect(read?.note).toMatch(/^shown \d+ of \d+ finding\(s\), \d+ prompt token\(s\)$/);
+    expect(read?.version).toBe(run.blackboardHistory.totalWrites);
+  });
+
+  it("REPLAYS the exact board the supervisor read — not the fuller final one", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    const read = run.blackboardHistory.reads.find((entry) => entry.reader === "supervisor");
+    const atRead = run.blackboardHistory.versions.find((version) => version.version === read?.version);
+    expect(atRead).toBeDefined();
+    // At the read, the board is complete — so the interesting proof is that an EARLIER version is
+    // genuinely smaller, i.e. the log holds real intermediate states rather than N copies of the end.
+    const midway = run.blackboardHistory.versions[5];
+    expect(midway.state.entries.length).toBeLessThan(atRead!.state.entries.length);
+    expect(atRead!.state.entries.length).toBe(run.blackboard.entries.length);
+  });
+
+  it("holds INTERMEDIATE states, so the board's growth is reconstructable entry by entry", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    const sizes = run.blackboardHistory.versions.map((version) => version.state.entries.length);
+    expect(sizes).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it("each version is an INDEPENDENT snapshot, not a reference to one growing array", async () => {
+    // The failure this rules out: folding into a shared mutable board and pushing the SAME object
+    // reference into every version. The log would then hold N views of the final state, every
+    // intermediate version would be a lie, and it would look correct in a size assertion.
+    const run = await runFanOut({ result: clusteredResult({ clusters: 1 }), chatClient: fanOutChat() });
+    const [, second, third] = run.blackboardHistory.versions;
+    expect(second.state.entries).not.toBe(third.state.entries);
+    const thirdSizeBefore = third.state.entries.length;
+    second.state.entries.push(entry(99, "architecture", []));
+    expect(third.state.entries.length).toBe(thirdSizeBefore);
+  });
+
+  it("is NEVER trimmed on a full-size fan-out — the bound is derived, not guessed", async () => {
+    // maxVersions = clusters x specialists + 2, so the production ceiling (FANOUT_MAX_COMMUNITIES)
+    // cannot reach it. A trim would mean a replay silently starting mid-run.
+    const run = await runFanOut({ result: clusteredResult({ clusters: 12 }), chatClient: fanOutChat(), maxCommunities: 12 });
+    expect(run.blackboardHistory.trimmedBefore).toBe(1);
+    expect(run.blackboardHistory.versions).toHaveLength(run.blackboardHistory.totalWrites);
+    expect(run.warnings.filter((warning) => warning.includes("trimmed"))).toEqual([]);
+  });
+
+  it("is REPRODUCIBLE: the same input yields a byte-identical history", async () => {
+    // The default clock is a constant, deliberately — a wall-clock stamp would make two runs of the
+    // same input differ, and a history you cannot diff is not one you can use to compare runs.
+    const a = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    const b = await runFanOut({ result: clusteredResult({ clusters: 2 }), chatClient: fanOutChat() });
+    expect(JSON.stringify(a.blackboardHistory)).toBe(JSON.stringify(b.blackboardHistory));
+  });
+
+  it("records a read even on the NO-COMMUNITIES fallback, so a synthesis is never unattributed", async () => {
+    const noClusters = clusteredResult({ clusters: 1 });
+    const run = await runFanOut({
+      result: { ...noClusters, metrics: { ...noClusters.metrics!, clusters: undefined } },
+      chatClient: fanOutChat(),
+    });
+    expect(run.blackboardHistory.totalWrites).toBe(1);
+    expect(run.blackboardHistory.reads.map((read) => read.reader)).toEqual(["fallback-synthesis"]);
+  });
+
+  it("records a REFUSAL as its own version with the reason, not as a silent gap", async () => {
+    const refusing = scriptedChat([
+      (prompt) =>
+        prompt.includes("Specialist findings")
+          ? supervisorReply("src/c0/f0.ts")
+          : JSON.stringify({ refused: true, reason: "nothing security-relevant here" }),
+    ]);
+    const run = await runFanOut({ result: clusteredResult({ clusters: 1 }), chatClient: refusing });
+    const reasons = run.blackboardHistory.versions.slice(1).map((version) => version.reason);
+    expect(reasons.every((reason) => reason.startsWith("refused:"))).toBe(true);
+    expect(reasons[0]).toContain("nothing security-relevant here");
+  });
+
+  it("keeps `blackboard` and the log's HEAD in agreement — there is no second truth", async () => {
+    const run = await runFanOut({ result: clusteredResult({ clusters: 3 }), chatClient: fanOutChat() });
+    const head = run.blackboardHistory.versions.at(-1)!.state;
+    expect(JSON.stringify(head)).toBe(JSON.stringify(run.blackboard));
+  });
+});

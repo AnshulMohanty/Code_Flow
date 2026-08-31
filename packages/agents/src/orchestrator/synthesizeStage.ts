@@ -8,6 +8,7 @@ import type {
   Synthesis,
 } from "@codeflow/shared-types";
 import type { LlmClient } from "@codeflow/analyzers";
+import { renderBlackboardHistory } from "@codeflow/observability";
 import { summarizeBlackboard } from "./blackboard.js";
 import type { FanOutResult } from "./contracts.js";
 import { runFanOut, type FanOutDeps } from "./runFanOut.js";
@@ -50,6 +51,9 @@ export interface FanOutSynthesizeDependencies extends Omit<FanOutDeps, "result">
 
 /** Cache-key version — bump on a change to the prompt shape or the routing algorithm. */
 const FANOUT_CACHE_VERSION = "v1";
+
+/** The version log's first line. Named so the intent reads clearly at the call site. */
+const FIRST_LINE = /^[^\r\n]*/;
 
 export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies): PipelineStage<"aiSynthesis"> {
   const now = deps.now ?? Date.now;
@@ -108,9 +112,23 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
         ctx.logger.warn("Cached fan-out synthesis no longer grounds against the graph; re-running.");
       }
 
-      const fanOut = await runFanOut({ ...deps, result, ...(ctx.budget ? { budget: ctx.budget } : {}) });
+      const fanOut = await runFanOut({
+        ...deps,
+        result,
+        ...(ctx.budget ? { budget: ctx.budget } : {}),
+        // The stage's own injected clock feeds the blackboard version log, so a run driven by a
+        // fake clock produces a byte-identical history. Relative to the stage start, not absolute.
+        now: () => now() - startedAt,
+      });
 
       for (const warning of fanOut.warnings) ctx.logger.warn(`Fan-out synthesis: ${warning}`);
+
+      // The version log's HEADER only. The full history stays in memory on `FanOutResult`: 60 lines
+      // of version detail per job would drown a worker's log, and the header carries the two facts
+      // that matter from outside — how many versions exist, and whether replay can reach the start.
+      ctx.logger.info(
+        `Fan-out blackboard: ${FIRST_LINE.exec(renderBlackboardHistory(fanOut.blackboardHistory))?.[0] ?? ""}`,
+      );
 
       if (fanOut.synthesis.readingOrder.length === 0) {
         // The SAME condition the single-shot stage threw on: nothing grounded to show. Everything
@@ -175,6 +193,14 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
                   ),
                   kbBytes: meta.fanOut.knowledgeBase.reduction.jsonBytes,
                   kbFaq: meta.fanOut.knowledgeBase.faq.length,
+                  // V3-P5 task 2e — REPLAY. `blackboardReadVersion` is the load-bearing one: it
+                  // names the exact version the supervisor synthesised from, so a later "why did it
+                  // say that?" resolves to a state rather than to a guess. `trimmedBefore > 1` is
+                  // the honest admission that a replay cannot reach the start of the run.
+                  blackboardVersions: meta.fanOut.blackboardHistory.totalWrites,
+                  blackboardReadVersion:
+                    meta.fanOut.blackboardHistory.reads.find((read) => read.reader === "supervisor")?.version ?? 0,
+                  blackboardTrimmedBefore: meta.fanOut.blackboardHistory.trimmedBefore,
                 }
               : {}),
           },

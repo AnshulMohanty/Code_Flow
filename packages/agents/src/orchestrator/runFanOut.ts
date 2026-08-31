@@ -2,6 +2,12 @@ import { FANOUT_MAX_CONCURRENCY, SUPERVISOR_MAX_FINDINGS, SUPERVISOR_MAX_READING
 import { BudgetExceededError, estimateTokens, type LlmClient } from "@codeflow/analyzers";
 import type { AnalysisResult, BudgetHandle, RepoCluster } from "@codeflow/shared-types";
 import { meterContext } from "../contextMeter.js";
+import {
+  createVersionedBlackboard,
+  renderBlackboardHistory,
+  type VersionedBlackboard,
+  type VersionedBlackboardReport,
+} from "@codeflow/observability";
 import { emptyBlackboard, post } from "./blackboard.js";
 import type {
   Blackboard,
@@ -90,6 +96,13 @@ export interface FanOutDeps {
    * `snapshotOf` and `consolidateKnowledge` follow.
    */
   capturedAt?: string;
+  /**
+   * Relative-millisecond clock for the blackboard version log. Injected for the same reason
+   * `capturedAt` is supplied: a history stamped from `Date.now()` would make two runs of the same
+   * input differ, and the version log exists precisely to be compared across runs. Defaults to a
+   * CONSTANT zero rather than a wall clock, so the default is the reproducible one.
+   */
+  now?: () => number;
 }
 
 export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
@@ -102,15 +115,47 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
   // instead of silently making every KB differ. A caller that wants a real timestamp passes one.
   const capturedAt = deps.capturedAt ?? "1970-01-01T00:00:00.000Z";
 
+  // --- THE BLACKBOARD, VERSIONED (V3-P5 task 2e — wired here in V3-FINAL) ---------------
+  //
+  // V3-P4's blackboard was an immutable VALUE folded up by `post()`. That made the fan-out
+  // deterministic, but it left one question permanently unanswerable: what did the supervisor
+  // actually SEE? By the time a run ends the board holds every finding, so "why did it say that?"
+  // has no evidence behind it — the input it reasoned over no longer exists anywhere.
+  //
+  // So the running state now LIVES in an append-only version log. Each `post()` result is a new
+  // version, tagged with the specialist that wrote it and what it contributed; the supervisor's read
+  // is recorded against the version it saw. There is deliberately no second copy of the board in a
+  // local variable: the current state IS the last version, which is the whole reason the log cannot
+  // drift from reality.
+  //
+  // The version log is IN-PROCESS ONLY. It is returned on `FanOutResult` and never written into the
+  // analysis document — ledger #20 is about that document's growth, and a per-write history of a
+  // 60-entry fan-out is exactly the kind of thing that would undo P2's work there.
+  const versioned: VersionedBlackboard<Blackboard> = createVersionedBlackboard<Blackboard>({
+    // One version per posted entry, plus the empty opening state. Bounded BY CONSTRUCTION rather
+    // than by a guessed constant: jobs is at most FANOUT_MAX_COMMUNITIES x specialists, so this is
+    // a real ceiling (<= 61 today) and a normal run is never trimmed.
+    maxVersions: clusters.length * specialists.length + 2,
+    // Injected relative clock, so a run driven by a fake clock stays byte-reproducible. Without this
+    // the history would carry wall-clock reads and the fan-out would stop being replayable.
+    clock: deps.now ?? (() => 0),
+  });
+  versioned.write(emptyBlackboard(), "orchestrator", "fan-out opened (no findings yet)");
+
   if (clusters.length === 0) {
     // No communities ⇒ nothing to fan out over. Honest rather than clever: the deterministic
     // fallback still produces a grounded reading order from entry points + centrality, which is
     // exactly what a single-community repository deserves.
-    const board = emptyBlackboard();
     warnings.push("No code communities were detected, so there was nothing to fan out over.");
+    // Recorded as a READ even though there is nothing to read: the fallback still consulted the
+    // board, and a history with a synthesis but no read would look like the synthesis came from
+    // nowhere.
+    const read = versioned.read("fallback-synthesis", "no communities; deterministic fallback");
+    const board = read.state ?? emptyBlackboard();
     return {
       synthesis: fallbackSynthesis(board, deps.result, deps.maxReadingSteps ?? SUPERVISOR_MAX_READING_STEPS),
       blackboard: board,
+      blackboardHistory: versioned.report(),
       routes: [],
       skippedClusters: [],
       peakConcurrency: 0,
@@ -147,7 +192,6 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
   let specialistCalls = 0;
   let bestOfNExtraCalls = 0;
   let budgetExhausted = false;
-  let board: Blackboard = emptyBlackboard();
 
   // One job per (community, specialist). Ordered community-by-community with the hardest first, so
   // the concurrency cap spends its slots on the interesting work rather than starving it in a tail.
@@ -287,15 +331,39 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
   // this the entry ORDER would depend on scheduling, and the whole run would stop being reproducible
   // for a reason that has nothing to do with the models.
   entries.sort((a, b) => a.cluster - b.cluster || a.specialist.localeCompare(b.specialist));
-  for (const entry of entries) board = post(board, entry);
+  for (const entry of entries) {
+    // Read the latest version rather than carrying a running copy. One source of truth: a local
+    // `board` alongside the log would be a second place the state could live, and the first time the
+    // two disagreed the log would be the one that looked authoritative while being wrong.
+    const previous = versioned.current() ?? emptyBlackboard();
+    versioned.write(
+      post(previous, entry),
+      `${entry.specialist}@c${entry.cluster}`,
+      entry.status === "ok"
+        ? `${entry.findings.length} finding(s)${entry.samples > 1 ? ` from ${entry.samples} sample(s)` : ""}`
+        : `${entry.status}: ${entry.reason ?? "no reason given"}`,
+    );
+  }
 
   // --- Supervise -----------------------------------------------------------
   const nodeIds = new Set((deps.result.graph?.nodes ?? deps.result.files).map((node) => node.id));
   const maxSteps = deps.maxReadingSteps ?? SUPERVISOR_MAX_READING_STEPS;
+
+  // PEEK, build, then RECORD the read. Peeking with `at()` rather than `read()` first is what lets
+  // the recorded note say how much of the board the supervisor was actually shown — the one thing
+  // a replay most wants to know, and it is not knowable until the bounded selection has run.
+  // Nothing writes between the two, which a test asserts by comparing the versions.
+  const versionAtSupervision = versioned.currentVersion();
+  const board = versioned.at(versionAtSupervision) ?? emptyBlackboard();
   const supervisorPrompt = buildSupervisorPrompt(board, deps.result, {
     maxFindings: deps.maxSupervisorFindings ?? SUPERVISOR_MAX_FINDINGS,
     maxSteps,
   });
+  const supervisorRead = versioned.read(
+    "supervisor",
+    `shown ${supervisorPrompt.shown.length} of ${board.findings.length} finding(s), ` +
+      `${supervisorPrompt.context.total} prompt token(s)`,
+  );
 
   let synthesis = null as ReturnType<typeof fallbackSynthesis> | null;
   let supervised = false;
@@ -329,9 +397,29 @@ export async function runFanOut(deps: FanOutDeps): Promise<FanOutResult> {
     }
   }
 
+  const history = versioned.report();
+  if (supervisorRead.version !== versionAtSupervision) {
+    // Cannot happen with today's single-threaded fold, and it is asserted rather than assumed
+    // because if a future change DID write between the peek and the read, every replay would
+    // silently attribute the synthesis to the wrong version.
+    warnings.push(
+      `Blackboard version moved between building the supervisor prompt (v${versionAtSupervision}) ` +
+        `and recording the read (v${supervisorRead.version}); replay attribution is unreliable.`,
+    );
+  }
+  if (history.trimmedBefore > 1) {
+    // Reported, never silent — the same rule the community cap follows. A replay that cannot reach
+    // the start of the run must say so rather than looking complete.
+    warnings.push(
+      `Blackboard history was trimmed: versions before ${history.trimmedBefore} of ${history.totalWrites} ` +
+        "are no longer replayable.",
+    );
+  }
+
   return {
     synthesis: synthesis ?? fallbackSynthesis(board, deps.result, maxSteps),
     blackboard: board,
+    blackboardHistory: history,
     routes: plan.routes,
     skippedClusters: plan.skippedClusters,
     peakConcurrency: tracker.peak,

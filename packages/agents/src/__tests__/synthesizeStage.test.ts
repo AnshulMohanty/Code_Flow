@@ -225,6 +225,33 @@ describe("createFanOutSynthesizeStage — the stage contract is unchanged", () =
     expect(event.detail).toMatch(/specialist calls/);
   });
 
+  it("REPORTS the blackboard REPLAY facts on the event (V3-P5 task 2e, wired V3-FINAL)", async () => {
+    // Before this the versioned blackboard existed and nothing used it, so a completed run left no
+    // record of which board state the supervisor synthesised from. `blackboardReadVersion` is the
+    // one that makes a later "why did it say that?" resolve to a state rather than to a guess.
+    const { event } = await createFanOutSynthesizeStage({ chatClient: fanOutChat(), now: () => 1 }).run(input, ctxFor());
+    const preview = event.preview as Record<string, unknown>;
+    expect(preview.blackboardVersions).toBeTypeOf("number");
+    expect(preview.blackboardVersions as number).toBeGreaterThan(1);
+    // The supervisor read the HEAD, so the two agree — and a mismatch would mean the log lost the
+    // state the synthesis came from.
+    expect(preview.blackboardReadVersion).toBe(preview.blackboardVersions);
+    // 1 means nothing was trimmed, i.e. a replay can reach the start of the run.
+    expect(preview.blackboardTrimmedBefore).toBe(1);
+  });
+
+  it("logs the version-log HEADER, not sixty lines of it, per job", async () => {
+    const ctx = ctxFor();
+    const logged: string[] = [];
+    ctx.logger.info = (message: string) => logged.push(message);
+    await createFanOutSynthesizeStage({ chatClient: fanOutChat(), now: () => 1 }).run(input, ctx);
+    const line = logged.find((message) => message.startsWith("Fan-out blackboard:"));
+    expect(line).toMatch(/\d+ write\(s\), \d+ read\(s\)/);
+    // One line. A per-version dump would drown a worker's log at exactly the throughput where the
+    // log matters most.
+    expect(line).not.toContain("v1 @");
+  });
+
   it("keys the cache on the COMMUNITY PARTITION, not only the SHA", async () => {
     // A different partition is a different fan-out even at the same commit; serving the old
     // synthesis would be answering about a structure that no longer exists.

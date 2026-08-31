@@ -229,6 +229,9 @@ importers:
       '@codeflow/memory':
         specifier: workspace:*
         version: link:../memory
+      '@codeflow/observability':
+        specifier: workspace:*
+        version: link:../observability
       '@codeflow/retrieval':
         specifier: workspace:*
         version: link:../retrieval
