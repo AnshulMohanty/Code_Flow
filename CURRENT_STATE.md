@@ -613,6 +613,65 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-P5 — marvel + reach (branch `v3/p5-marvel-reach`)
+
+> Full detail and the honest deviations: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P5`,
+> backfilled 2026-09-01).
+
+| # | Task | Status |
+|---|---|---|
+| 1 | **Latency** — readiness-based parallel stages, warm pool, model routing, speculative prefetch, `/health.warmedUp`, four latency tiers | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** Scheduling, warm-up, routing and the tiers all landed and are measured (sequential 67ms → layered 38ms, **1.76×**, orchestration-only). Two pieces did NOT resolve truthfully: `createSpeculator` had zero call sites, and `/health.warmedUp` on the API was structurally always false. |
+| 2 | **Observability** — OTel-shaped traces, per-agent interaction graph, per-step tokens/$, Langfuse/Helicone, versioned blackboard | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** The tracer, the interaction graph and the cost model are real. But `exportersFromEnv`, `createVersionedBlackboard` and `Span.recordUsage` all had zero production call sites — so every trace went nowhere and **every cost report read $0.00**. |
+| 3 | **MCP server** (`apps/mcp`) — graph + retrieval + verifier tools, default-deny scopes | ✅ **MET.** Built on `@modelcontextprotocol/sdk` after a dependency probe; the tools are the SAME objects the internal agent uses, so the two cannot drift. ⚠️ Never called by a real external agent — that is manual. |
+| 4 | **Local-first CLI** — on-device parse, embedded store, local embeddings, zero egress | ✅ **MET, with two named substitutions.** Shares the core packages; only the embedder and store differ. LanceDB (656 MB, NAPI, drags back onnxruntime) and int8 MiniLM (needs a NAPI tokenizer) were probed and REJECTED on evidence; a JSON file store and feature-hashed bag-of-words ship instead. **Both OWNER-DEFERRED** — see the ledger. |
+| 5 | **Deploy** — HEALTHCHECK, autoscale, CDN, keepalive, live benchmark | ✅ **CONFIG MET, execution deferred.** Worker `/health` `/ready` `/metrics` with a pure handler; `WORKER_CONCURRENCY` clamped-and-announced; web probes nginx's own `/healthz`. Resolved **ledger #20** and **#21**. ⚠️ Nothing deployed; the live benchmark against a deployed URL is owner-manual. |
+| 6 | **Offline memory consolidation** — per-community findings into a queryable repo KB | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** The consolidation is real, extractive and byte-deterministic. But the KB was built inside the run and discarded with it — nothing persisted it, so no surface could show what five specialists found. |
+
+**Gates at ship:** typecheck ✅ · lint ✅ · **1207 tests** ✅ · build ✅ · legacy 25/25 ✅ · compose ✅
+
+**Why the gates were green with four unwired modules:** a unit test proves a module WORKS. It does not
+prove anything USES it. Every one of the four had a full passing suite.
+
+---
+
+### V3-FINAL — wire-in + frontend build + verify (branch `v3/final-build-verify`)
+
+> Full detail: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-09-01 — V3-FINAL`).
+> Per-check verdicts and the still-remaining owner list: **[VERIFICATION_REPORT.md](VERIFICATION_REPORT.md)**.
+
+**Part 1 — the unwired modules**
+
+| Item | Status |
+|---|---|
+| `exportersFromEnv` on the live path (P5 DoD 2d) | ✅ **DONE.** Resolved once at boot; default is a bounded in-memory replay buffer (no network); Langfuse/Helicone fan out beside it from env. `/metrics` reports exported/retained/dropped and the last trace's cost. Test asserts 0 before a run, 1 after. |
+| `/health.warmedUp` honest (P5 DoD 1e) | ✅ **DONE.** Three real API tasks — `mongo-connection` (required), `shared-redis`, `qa-dependencies` — registered from an injected, testable module at the composition root. The Postgres schema round trip that was paid inside the first `/ask` is now paid at boot. |
+| `createVersionedBlackboard` on the live fan-out (P5 DoD 2e) | ✅ **DONE.** The running state IS the log; the supervisor's read is recorded against the version it saw with the bounded-selection count. `maxVersions` derived, clock injected, history byte-identical across runs. |
+| `createSpeculator` in the orchestrator (P5 DoD 1d) | ✅ **DONE.** Stages DECLARE (`StageSpeculationSource`), the orchestrator launches. RAG's chunk plan is built during synthesis's provider wait — **the disk pass happens once, not twice** — and the rag slice is byte-identical with and without. **Two real bugs in the unwired module fixed:** a queued task was invisible to `claim`, and settle did not drain the queue. |
+| `Span.recordUsage` + `pricing` + the wallet bug | ✅ **DONE** (beyond the brief; found by the audit). Cost was structurally $0.00 for every run, and `budget.record` sat after the grounding check — so a rejected completion was charged by the provider and never by us. Measured on the retry path: **3 paid attempts, $31.50, recorded three times.** |
+
+**Part 2 — the frontend**
+
+| Item | Status |
+|---|---|
+| Marketing site (paper/light): nav + status pill, hero + mesh + ticker, 01 Resolve, 02 Grounding, 03 Numbers, CTA, footer | ✅ **BUILT**, wired to real analysis output. Four em-dashes with their reasons when nothing is analysed. |
+| Workbench (dark): entry, resolving, 01 SYSTEM · 02 EXPLORE · 03 IMPACT · 04 DOMAINS | ✅ **BUILT.** Tabs appear only once a result exists. |
+| Deterministic derivations (lanes, edge classes, hop tiers, API reachability, test reachability, entry-probable) | ✅ **ADDED HERMETICALLY** — `apps/web/src/lib/architecture.ts`, 35 tests. |
+| Domain lanes surfaced as INFERENCE | ✅ **ADDED.** `AnalysisResult.ai.domains` — bounded, re-grounded, titles derived from real paths. Labelled inferred three times on TAB 04. |
+| Measured chrome facts | ✅ **ADDED.** `/api/meta` + a measured per-process p50 with its scope and sample count. |
+| Architectural VIOLATION rules | ✅ **OWNER-DECIDED, then built.** Two rules: UI→platform direct, API skips domain. No third. The legend key is omitted when neither fires. |
+| "TESTS THAT COVER IT" | ✅ **OWNER-DECIDED, then built.** Relabelled to **TEST FILES THAT REACH IT** — role=test files reaching it by import, with the nearest hop count, and the caption says "by import reachability, NOT coverage". |
+| The mock-data path | ✅ **REMOVED.** `PublicRepoInput`'s "Use Mock Data Instead" button loaded fabricated modules and metrics into every view; the fixture moved to `src/test/fixture.ts`. |
+| Dead code from the rebuild | ✅ **REMOVED.** 5 ui primitives, `graphView`, `pipeline`, `dashboard`, `analysisNormalizer`, `types/web`, plus the `react-force-graph-2d` and `zustand` dependencies. |
+
+**Part 3 — verification**
+
+All nine checks in `VERIFICATION_REPORT.md`. One finding fixed in-pass: the Arena's citation verifier
+had no consumer and `@codeflow/eval` kept its own copy, so V3-P0 §0.5's stated benefit was not true.
+The RULE (not the async wrapper) is now shared.
+
+**Gates:** typecheck ✅ (exit 0) · lint ✅ (exit 0) · **1336 tests** ✅ (1207 → 1336, **+129**) ·
+build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval check ✅
+
 ### V3-P4 — bounded agent fan-out + test-time compute (branch `v3/p4-agent-fanout`)
 
 > Full detail, every measurement and six flagged judgment calls:
@@ -1248,13 +1307,26 @@ former blocker — is **DONE** this session).
     ledger #8 already flags for the inline RAG vectors. Measure both together on a genuinely large
     repo; the Phase 2 move of embeddings out of `analyses` is the natural time to decide whether the
     graph slice needs externalizing too.
-    **STATUS REPORTED, deliberately NOT resolved (V3-P2).** P2 removed the LARGE contributor —
+    **✅ RESOLVED (V3-P5, `4abd45f`).** The analysis document now MEASURES itself and externalises the
+    heavy optional fields only when it would otherwise approach the 16MB ceiling — a normal analysis
+    takes the original path exactly, same document, no second collection, no manifest. When it cannot
+    fit even fully shed, it fails LOUDLY with the sizes and the three largest remaining slices, which
+    is the difference between a diagnosable limit and a driver error that names no field. V3-FINAL
+    added two fields to the document (`cost`, six numbers; `ai.domains`, a bounded projection) and both
+    were sized against this ceiling before being added.
+    *Prior status, kept for the record —* **STATUS REPORTED, deliberately NOT resolved (V3-P2).** P2 removed the LARGE contributor —
     the inline vectors (ledger #8) — which changes the arithmetic substantially: the document no
     longer grows with the embedding dimension at all. What remains is the graph slice's own growth,
     which is still UNMEASURED on a genuinely large repo, and externalising it on a guess would be
     building without evidence. The decision point is the first big-repo end-to-end run (see the
     deferred-manual list in PHASE_LOG).
-21. **The Q&A ANSWER CACHE is still per-API-process (V3-P0).** V3-P0 fixed the wallet half of the old
+21. **The Q&A ANSWER CACHE is still per-API-process (V3-P0). ✅ RESOLVED (V3-P5, `4abd45f`).** Both
+    halves are now Redis-backed when Redis is available: the answer cache (`redisAnalysisCache.ts`) and
+    the repo memory whose per-commit snapshots `what_changed` diffs — the sibling this entry named. Both
+    fall back to in-memory and both ANNOUNCE it, and the answer cache announces at INFO rather than WARN
+    on purpose: an unshared answer cache costs money, not correctness, and a warning that fires on every
+    boot of a keyless local deployment trains operators to ignore warnings.
+    *Prior status, kept for the record —* V3-P0 fixed the wallet half of the old
     #9/14 split — the daily budget is now one shared Redis counter — but `ragQaService` still keeps its
     answer cache in a process-local Map. Consequence: two API replicas each pay for the same repeated
     question once, and a restart forgets every answer. Not a correctness or spend-ceiling problem
@@ -1292,3 +1364,49 @@ former blocker — is **DONE** this session).
     behaviour, or ioredis's reconnect story. Same status as the Anthropic/Gemini/Voyage adapters
     (ledger #5, #12): a real-service smoke run is the proof. Related: the worker now REQUIRES Redis for
     the budget (it already required it for BullMQ), so there is no fallback path there to test.
+26. **Local vector store is a JSON file, not LanceDB (V3-P5) — OWNER-DEFERRED.** `createFileVectorStore`
+    writes one JSON document per namespace and does an exact cosine scan; the ordering matches pgvector's,
+    and the file is inspectable with `cat`, which is what makes "zero code egress" checkable rather than
+    asserted. It is O(n) and wrong for a million chunks; it is correct for one repository. LanceDB was
+    PROBED and rejected on evidence: `@lancedb/lancedb@0.37.1` is **656 MB installed**, a
+    platform-specific Rust NAPI binary, and it drags back `onnxruntime-node` (211 MB, already rejected in
+    V3-P2) plus `sharp`, with three install scripts between them — the opposite of the feature for a CLI
+    whose selling point is a laptop with no toolchain. Adopting it would also make the suite
+    non-hermetic. **Re-confirmed honestly documented by the V3-FINAL audit** (`localVectorStore.ts`, the
+    local-cli module note, and PHASE_LOG all say what it is). Owner will revisit.
+27. **Local embeddings are feature-hashed bag-of-words, not int8 MiniLM (V3-P5) — OWNER-DEFERRED.**
+    `createLocalEmbeddingClient` hashes token features into a fixed-dimension vector: lexical, not
+    semantic, so it finds a chunk that shares WORDS with the query and not one that shares MEANING. The
+    local-cli's similarity floor is set higher than the hosted one for exactly that reason, and the
+    module says so. int8 MiniLM was probed: `onnxruntime-web` is WASM-clean and would have been right,
+    but the tokenizer it needs is itself NAPI, and the model download makes the suite non-hermetic.
+    **Re-confirmed honestly documented by the V3-FINAL audit.** Owner will revisit.
+28. **`Span.recordUsage` had no call site, so every trace reported $0.00 (V3-P5). ✅ RESOLVED
+    (V3-FINAL).** The recording tracer's headline claim — "cost is MEASURED, not estimated" — was
+    structurally false in production: the AI stages held the provider's real read-back and dropped it,
+    and `RecordingTracerOptions.pricing` was an accepted option no composition root supplied.
+    `ProgressEvent.usage` now carries it (a first-class field, not three numbers through `preview`,
+    because it carries the `measured` flag), the orchestrator forwards it, the worker records it from
+    EVERY event — not just terminal ones, since an AI stage's terminal event only exists on the success
+    path — and `AnalysisResult.cost` persists the total. `pricingFromEnv(LLM_PRICING)` returns an EMPTY
+    table when unconfigured, so `usd` stays NULL and the unpriced models are named. **Setting
+    `LLM_PRICING` is an owner step — see GO_LIVE.md.**
+29. **A rejected completion was charged by the provider and never by the budget (V3-P5 and earlier).
+    ✅ RESOLVED (V3-FINAL).** `budget.record` sat AFTER the schema/grounding check in `synthesize` and
+    AFTER the whole batch loop in `rag`, so a completion the grounding check rejected was never recorded,
+    and a throw on embedding batch 7 discarded the usage of batches 1–6. Three rejected synthesis
+    attempts spent real money against a daily ceiling that never saw a token of it — the wallet guard was
+    blind to exactly the failure mode that retries most, and the retry loop makes it a multiple rather
+    than a rounding error. Both now charge at the point the provider call SUCCEEDS, before the output is
+    judged. Asserted: 3 paid attempts ⇒ 3 records ⇒ $31.50 measured.
+30. **The Q&A answer-latency p50 is PER-PROCESS (V3-FINAL).** `answerLatency.ts` keeps a bounded
+    in-memory ring of recent answered-request wall-clocks. It does not survive a restart and two API
+    replicas report two different numbers. The limitation travels WITH the figure — the payload carries
+    `scope: "process"` and `sampleCount`, and the UI renders both — so nothing reads it as a fleet
+    percentile. Making it global means putting the samples in the Redis this process already has, which
+    is the same wiring task ledger #21 tracked for the answer cache; deliberately NOT done on a guess
+    about whether anyone needs it.
+31. **The MCP server has never been called by a real external agent (V3-P5).** `apps/mcp` is unit-tested
+    against its own tool objects, its scope allowlist and its refusal paths — 33 tests, all hermetic. A
+    real Cursor / Claude Code / Windsurf session is the proof that the transport, the handshake and the
+    tool schemas work end to end, and it is manual. In `GO_LIVE.md`.

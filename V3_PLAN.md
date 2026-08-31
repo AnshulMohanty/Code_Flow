@@ -330,14 +330,81 @@ script.
 **Goal:** the engineering-marvel layer and distribution.
 **Entry gate:** Phase 4 `[x]`.
 
-- [ ] **Latency:** DAG-layered parallel scheduling over the known pipeline DAG; persistent warm worker pool; model routing; speculative prefetch on the hard tail; cold-start warmup (HH_Goa pattern) with `/health.warmedUp`. Report the 4 latency tiers independently (`coreAnalysis`, `aiSynthesis`, `qaCoreHit`, `qaGenerate`).
-- [ ] **Observability:** OpenTelemetry traces per run; per-agent interaction graph; per-step tokens/$; wire Langfuse/Helicone; versioned blackboard for replay.
-- [ ] **MCP server** (`apps/mcp`, replacing the `card-action`/`local-cli` stub direction): expose graph + retrieval + **verifier** tools so Cursor/Claude Code/Windsurf can call the engine. Allowlist scopes deliberately.
-- [ ] **Local-first CLI:** `web-tree-sitter` parse on-device, embedded graph store (LanceDB/KuzuDB), int8 MiniLM local embeddings, zero code egress; shares the core packages.
-- [ ] **Deploy:** add `HEALTHCHECK` to worker + web; autoscaled worker pool; CDN for SPA; ping-to-prevent-cold-sleep; run the live benchmark against the deployed URL and confirm budgets hold on cloud CPU.
-- [ ] **Offline memory consolidation** pass (design doc §2.3): consolidate per-community findings into a queryable repo KB.
+- [x] **Latency:** DAG-layered parallel scheduling over the known pipeline DAG; persistent warm worker pool; model routing; speculative prefetch on the hard tail; cold-start warmup (HH_Goa pattern) with `/health.warmedUp`. Report the 4 latency tiers independently (`coreAnalysis`, `aiSynthesis`, `qaCoreHit`, `qaGenerate`).
+      → **DONE, but only after V3-FINAL closed two gaps V3-P5 left open.** The measurement changed the
+      design: pure LAYER BARRIERS measurably UNDER-parallelise this DAG (shape `[1,1,1,1,1,2,1]` — `rag`
+      is ready a layer before `synthesize`, so a barrier serialises the two slowest stages against each
+      other), so stages launch by DEPENDENCY READINESS instead. Byte-identical slices across both modes,
+      asserted. Sequential 67ms → layered 38ms (**1.76×**) — and that number is ORCHESTRATION-ONLY, on a
+      harness whose stages do no real parse work. The "warm pool" is a registry of PROCESS-lifetime
+      resources, not a pool of processes; calling it the latter would describe an architecture that does
+      not exist. **The two gaps:** `createSpeculator` shipped with ZERO production call sites, and
+      `/health.warmedUp` on the API was STRUCTURALLY always false (zero registered tasks, and the flag is
+      `required.length > 0 && …`). Both closed in V3-FINAL — and wiring the speculator exposed two real
+      bugs in it: a queued task was invisible to `claim`, and settle did not drain the queue.
+- [x] **Observability:** OpenTelemetry traces per run; per-agent interaction graph; per-step tokens/$; wire Langfuse/Helicone; versioned blackboard for replay.
+      → **DONE, but only after V3-FINAL.** No direct OTel dependency, deliberately: the API alone is a
+      NO-OP without an SDK, an exporter and a collector. A `Tracer` interface with an in-memory recorder
+      as the hermetic default, OTel/Langfuse/Helicone as injected adapters, and the interaction graph
+      DERIVED from the span tree so it cannot drift. **Three gaps:** `exportersFromEnv` and
+      `createVersionedBlackboard` had zero production call sites, and `Span.recordUsage` had zero call
+      sites AT ALL — so the headline claim ("cost is MEASURED, not estimated") reported **$0.00 for every
+      run**. All three wired in V3-FINAL, which also found and fixed a WALLET BUG behind the third:
+      `budget.record` sat after the schema/grounding check, so a completion the grounding check rejected
+      was charged by the provider and never by us. Langfuse/Helicone still activate only from env — a
+      real send needs the owner's keys and is in the runbook.
+- [x] **MCP server** (`apps/mcp`, replacing the `card-action`/`local-cli` stub direction): expose graph + retrieval + **verifier** tools so Cursor/Claude Code/Windsurf can call the engine. Allowlist scopes deliberately.
+      → **DONE.** Dependency probe first (`@modelcontextprotocol/sdk@1.30.0`: 24 MB, pure JS, no native
+      binaries, no install scripts; the cost is isolated to this app). The tools answer what grep cannot
+      — who CALLS this, what BREAKS if I change it, and the unusual one: is my answer TRUE — and they are
+      the SAME objects the internal agent uses, so the two cannot drift on what "who calls this" means.
+      Scopes are coarse (three, not one per tool: a 12-item allowlist is one nobody reads) and
+      DEFAULT-DENY; unset ⇒ nothing is exposed; an unknown scope name REFUSES TO START. ⚠️ Never called
+      by a real external agent — that proof is manual and is in the runbook.
+- [x] **Local-first CLI:** `web-tree-sitter` parse on-device, embedded graph store (LanceDB/KuzuDB), int8 MiniLM local embeddings, zero code egress; shares the core packages.
+      → **DONE, with TWO named substitutions rejected on measured evidence.** It shares the core packages
+      — same stages, graph, chunker and grounding — and only the embedder and the store differ, both
+      behind the interfaces V3-P2 built for exactly this swap. LanceDB is 656 MB installed with a
+      platform-specific Rust NAPI binary and drags back `onnxruntime-node` (211 MB, already rejected in
+      V3-P2) plus `sharp`: the opposite of the feature for a CLI whose selling point is a laptop with no
+      toolchain. int8 MiniLM needs a tokenizer that is itself NAPI. A JSON file store (exact cosine scan,
+      same total order as pgvector, inspectable with `cat` — which is what makes "zero egress" checkable
+      rather than asserted) and feature-hashed bag-of-words ship instead. **Both are OWNER-DEFERRED**
+      (ledger #26/#27), not pretended: the code and the docs both say what they are.
+- [x] **Deploy:** add `HEALTHCHECK` to worker + web; autoscaled worker pool; CDN for SPA; ping-to-prevent-cold-sleep; run the live benchmark against the deployed URL and confirm budgets hold on cloud CPU.
+      → **CONFIG DONE; EXECUTION DEFERRED, and the split is deliberate.** Worker `/health` `/ready`
+      `/metrics`, with the handler a PURE function of injected state so the hermetic suite tests real
+      status codes without binding a port. A heartbeat FILE was considered and rejected: an autoscaler
+      cannot read it, and `pgrep node` is true of a worker wedged on a dead Redis connection — the single
+      most likely way this process fails while looking alive. web probes nginx's OWN `/healthz`, because
+      the SPA fallback returns `index.html` for any unmatched path and would report healthy with every
+      asset missing. `WORKER_CONCURRENCY` clamps-and-announces rather than refusing to boot during a
+      scale-out. Resolved ledger #20 and #21. ⚠️ **Nothing is deployed and the live benchmark has not
+      run** — both are owner-manual and are in `GO_LIVE.md`.
+- [x] **Offline memory consolidation** pass (design doc §2.3): consolidate per-community findings into a queryable repo KB.
+      → **DONE, and PERSISTED only in V3-FINAL.** Extractive, not generative, and that is the central
+      decision: another LLM pass would spend money compressing information the fan-out already paid to
+      produce, make the KB NON-DETERMINISTIC (so you could not diff, cache or trust it to answer twice),
+      and add a new place for an ungrounded claim immediately after the fan-out grounded every fileId to
+      its own community. Corroboration is what consolidation ADDS — two independent lenses agreeing is
+      information that did not exist in the flat list. **The gap:** the KB was built inside the run and
+      discarded with it, so nothing a user could see was ever produced from five specialists' work.
+      V3-FINAL added `AnalysisResult.ai.domains` — a bounded, re-grounded projection rendered on the
+      workbench's DOMAINS tab and labelled as inference, never as fact.
 
 **Phase 5 DoD:** all gates green · latency tiers published · MCP server usable from an external agent · local-first mode analyzes a repo offline.
+→ **MET as of V3-FINAL (2026-09-01); NOT met as V3-P5 shipped.** Gates green ✅ — typecheck, lint,
+**1336 tests**, build, legacy 25/25, compose config. Latency tiers published ✅ (orchestration-only; a
+real-repository number needs the deployed benchmark). Local-first analyses a repo offline ✅. MCP server
+"usable from an external agent" is **⚠️ built and unit-tested but never exercised by a real one** — that
+proof is manual.
+
+**Why this box could not honestly be ticked when the phase shipped.** Four modules had a complete,
+passing test suite and ZERO production call sites, and one flag was incapable of ever being true. The
+gates were green throughout, because **a unit test proves a module WORKS — it does not prove anything
+USES it.** The V3-FINAL audit greps every exported runtime symbol for a call site outside its own file,
+its barrel and the suite; that check is recorded in `VERIFICATION_REPORT.md` and is the reason this tick
+is trustworthy.
 
 ---
 

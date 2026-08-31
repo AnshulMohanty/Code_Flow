@@ -2365,6 +2365,408 @@ resolved by the same deferred big-repo run.
 
 ---
 
+## 2026-08-31 — V3-P5: marvel + reach (branch `v3/p5-marvel-reach`)
+
+**BACKFILLED 2026-09-01.** This entry was never written when the phase shipped; it is reconstructed
+from the six commits (`a49ca37` … `3748205`) and from reading the code they produced. Where the
+backfill found a claim the code does not support, it says so here rather than in a footnote — those
+gaps are what V3-FINAL then closed, and the next entry records the fixes.
+
+Six commits, ~10,000 lines. The engineering-marvel layer (latency, observability) and the
+distribution layer (MCP, local-first, deploy config), plus offline consolidation of the fan-out's
+findings.
+
+### Task 1 — latency (`a49ca37`)
+
+**The measurement changed the design.** A first implementation used pure LAYER BARRIERS. The measured
+layer shape is `[1,1,1,1,1,2,1]`: the deterministic chain is genuinely linear, and `rag` reads only
+`{graph, structure, inventory}` — so it is ready one layer BEFORE `synthesize`, which needs `metrics`.
+A layer barrier then blocks `synthesize` behind `rag` finishing, serialising the two SLOWEST stages
+against each other. Exactly backwards. So stages launch by DEPENDENCY READINESS, not by layer.
+
+The deterministic spine survives because each stage is launched with a snapshot holding every slice it
+DECLARED, slices are per-key, and nothing mutates one after assignment. A test asserts byte-identical
+slices across both modes, including the failure path. Per-stage timings are excluded from that
+comparison — they are wall-clock facts about one execution, so a scheduler that changed nothing else
+would still change them. Opt-in via `PARALLEL_STAGES`.
+
+Also: a warm-up registry (the real cost is the tree-sitter WASM grammars — a one-time load whichever
+job arrives first would otherwise pay), model routing behind `maybeRouted` (which returns the single
+client UNWRAPPED when only one tier exists, so a deployment with no `FAST_MODEL` keeps byte-identical
+cache keys), and a speculator with a staging layer and a real rollback.
+
+**Measured, hermetically:** sequential 67ms → layered 38ms (**1.76×**) on the orchestration harness.
+The note beside it is load-bearing: this measures ORCHESTRATOR OVERHEAD, not parsing — the hermetic
+stages do no real work — so it is a bound on the scheduling win, not a claim about a real repository.
+
+**TWO THINGS THIS TASK CLAIMED AND DID NOT DELIVER** (found by the V3-FINAL audit):
+- `createSpeculator` had **zero production call sites**. The staging layer and the rollback — the part
+  the module argues is the whole point — could never fire.
+- `/health.warmedUp` on the API was **structurally always false**: the route read the shared registry
+  and the API process registered nothing into it, and `warmedUp` is `required.length > 0 && …`. Not
+  "false because cold" — incapable of ever being true. The suite asserted `false` and therefore passed
+  forever while describing a broken endpoint.
+
+### Task 2 — observability (`dd22e56`)
+
+Not a direct OpenTelemetry dependency, and that is the design: `@opentelemetry/api` on its own is a
+NO-OP (spans go nowhere without an SDK, an exporter and a collector), so it would add weight to every
+consumer while changing nothing observable. Instead a `Tracer` interface with an in-memory RECORDER as
+the hermetic default and OTel/Langfuse/Helicone as INJECTED adapters. The package depends on nothing.
+
+Span ids are DETERMINISTIC (`s1`, `s2`, …), not UUIDs — a random id makes every recorded trace
+unassertable. The interaction graph is DERIVED from the span tree rather than recorded separately, so
+it cannot drift; nodes key on span NAME, so 60 `specialist:security` spans collapse to one node with
+`calls: 60`, which is the difference between a readable fan-out and 300 flat rows. A trace with an
+unended span reports `complete: false` and says so in the rendering.
+
+**THREE THINGS THIS TASK CLAIMED AND DID NOT DELIVER** (found by the V3-FINAL audit):
+- `exportersFromEnv` had **zero production call sites**. Every run built a full report and handed it to
+  `deps.traceExporter`, which nothing ever supplied.
+- `createVersionedBlackboard` had **zero production call sites**. The fan-out kept folding V3-P4's
+  unversioned value, so "what did the supervisor see?" stayed unanswerable in production while being
+  answerable in a unit test.
+- **`Span.recordUsage` had zero call sites at all.** The headline claim — "cost is MEASURED, not
+  estimated" — reported **$0.00 for every run**, because nothing ever fed it a number. The AI stages
+  had the provider's real read-back in hand and dropped it. `RecordingTracerOptions.pricing` was
+  likewise never supplied.
+
+### Task 3 — MCP server (`39d913e`)
+
+New `apps/mcp`. Dependency probe first, same discipline as the tree-sitter and reranker ones:
+`@modelcontextprotocol/sdk@1.30.0` is 24 MB, 94 packages, pure JS, zero native binaries, zero install
+scripts — adoptable, and isolated to this app.
+
+What earns a place on the surface: an external agent already has file search and grep. What it does
+not have is a code property graph, so the tools answer what grep cannot — who CALLS this, what BREAKS
+if I change it, and the unusual one: is my answer actually TRUE. `verify_answer` gives an exact, free,
+non-arguable verdict and REFUSES anything the graph cannot grade exactly rather than falling back to
+an opinion. The tools are the SAME objects the internal agent uses, so the two cannot drift.
+
+Scope allowlist, DEFAULT-DENY, three coarse scopes rather than one per tool (a 12-item allowlist is one
+nobody reads, and the first person to hit a denial turns them all on). Unset ⇒ nothing is exposed. An
+unknown scope name REFUSES TO START — a typo that silently denies is a debugging session, one that
+silently permits is an incident. A denied tool is ABSENT from the list rather than present-and-refusing.
+
+### Task 4 — local-first CLI (`6e07b59`)
+
+Analyses a repository entirely on-device: no key, no socket, no code leaving the machine. It SHARES
+the core packages — same stages, graph, chunker and grounding as the hosted path — and only the
+embedder and the store differ, both behind interfaces V3-P2 built for exactly this swap.
+
+**Two dependencies the plan named were probed and REJECTED on evidence,** with the substitutes named so
+nothing reads as more than it is:
+- **LanceDB** (`@lancedb/lancedb@0.37.1`): 656 MB installed, a platform-specific Rust NAPI binary, and
+  it drags back `onnxruntime-node` (211 MB, already rejected in V3-P2) plus `sharp`. For a CLI whose
+  selling point is running on a laptop with no toolchain, that is the opposite of the feature.
+  Replaced by `createFileVectorStore` — JSON per namespace, exact cosine scan, same total order as
+  pgvector. O(n) and wrong for a million chunks; correct for one repository, and inspectable with
+  `cat`, which is what makes "zero egress" checkable rather than asserted.
+- **int8 MiniLM**: `onnxruntime-web` is WASM-clean and would have been right, but the tokenizer it
+  needs is itself NAPI. Replaced by feature-hashed bag-of-words.
+
+Both substitutions are **OWNER-DEFERRED**, documented in the code, and re-confirmed by the V3-FINAL
+audit as honestly labelled — see the STILL-REMAINING list in `VERIFICATION_REPORT.md`.
+
+### Task 5 — deploy config (`4abd45f`)
+
+Config only; nothing is run or deployed. Healthchecks for the worker and web, the two images without
+one. A heartbeat FILE was considered and rejected: `docker` can check it but an autoscaler cannot read
+it, and `pgrep node` proves only that the process exists — true of a worker wedged on a dead Redis
+connection, the single most likely way it fails while looking alive. web probes nginx's OWN `/healthz`
+rather than `/`, because the SPA fallback returns `index.html` for any unmatched path and would report
+healthy with the entire asset directory missing.
+
+`WORKER_CONCURRENCY` with the previous hardcoded 2 as the default. Out-of-range values are CLAMPED and
+announced rather than rejected — a worker refusing to boot during a scale-out removes capacity at the
+moment it is most needed. Resolved **ledger #20** (analysis-document overflow) and **#21** (the
+per-process Q&A answer cache and repo memory, both now Redis-backed).
+
+### Task 6 — offline consolidation (`3748205`)
+
+A fan-out over 12 communities produces up to 60 findings; the supervisor reads 12 and the rest is paid
+for and discarded. This consolidates all of them into a compact knowledge base before they are lost.
+
+**Extractive, not generative,** and that is the central decision. Another LLM pass would spend money
+compressing information the fan-out already paid to produce; it would make the KB NON-DETERMINISTIC,
+so the same analysis yields a different KB each run and one you cannot diff, cache or trust twice; and
+it would add a new place for an ungrounded claim to enter immediately after the fan-out grounded every
+fileId to its own community. So: sorting, merging, de-duplicating, templating. Byte-identical for
+identical input, and independent of blackboard append order — which matters because findings arrive
+from concurrent specialists, so their order is a race.
+
+Corroboration is what consolidation ADDS: when two independent lenses make the same point, that
+agreement is stronger than either alone and invisible in a flat list.
+
+**WHAT THIS TASK CLAIMED AND DID NOT DELIVER**: the knowledge base was built inside the run and then
+discarded with it. Nothing persisted it, so no surface could show a user what five specialists found.
+V3-FINAL added `AnalysisResult.ai.domains` as a bounded, re-grounded projection.
+
+### Gates at the end of V3-P5
+
+| package | tests |
+|---|---:|
+| agents | 201 |
+| analyzers | 283 |
+| arena | 68 |
+| config | 0 (no test files) |
+| eval | 109 |
+| graph | 33 |
+| memory | 62 |
+| observability | 42 |
+| parsers | 28 |
+| retrieval | 155 |
+| shared-types | 3 |
+| api | 79 |
+| local-cli | 17 |
+| mcp | 33 |
+| web | 60 |
+| worker | 34 |
+| **total** | **1207** |
+
+typecheck ✅ · lint ✅ · 1207 tests ✅ · build ✅ · legacy 25/25 ✅ · compose config ✅
+
+### Honest deviations, stated at backfill time
+
+1. **Four modules shipped with no production call site** (`createSpeculator`, `exportersFromEnv`,
+   `createVersionedBlackboard`, `Span.recordUsage`) and **one flag was structurally always false**
+   (`/health.warmedUp` on the API). Each had a full test suite, which is why the gates stayed green:
+   a unit test proves a module WORKS, not that anything USES it. All five are closed in V3-FINAL.
+2. **The latency speedup is orchestration-only.** 1.76× on a harness whose stages do no real parse or
+   clone work. A real-repository number needs `scripts/live-benchmark.mjs` against a deployed URL —
+   owner-manual, and in the runbook.
+3. **The MCP server has never been called by an external agent.** It is unit-tested against its own
+   tool objects; a real Cursor/Claude Code session is the proof and it is manual.
+4. **Local vector store and local embeddings are substitutions, not the planned implementations.**
+   Owner-deferred; both need heavy downloads that would break hermeticity.
+5. **`/metrics` queue depth, autoscaling and the CDN are config.** Nothing was deployed.
+
+---
+
+## 2026-09-01 — V3-FINAL: wire-in + frontend build + verify (branch `v3/final-build-verify`)
+
+Nine commits. Every built-but-unwired module from V3-P5 put on a live path, the whole frontend built
+from the design against real data, and a verification pass over Phases 0–5 whose findings are in
+`VERIFICATION_REPORT.md`.
+
+**THE THEME, stated once because it is the same defect eight times: a unit test proves a module
+WORKS. It does not prove anything USES it.** Every gap closed below had a full, passing test suite
+and a green gate. What none of them had was a call site.
+
+### Part 1 — the four unwired modules and the always-false flag
+
+#### `exportersFromEnv` — trace export at the composition root (`02c89fc`, P5 DoD 2d)
+
+The recording tracer ran on every job and built a full report — per-span cost, the interaction graph,
+error spans — and handed it to `deps.traceExporter`, which nothing ever supplied.
+
+`exportersFromEnv` returning null is the RIGHT answer to "is a backend configured" — that is why it
+refuses to hand back a no-op object — but a composition root still has to decide what the exporter IS
+when the answer is null, and `undefined` is what shipped. So the default is now a bounded in-memory
+replay buffer: no network, no key, no dependency, oldest reports dropped first with the drop COUNTED.
+Langfuse/Helicone fan out beside it when their env is set, buffer first so a remote failure costs
+neither. The real network send stays deferred BY CONSTRUCTION — no test sets that env and no default
+provides it.
+
+`/metrics` now reports the exporter id, `remoteConfigured`, exported/retained/dropped counts and the
+last trace's cost with its `measured` flag. The test asserts 0 exported before a run and 1 after,
+which is exactly the assertion the V3-P5 wiring could not pass.
+
+#### `/health.warmedUp` — the API's real warm-up tasks (`3e14116`, P5 DoD 1e)
+
+Structurally always false. Now three real tasks: `mongo-connection` (REQUIRED — the readiness anchor,
+because `index.ts` refuses to boot without it), `shared-redis` (not required; every consumer degrades
+honestly, and configured-but-unreachable records FAILED so `/health` names it), and `qa-dependencies`
+(only when a provider is configured), which pre-resolves the answer cache, budget, session and repo
+memory, and the `CREATE EXTENSION` / `CREATE TABLE` round trip that was previously paid INSIDE the
+first `/api/result/:id/ask`. No probe requests: clients are constructed, never called.
+
+Registration is an injected, testable module rather than three lines in `index.ts` — putting it there
+would have reproduced the same bug in a new place: real behaviour no test can see. It is NOT in
+`createApp()`, because the suite builds the app dozens of times and warming a process-global singleton
+from a factory would make health assertions order-dependent.
+
+The old assertion is UPDATED rather than deleted: this suite genuinely registers nothing, so `false`
+there is now the honest answer, and it additionally asserts `tasks: []`, which is WHY.
+
+#### `createVersionedBlackboard` — replay on the live fan-out (`7c0527a`, P5 DoD 2e)
+
+The running state now LIVES in the append-only log. `post()` still computes the next immutable value
+and each is appended with the specialist that wrote it and what it contributed. There is deliberately
+no running `board` variable alongside it: a second copy is a second place the state could live, and
+the first time they disagreed the log would be the one that looked authoritative while being wrong.
+`blackboard` and the log's HEAD are asserted equal.
+
+The supervisor's READ is recorded against the version it saw, with a note carrying the bounded
+selection ("shown 12 of 15 finding(s), 668 prompt token(s)"). The note needs the selection count,
+which is why the code PEEKS with `at()`, builds the prompt, then records the read — and a version
+moving between those two steps would misattribute every replay, so it is checked and warned rather
+than assumed.
+
+`maxVersions` is DERIVED (`clusters × specialists + 2`), so a full-size fan-out can never trim. The
+clock is injected and defaults to a CONSTANT: two runs of the same input produce a byte-identical
+history, because a history you cannot diff is not one you can use to compare runs. The log is
+in-process only — a per-write history of a 60-entry fan-out is exactly the growth ledger #20 tracks.
+
+#### `createSpeculator` — speculative prefetch in the orchestrator (`2c069fa`, P5 DoD 1d)
+
+**Stages declare, the orchestrator launches.** Speculation needs two facts that live in different
+places: only the orchestrator knows a stage's reads are satisfied while the stage has not started
+(i.e. that there is a wait to spend), and only the stage knows its own cache key and how to fill it.
+`StageSpeculationSource` is the narrow optional capability that joins them, following
+`StageEmbeddingTarget`'s precedent.
+
+The one that pays for itself is RAG's chunk plan: a pure disk+CPU pass over every source file — no
+provider, no money — computable the moment `connect` lands, while the stage that needs it runs LAST,
+after `synthesize` has spent seconds blocked on a chat provider. In sequential mode (the default) that
+wait was entirely unused. **The test proves the disk pass happens ONCE, not twice.**
+
+Safe to default ON where layered scheduling is not: same function, same frozen prior slices, so the
+staged value is byte-identical — asserted by running the real pipeline both ways and comparing the rag
+slice. A claimed plan is still GROUNDED on the way in; "we computed it ourselves" is a reason to
+expect grounding to hold, not to stop checking.
+
+**Two real bugs in the unwired module, both found only by wiring it:**
+1. A queued task was **invisible to `claim`**. `staged` was populated when `pump()` dequeued, so
+   anything past the concurrency bound returned null: the caller recomputed the work AND the queued
+   task later ran and was discarded. The bound turned a hit into a miss plus a duplicate — worse than
+   not speculating. It was latent because the one test that over-queued asserted peak concurrency and
+   never checked that the claims returned values.
+2. `commit()`/`rollback()` cleared the maps but **left the queue**, so unclaimed tasks kept starting
+   after the run had decided what it wanted. "A wrong guess costs exactly the CPU it used" is only
+   true if we stop starting new ones.
+
+#### Beyond the brief: the measured cost reached nothing (`7fcb760`)
+
+Found while auditing for unwired code, and the same defect class:
+
+- **`Span.recordUsage` had zero call sites.** "Cost is MEASURED, not estimated" reported **$0.00 for
+  every run**.
+- **`RecordingTracerOptions.pricing`** was an accepted option no composition root supplied.
+- **THE WALLET BUG.** `budget.record` sat AFTER the schema/grounding check in synthesize and AFTER the
+  whole batch loop in RAG. A completion the grounding check rejected was **never recorded**, and a
+  throw on embedding batch 7 discarded batches 1–6. The provider charged for all of it. Three rejected
+  synthesis attempts spent real money against a daily ceiling that never saw a token — the wallet
+  guard was blind to exactly the failure mode that retries most, and the retry loop makes it a
+  multiple rather than a rounding error.
+
+Fixed: `ProgressEvent.usage` as a first-class field (not three numbers through `preview`, because it
+carries `measured` and an honesty flag a loose record can drop is one that will be); the orchestrator
+FORWARDS it; synthesize charges the moment `complete()` returns and emits an interim event per call;
+RAG charges per batch; the worker records usage from EVERY event, not just terminal ones — an AI
+stage's terminal event only exists on the success path, so attributing cost only there reports zero
+for a run that spent money and then failed. `pricingFromEnv(LLM_PRICING)` returns an EMPTY table when
+unconfigured, so `usd` is `null` and the unpriced models are NAMED. `AnalysisResult.cost` (six numbers,
+attached before `saveAnalysis`, omitted when nothing was spent).
+
+**Measured on the retry path: 3 paid attempts, $31.50, recorded three times** — the case both halves
+of the bug hid.
+
+### Part 2 — the frontend, from the design
+
+The claude_design MCP could not authorize in a non-interactive session, so the build is from the
+written spec plus the twelve screenshots the owner supplied; motion is a judgement call inside the
+design DNA, and that is recorded in `VERIFICATION_REPORT.md`.
+
+#### The data first, so no component had to invent anything (`b3bf10a`)
+
+- **`apps/web/src/lib/architecture.ts`** (35 tests): container lanes from role + PATH SEGMENTS, never
+  substrings (`src/dbutils/` is not the data lane); every assignment carries `matchedBy` so a hover can
+  say WHY; an unplaceable module renders UNCLASSIFIED rather than being dropped. Edge classification
+  with exactly the two owner-sanctioned violation rules and no third. Hop-tiered blast radius by
+  SHORTEST distance. MOVE impact as a genuinely different question from CHANGE — a rename breaks only
+  direct references, and counting four-hop dependents would inflate it into a refactor.
+- **`AnalysisResult.ai.domains`** (11 tests): the bounded, re-grounded projection of the fan-out's
+  knowledge base. Titles DERIVED from real shared paths, because a model-written title reads as a fact
+  while being a guess.
+- **`/api/meta`** + `answerLatency.ts` (11 tests): analyzer version, build SHA (null when unset — a
+  build id nobody can look up is decoration), the measured p50 with its per-process scope and sample
+  count travelling WITH it, and REAL indexed analyses. Refusals are excluded from the latency window —
+  a metric that improves when the product fails to answer is worse than none.
+- **`siteModel.ts`** (23 tests): maps the design's six rows onto the real eight stages, and makes the
+  three grounding states the run's ACTUAL delivered scope. Distinguishes "nothing was spent" from
+  "unpriced" — two different em-dashes.
+
+#### The two surfaces (`e34cedd`)
+
+**THE MOCK PATH IS GONE.** `PublicRepoInput` shipped a "Use Mock Data Instead" button that loaded
+fabricated module names, paths and metrics into every dashboard view. A user could not tell it from a
+real analysis. Deleted; nothing replaces it. The fixture moved to `src/test/fixture.ts`, which makes
+the boundary structural rather than a matter of discipline.
+
+Four em-dashes with nothing analysed, each with its reason. The status pill reads CONNECTING / READY /
+OFFLINE, green only when `/api/meta` answered. The hero mesh carries a visible "representative shape ·
+not a repository" badge. TAB 04 labels inference three times over and does NOT substitute the
+community partition when there are no lanes. TAB 01 omits the violation legend key when no rule fires.
+TAB 03's coverage card is relabelled to what it actually knows. TAB 02 states the provenance of the
+reading order.
+
+The radial layout replaces the force simulation: `react-force-graph-2d`'s positions are
+non-deterministic and encode nothing, whereas ring = fan-in rank means distance from the centre is how
+foundational a module is, and two runs draw the same map. Dropping it and `zustand` also removed two
+dependencies.
+
+**Removed as dead code, not as a missing feature:** five ui primitives, `graphView`, `pipeline`,
+`dashboard`, `analysisNormalizer`, `types/web` — all zero shipped importers after the new views
+landed. Their 23 tests went with them. Also fixed: the web suite never called RTL `cleanup`, so every
+render leaked into the next test.
+
+### Part 3 — verification
+
+Full report in `VERIFICATION_REPORT.md`. One finding fixed here:
+
+**`refactor(eval)` (`65fed98`)** — V3-P0 §0.5 wrapped the grounding passes as Arena verifiers so "the
+eval and the Arena stop needing their own copies". They did not: `answerScore.ts` kept its own
+`containedInRetrieved` and `createCitationVerifier` had zero consumers outside the Arena's own suite.
+The reason is the interesting part — a `Verifier` is async and sandbox-aware while `scoreAnswer` is a
+synchronous pure function, so the wrapper was the wrong SHAPE to share. The RULE is now exported on
+its own and both callers use it. The eval keeps its own zero-citation policy, deliberately, and a test
+says why.
+
+### Gates
+
+| package | before (V3-P5) | after | Δ |
+|---|---:|---:|---:|
+| agents | 201 | 225 | +24 |
+| analyzers | 283 | 305 | +22 |
+| arena | 68 | 68 | — |
+| config | 0 | 0 | — |
+| eval | 109 | 113 | +4 |
+| graph | 33 | 33 | — |
+| memory | 62 | 62 | — |
+| observability | 42 | 55 | +13 |
+| parsers | 28 | 28 | — |
+| retrieval | 155 | 155 | — |
+| shared-types | 3 | 3 | — |
+| api | 79 | 102 | +23 |
+| local-cli | 17 | 17 | — |
+| mcp | 33 | 33 | — |
+| web | 60 | 88 | +28 |
+| worker | 34 | 49 | +15 |
+| **total** | **1207** | **1336** | **+129** |
+
+typecheck ✅ (exit 0) · lint ✅ (exit 0) · 1336 tests ✅ · build ✅ (exit 0) · legacy 25/25 ✅ ·
+compose config ✅ · keyless eval check ✅ (byte-identical across two loads)
+
+Web is +28 NET: 51 new tests less the 23 that went with the deleted modules.
+
+### Honest deviations
+
+1. **The design came from the spec and screenshots, not the MCP.** `claude_design` cannot authorize
+   in a non-interactive session. Layout, type, colour and copy are from the contract; motion and
+   easing are a judgement call inside the design DNA.
+2. **Two views were STOPPED on and asked about** rather than guessed: the architectural violation rule
+   set, and the coverage card. Both answered by the owner and built to the answer.
+3. **Cost is measured but UNPRICED by default.** `LLM_PRICING` is unset, so `usd` is null and the
+   models are named. Tokens are measured either way. Setting it is a GO_LIVE step.
+4. **The p50 is per-process.** In-memory, does not survive a restart, and two replicas report two
+   numbers. Stated in the payload (`scope: "process"`) and rendered with its sample count. Making it
+   global is the same Redis wiring ledger #21 tracked for the answer cache.
+5. **No browser screenshot.** The suite drives the real component tree in jsdom (31 interaction tests)
+   and the production bundle builds and serves, but nothing in this environment renders pixels.
+
+---
+
 ## DEFERRED TO MANUAL PHASE (P5/P6)
 
 Everything below is BUILT, hermetically tested and integration-ready, but needs real infra, real
