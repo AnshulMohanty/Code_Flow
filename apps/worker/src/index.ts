@@ -25,6 +25,7 @@ import { measureRepoSize } from "./services/measureRepoSize.js";
 import { cleanupRepoPath } from "./services/publicRepoCloneService.js";
 import { resolveScalingConfig } from "./config/scaling.js";
 import { startHealthServer } from "./health/healthServer.js";
+import { resolveTraceExport } from "./observability/traceExport.js";
 
 // Monorepo has a single root .env; apps run with cwd = their package dir (apps/<app>), so
 // resolve the repo-root .env explicitly rather than dotenv's cwd-relative default. Skip under
@@ -177,6 +178,14 @@ async function main() {
     console.log("Stage schedule: PARALLEL by dependency readiness (V3-P5). Slices are byte-identical to sequential.");
   }
 
+  // --- V3-P5 TRACE EXPORT ----------------------------------------------------
+  // Resolved once, at boot, and handed to every job. The recording tracer has run since V3-P5 but
+  // its report reached nothing: `traceExporter` was an accepted dependency nobody ever supplied.
+  // Default is the bounded in-memory replay buffer (no network); Langfuse/Helicone activate only
+  // from env. See ./observability/traceExport.ts.
+  const traceExport = resolveTraceExport(process.env);
+  console.log(`[worker] ${traceExport.description}`);
+
   // --- V3-P5 AUTOSCALE CONFIG ------------------------------------------------
   // Concurrency was hardcoded at 2, which is right for a 1-vCPU box and wrong for a 4-vCPU one.
   // An unset WORKER_CONCURRENCY resolves to the same 2, so an existing deployment is unchanged.
@@ -210,6 +219,7 @@ async function main() {
           cache,
           budget,
           eventLog,
+          traceExporter: traceExport.exporter,
         });
         console.log(`Completed analysis job ${job.data.jobId}.`);
       } finally {
@@ -255,6 +265,13 @@ async function main() {
     },
     activeJobs: () => activeJobs,
     consumerRunning: () => consumerRunning,
+    // The trace exporter's own counters. Reported so "traces are exported" is an observable fact
+    // about this instance rather than a claim in a doc.
+    traceExport: () => ({
+      remoteConfigured: traceExport.remoteConfigured,
+      exporterId: traceExport.exporter.id,
+      stats: traceExport.buffer.stats(),
+    }),
   });
 
   const shutdown = async () => {

@@ -56,6 +56,14 @@ export {
   type OtelTracerLike,
 } from "./exporters.js";
 
+// The DEFAULT exporter when no backend is configured: bounded, in-memory, no network. See its
+// module note on why `exportersFromEnv` returning null still needs something to fall back TO.
+export {
+  createMemoryTraceExporter,
+  type MemoryTraceExporter,
+  type MemoryTraceExporterStats,
+} from "./memoryExporter.js";
+
 // A no-op tracer, for a call site that must always have one. Distinct from "no tracer configured" —
 // see `exportersFromEnv` on why those two must stay distinguishable.
 export { createNoopTracer } from "./noop.js";

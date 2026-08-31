@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import type { WarmupState } from "@codeflow/analyzers";
+import type { MemoryTraceExporterStats } from "@codeflow/observability";
 import { describeScaleRule, type ScalingConfig } from "../config/scaling.js";
 
 /**
@@ -36,6 +37,13 @@ export interface WorkerHealthState {
   activeJobs(): number;
   /** Whether the BullMQ consumer is still open (false once shutdown starts). */
   consumerRunning(): boolean;
+  /**
+   * Trace-export state (V3-FINAL). Optional so an older/simpler wiring still satisfies the
+   * interface — but when present it is the ONLY outside-the-process evidence that the recording
+   * tracer's report actually goes somewhere. `remoteConfigured: false` is the honest default: the
+   * report is retained in a bounded in-process buffer and sent to no backend.
+   */
+  traceExport?(): { remoteConfigured: boolean; exporterId: string; stats: MemoryTraceExporterStats };
 }
 
 export interface HealthResponse {
@@ -92,6 +100,7 @@ export async function handleHealthRequest(path: string, state: WorkerHealthState
 
   if (path === "/metrics") {
     const depth = await state.queueDepth();
+    const traces = state.traceExport?.();
     return {
       // 200 EVEN WHEN DEPTH IS NULL, and this is the load-bearing decision in this file. A scaler
       // that gets a 5xx from its metrics endpoint typically holds the last known value or refuses
@@ -106,6 +115,35 @@ export async function handleHealthRequest(path: string, state: WorkerHealthState
         ...(depth === null ? { reason: "queue depth unreadable (Redis unavailable) - do NOT treat as zero" } : {}),
         activeJobs: state.activeJobs(),
         warmedUp: warmup.warmedUp,
+        // Trace export, reported where an operator already looks. `exported` is the number that
+        // matters: a recording tracer with a live exporter shows it climbing with throughput, and
+        // the V3-P5 state (tracer on, exporter unwired) showed nothing at all.
+        ...(traces
+          ? {
+              traceExport: {
+                exporter: traces.exporterId,
+                remoteConfigured: traces.remoteConfigured,
+                exported: traces.stats.exported,
+                retained: traces.stats.retained,
+                droppedReports: traces.stats.droppedReports,
+                // Cost carries `measured` from the provider read-back, so a reader can tell a real
+                // figure from an estimated one without leaving this endpoint.
+                ...(traces.stats.last
+                  ? {
+                      last: {
+                        traceId: traces.stats.last.traceId,
+                        durationMs: traces.stats.last.durationMs,
+                        spans: traces.stats.last.spans,
+                        complete: traces.stats.last.complete,
+                        errors: traces.stats.last.errors,
+                        costUsd: traces.stats.last.cost.usd,
+                        costMeasured: traces.stats.last.cost.measured,
+                      },
+                    }
+                  : { last: null }),
+              },
+            }
+          : {}),
       }),
     };
   }
