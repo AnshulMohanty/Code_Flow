@@ -1,187 +1,389 @@
-import type { AnalysisResult } from "@codeflow/shared-types";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { createAnalysisJob, getJob, getResult } from "./lib/apiClient";
-import { useAppStore } from "./store/appStore";
+import { mockAnalysisResult } from "./test/fixture";
+import { parseRepo } from "./site/RepoField";
+import type { AnalysisResult } from "@codeflow/shared-types";
 
-vi.mock("./lib/apiClient", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./lib/apiClient")>();
+/**
+ * INTERACTION TESTS for the two shipped surfaces.
+ *
+ * The assertions are organised around the invariant, not around the layout: no shipped view shows a
+ * number it did not measure, no view presents inference as fact, and there is no path from the UI to
+ * fabricated data. Every fetch is stubbed, so nothing here touches a network.
+ */
+
+const META = {
+  analyzerVersion: "1.1.0",
+  build: "abc1234def",
+  answerLatency: { p50Ms: 412, p95Ms: 900, sampleCount: 40, scope: "process" },
+  indexed: [{ analysisId: "a1", repoFullName: "acme/indexed-repo", commitSha: "f".repeat(40), fileCount: 12, completedAt: "2026-08-31T00:00:00.000Z" }],
+  serverTime: "2026-08-31T13:10:25.000Z",
+};
+
+/** Routes every request the app makes. Anything unrouted FAILS loudly rather than silently 404ing. */
+function stubFetch(routes: Record<string, unknown>, options: { metaFails?: boolean } = {}) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/meta")) {
+      if (options.metaFails) return new Response("nope", { status: 500 });
+      return new Response(JSON.stringify(META), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    // LONGEST fragment first, so `/api/result/job-1/ask` cannot be matched by the `/api/result/job-1`
+    // route and answered with an analysis document. Route order in an object literal is a fragile
+    // thing to depend on.
+    const matches = Object.entries(routes)
+      .filter(([fragment]) => url.includes(fragment))
+      .sort((a, b) => b[0].length - a[0].length);
+    if (matches[0]) {
+      return new Response(JSON.stringify(matches[0][1]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unrouted fetch: ${url}`);
+  });
+}
+
+function completedJob(jobId: string) {
   return {
-    ...actual,
-    createAnalysisJob: vi.fn(),
-    getJob: vi.fn(),
-    getResult: vi.fn(),
-    normalizeApiError: vi.fn(() =>
-      "Could not reach CodeFlow API at http://localhost:4000. Start apps/api or use mock local mode.",
-    ),
+    id: jobId,
+    jobId,
+    status: "completed",
+    progress: 1,
+    currentStep: "Analysis completed.",
+    parsedFiles: 4,
+    totalFiles: 4,
+    runStatus: "partial",
+    createdAt: "2026-08-31T00:00:00.000Z",
+    updatedAt: "2026-08-31T00:00:05.000Z",
   };
+}
+
+beforeEach(() => {
+  window.location.hash = "";
+  // The app's SSE path needs EventSource; jsdom has none, so the driver falls back to polling —
+  // which is exactly the degradation these tests should exercise.
+  vi.stubGlobal("EventSource", undefined);
 });
 
-const mockCreateAnalysisJob = vi.mocked(createAnalysisJob);
-const mockGetJob = vi.mocked(getJob);
-const mockGetResult = vi.mocked(getResult);
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.location.hash = "";
+});
 
-describe("CodeFlow web shell", () => {
-  afterEach(() => {
-    cleanup();
-    vi.clearAllMocks();
-  });
-
-  beforeEach(() => {
-    useAppStore.setState({
-      analysisMode: "public_hosted",
-      selectedFileId: null,
-      analysisLoaded: false,
-      mockAnalysis: null,
-      currentJobId: null,
-      jobProgress: null,
-      apiError: null,
-      isAnalyzing: false,
-      analysisSource: "mock",
-    });
-  });
-
-  it("renders the app shell", () => {
+describe("the marketing site, before any analysis", () => {
+  it("renders the headline and the repo field", async () => {
+    vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
-
-    expect(screen.getByText("Understand any codebase, fast")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(/See what breaks/i);
     expect(screen.getByLabelText(/GitHub repository/i)).toBeInTheDocument();
   });
 
-  it("loads public API mock analysis", async () => {
-    mockCreateAnalysisJob.mockResolvedValue({
-      jobId: "job-123",
-      status: "queued",
-      message: "created",
-    });
-    mockGetJob.mockResolvedValue({
-      id: "job-123",
-      status: "completed",
-      progress: 1,
-      currentStep: "Mock analysis completed",
-      parsedFiles: 2,
-      totalFiles: 2,
-      createdAt: "2026-05-05T00:00:00.000Z",
-      updatedAt: "2026-05-05T00:00:01.000Z",
-    });
-    mockGetResult.mockResolvedValue(createApiResult());
-
+  it("shows FOUR em-dashes in the numbers section — nothing has been measured", async () => {
+    // The correct first screenshot for a page about measured numbers with nothing to measure.
+    vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
-
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), {
-      target: { value: "https://github.com/facebook/react" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /Analyze Public Repo/i }));
-
-    expect(mockCreateAnalysisJob).toHaveBeenCalledWith({
-      mode: "public_hosted",
-      repoUrl: "https://github.com/facebook/react",
-    });
-    // The dashboard opens on Start Here, headed by the repository name.
-    expect(await screen.findByRole("heading", { name: "facebook/react" })).toBeInTheDocument();
-    expect(screen.getByText("Where do I begin?")).toBeInTheDocument();
+    const numbers = document.getElementById("numbers")!;
+    const stats = numbers.querySelectorAll(".stat");
+    expect(stats).toHaveLength(4);
+    for (const stat of stats) {
+      expect(stat.getAttribute("data-measured")).toBe("false");
+      expect(stat.querySelector(".stat-value")?.textContent).toBe("—");
+      // And each one says WHY, because a bare dash is honest but useless.
+      expect(stat.querySelector(".stat-note")?.textContent ?? "").not.toBe("");
+    }
   });
 
-  it("renders API error fallback when public API is unavailable", async () => {
-    mockCreateAnalysisJob.mockRejectedValue(new TypeError("Failed to fetch"));
-
+  it("shows an honest empty state where the pipeline card goes", async () => {
+    vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
+    expect(screen.getByText(/Nothing resolved yet/i)).toBeInTheDocument();
+    expect(screen.getByText(/never with sample data/i)).toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: /Analyze Public Repo/i }));
+  it("labels the hero mesh as a representative shape, not a repository", async () => {
+    // A graph-shaped graphic on a page arguing for real data must say what it is.
+    vi.stubGlobal("fetch", stubFetch({}));
+    render(<App />);
+    expect(screen.getByText(/representative shape · not a repository/i)).toBeInTheDocument();
+  });
 
-    expect(await screen.findByText(/Could not reach CodeFlow API at http:\/\/localhost:4000/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Use Mock Data Instead/i })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /Use Mock Data Instead/i }));
-
-    // The mock dashboard opens on Start Here.
-    expect(screen.getByText("Where do I begin?")).toBeInTheDocument();
+  it("has NO path to mock data anywhere in the UI", async () => {
+    // The old shell shipped a "Use Mock Data Instead" button that loaded fabricated modules and
+    // metrics into every view. It is gone and nothing replaces it.
+    vi.stubGlobal("fetch", stubFetch({}));
+    render(<App />);
+    expect(screen.queryByText(/mock/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/sample data/i)).toBeInTheDocument(); // only as the promise NOT to use it
   });
 });
 
-function createApiResult(): AnalysisResult {
-  return {
-    id: "job-123",
-    repository: {
-      provider: "github",
-      owner: "facebook",
-      name: "react",
-      url: "https://github.com/facebook/react",
-    },
-    mode: "public_hosted",
-    summary: {
-      repository: {
-        provider: "github",
-        owner: "facebook",
-        name: "react",
-      },
-      mode: "public_hosted",
-      files: 2,
-      functions: 3,
-      connections: 1,
-      healthScore: 82,
-      healthGrade: "B",
-      languages: ["TypeScript", "Markdown"],
-      securityIssues: 1,
-      architectureViolations: 1,
-      circularDependencies: 0,
-    },
-    files: [
-      {
-        id: "file-web",
-        path: "apps/web/src/App.tsx",
-        name: "App.tsx",
-        layer: "ui",
-        language: "TypeScript",
-        lines: 24,
-      },
-      {
-        id: "file-docs",
-        path: "README.md",
-        name: "README.md",
-        layer: "docs",
-        language: "Markdown",
-        lines: 12,
-      },
-    ],
-    symbols: [
-      {
-        id: "symbol-app",
-        name: "App",
-        kind: "function",
-        fileId: "file-web",
-        line: 1,
-        exported: true,
-      },
-    ],
-    dependencies: [
-      {
-        id: "edge-docs",
-        source: "file-web",
-        target: "file-docs",
-        kind: "unknown",
-        weight: 1,
-      },
-    ],
-    issues: [
-      {
-        id: "issue-security",
-        severity: "medium",
-        category: "security",
-        title: "Mock security finding",
-        message: "Mock issue",
-        fileId: "file-web",
-      },
-    ],
-    metrics: {
-      perFile: [],
-      keyFiles: [],
-      hotspots: [],
-      cycles: [],
-      summary: { fileCount: 2, edgeCount: 1, cycleCount: 0, isolatedFileCount: 0, maxBlastRadius: 0 },
-    },
-    warnings: ["Mock API result loaded."],
-    createdAt: "2026-05-05T00:00:00.000Z",
-  };
-}
+describe("the status pill never claims a connection it does not have", () => {
+  it("reads CONNECTING with a grey dot before /api/meta resolves", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+    render(<App />);
+    const pill = document.querySelector(".pill")!;
+    expect(pill).toHaveTextContent(/CONNECTING/);
+    expect(pill.getAttribute("data-live")).toBe("false");
+  });
+
+  it("reads READY with a green dot and the SERVER's version once it does", async () => {
+    vi.stubGlobal("fetch", stubFetch({}));
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/READY/));
+    const pill = document.querySelector(".pill")!;
+    expect(pill.getAttribute("data-live")).toBe("true");
+    // The server's analyzer version, not a constant compiled into this bundle.
+    expect(pill).toHaveTextContent("v1.1.0");
+  });
+
+  it("reads OFFLINE, not READY, when the API cannot be reached", async () => {
+    // A green READY pill on a build talking to nothing is the most misleading thing a status
+    // indicator can do.
+    vi.stubGlobal("fetch", stubFetch({}, { metaFails: true }));
+    render(<App />);
+    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/OFFLINE/));
+    expect(document.querySelector(".pill")!.getAttribute("data-live")).toBe("false");
+    // And the version falls back to an em-dash rather than a guess.
+    expect(document.querySelector(".pill")).toHaveTextContent("—");
+  });
+});
+
+describe("running a real analysis", () => {
+  function routes(result: AnalysisResult) {
+    return {
+      "/api/analyze": { jobId: "job-1", status: "queued", message: "queued" },
+      "/api/job/job-1": completedJob("job-1"),
+      "/api/jobs/job-1": completedJob("job-1"),
+      "/api/result/job-1": result,
+    };
+  }
+
+  it("moves to the workbench and renders the run's REAL numbers", async () => {
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+
+    // The tabs appear only once there is a result.
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+    expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument();
+  });
+
+  it("TAB 01 derives the container diagram from the real edge count", async () => {
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    const edgeCount = result.graph!.edges.length;
+    expect(screen.getByText(new RegExp(`derived from ${edgeCount} resolved edges`, "i"))).toBeInTheDocument();
+  });
+
+  it("omits the VIOLATION legend key when no sanctioned rule fires", async () => {
+    // A legend key for a class that cannot occur is itself a claim about the codebase.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    const legend = document.querySelector(".legend")!;
+    expect(legend).toHaveTextContent(/control flow/);
+    expect(legend).toHaveTextContent(/data \/ read/);
+    expect(legend).toHaveTextContent(/no rule violations detected/);
+  });
+
+  it("TAB 04 labels the domain lanes as INFERENCE, three times over", async () => {
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
+
+    expect(screen.getByText(/Structural roles — deterministic pass/i)).toBeInTheDocument();
+    expect(screen.getByText(/Roles come from the parser/i)).toBeInTheDocument();
+    expect(screen.getByText(/labelled as inference, never as fact/i)).toBeInTheDocument();
+    expect(screen.getByText(/Domain lanes — specialist agents · inferred/i)).toBeInTheDocument();
+  });
+
+  it("TAB 04 says so plainly when there are NO inferred domains, and does not substitute communities", async () => {
+    // Quietly showing the structural community partition as a "domain" is exactly the confusion the
+    // view exists to prevent.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
+
+    expect(screen.getByText(/No inferred domains for this run/i)).toBeInTheDocument();
+    expect(screen.getByText(/deliberately not shown here as though it were an inferred domain/i)).toBeInTheDocument();
+  });
+
+  it("TAB 03 relabels the coverage card to the fact it actually has", async () => {
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
+
+    expect(screen.getByText(/Test files that reach it/i)).toBeInTheDocument();
+    expect(screen.getByText(/By import reachability, NOT coverage/i)).toBeInTheDocument();
+    expect(screen.queryByText(/^Tests that cover it$/i)).not.toBeInTheDocument();
+  });
+
+  it("TAB 03's MOVE mode reports fewer affected files than CHANGE mode", async () => {
+    // A rename is not a refactor: only direct references break.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: /If I move it/i }));
+    expect(screen.getByText(/A path change breaks only DIRECT references/i)).toBeInTheDocument();
+  });
+
+  it("TAB 02 states the PROVENANCE of the reading order", async () => {
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
+
+    // This fixture HAS a synthesis, so the caption must attribute the prose to the agent.
+    expect(screen.getByText(/Narrated by the onboarding agent/i)).toBeInTheDocument();
+  });
+});
+
+describe("the workbench entry step", () => {
+  it("lists the deployment's REAL indexed repositories", async () => {
+    vi.stubGlobal("fetch", stubFetch({}));
+    window.location.hash = "workbench";
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/acme\/indexed-repo/)).toBeInTheDocument());
+  });
+
+  it("says NOTHING YET rather than showing well-known repositories as if they were history", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ ...META, indexed: [] }), { status: 200, headers: { "content-type": "application/json" } }),
+      ),
+    );
+    window.location.hash = "workbench";
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/has not analysed a repository/i)).toBeInTheDocument());
+  });
+});
+
+describe("parseRepo — validated locally, so a value this field accepts the API accepts", () => {
+  it("accepts owner/repo and a full URL", () => {
+    expect(parseRepo("tokio-rs/tokio")).toEqual({ owner: "tokio-rs", repo: "tokio" });
+    expect(parseRepo("https://github.com/tokio-rs/tokio")).toEqual({ owner: "tokio-rs", repo: "tokio" });
+    expect(parseRepo("https://github.com/tokio-rs/tokio.git")).toEqual({ owner: "tokio-rs", repo: "tokio" });
+    expect(parseRepo("git@github.com:tokio-rs/tokio.git")).toEqual({ owner: "tokio-rs", repo: "tokio" });
+  });
+
+  it("REJECTS a single segment rather than guessing which half it is", () => {
+    expect(parseRepo("tokio")).toEqual({ error: expect.stringContaining("owner/repo") });
+  });
+
+  it("rejects an empty value and an over-deep path", () => {
+    expect("error" in parseRepo("")).toBe(true);
+    expect("error" in parseRepo("a/b/c")).toBe(true);
+  });
+
+  it("rejects characters GitHub does not allow", () => {
+    expect("error" in parseRepo("bad owner/repo")).toBe(true);
+  });
+});
+
+describe("Q&A availability is stated, never a dead end", () => {
+  it("explains WHY Q&A is unavailable on a run that built no index", async () => {
+    // "Q&A unavailable" with no reason makes a correctly-behaving product feel broken.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal(
+      "fetch",
+      stubFetch({
+        "/api/analyze": { jobId: "job-1", status: "queued", message: "queued" },
+        "/api/job/job-1": completedJob("job-1"),
+        "/api/jobs/job-1": completedJob("job-1"),
+        "/api/result/job-1": result,
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
+
+    expect(screen.getByText(/No Q&A index was built for this run/i)).toBeInTheDocument();
+    expect(screen.getByText(/does not need a provider key/i)).toBeInTheDocument();
+  });
+});
+
+describe("citation chips resolve, or do not pretend to", () => {
+  it("links a citation to the ANALYSED commit, not to HEAD", async () => {
+    // The base fixture is a PARTIAL run whose RAG stage was budget-skipped, so Q&A is legitimately
+    // unavailable on it — which the next test asserts. Here we give it an index, because the thing
+    // under test is the CHIP, not the availability branch.
+    const result: AnalysisResult = {
+      ...mockAnalysisResult("acme/repo"),
+    };
+    result.ai = {
+      ...result.ai,
+      rag: {
+        chunks: [],
+        embeddingModel: "mock-embed",
+        embeddingDim: 3,
+        store: { namespace: "n", vectorStoreId: "v", textStoreId: "t" },
+      } as never,
+    };
+    vi.stubGlobal(
+      "fetch",
+      stubFetch({
+        "/api/analyze": { jobId: "job-1", status: "queued", message: "queued" },
+        "/api/job/job-1": completedJob("job-1"),
+        "/api/jobs/job-1": completedJob("job-1"),
+        "/api/result/job-1": result,
+        "/api/result/job-1/ask": {
+          answer: "The session shape is verified once at the edge.",
+          answered: true,
+          citations: [{ fileId: "src/auth.ts", startLine: 4, endLine: 9 }],
+          retrievedChunkIds: [],
+        },
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
+
+    const suggestion = document.querySelector(".ask-suggestions .chip") as HTMLButtonElement;
+    expect(suggestion).toBeTruthy();
+    fireEvent.click(suggestion);
+
+    await waitFor(() => expect(screen.getByText(/verified once at the edge/i)).toBeInTheDocument());
+    const chip = within(document.querySelector(".cited")!).getByRole("link");
+    expect(chip).toHaveAttribute("href", expect.stringContaining(result.commitSha!));
+    expect(chip).toHaveAttribute("href", expect.stringContaining("#L4-L9"));
+  });
+});
