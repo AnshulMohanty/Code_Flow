@@ -325,3 +325,81 @@ function createProductionAskHandler(): AskHandler {
     return answer;
   };
 }
+
+/**
+ * WARM the Q&A path (V3-FINAL — closing P5 DoD 1e).
+ *
+ * WHAT WAS COLD, and it was not theoretical. Everything above resolves LAZILY on the first
+ * `/api/result/:id/ask`: the answer cache, the budget, session and repo memory each await the
+ * shared Redis connection, and `resolveRetrieval` runs `CREATE EXTENSION` / `CREATE TABLE` against
+ * Postgres. So the first question of a process paid a round trip per store plus a schema round trip,
+ * inside the request — the HH_Goa cold-start problem, in the one place this service does real work.
+ *
+ * WHY IT IS ALSO WHAT MAKES `/health.warmedUp` HONEST. Before this, the API imported
+ * `warmupRegistry` and read `state()` while registering ZERO tasks — and `snapshot()` returns
+ * `required.length > 0 && …`, so `warmedUp` was STRUCTURALLY false in every API process forever. The
+ * flag was not wrong about a cold process; it was incapable of ever being right. Warming needed real
+ * tasks before the flag could mean anything, and these are the API's real ones.
+ *
+ * NO PROBE REQUESTS, the same rule the worker's warm-up follows: provider clients are CONSTRUCTED,
+ * never called. A warm-up that spent money would be charging the owner for a health check.
+ *
+ * Idempotent — every resolver here is memoized, so calling this twice costs one set of connections.
+ * Best-effort per dependency: a store that cannot resolve leaves its descriptor saying so rather
+ * than failing the warm-up, because the deterministic read paths do not need it.
+ */
+/**
+ * A descriptor per warmed dependency. A TYPE alias rather than an interface on purpose: TypeScript
+ * gives an object type alias an implicit index signature, so this satisfies the
+ * `Record<string, string>` the warm-up registry logs without the caller having to widen it — while
+ * still naming every key, which a bare Record would not.
+ */
+export type QaWarmupDescriptors = {
+  answerCache: string;
+  budget: string;
+  sessionMemory: string;
+  repoMemory: string;
+  retrieval: string;
+  providers: string;
+};
+
+export async function warmQaDependencies(): Promise<QaWarmupDescriptors> {
+  const redis = await getSharedRedis();
+  const shared = redis ? "redis (shared)" : isSharedRedisEnabled() ? "in-memory (redis unavailable)" : "in-memory";
+
+  // These four share one memoized Redis handle, so resolving them is one connection, not four.
+  await Promise.all([resolveAnswerCache(), resolveBudget(), resolveSessionStore(), resolveRepoStore()]);
+
+  const chatClient = createLlmClientFromEnv(process.env);
+  const embeddingClient = createEmbeddingClientFromEnv(process.env);
+  const providers =
+    chatClient && embeddingClient
+      ? `${chatClient.provider}/${chatClient.model} + ${embeddingClient.provider}/${embeddingClient.model}`
+      : "not configured (Q&A is unavailable; the deterministic read paths are not affected)";
+
+  // The expensive one. Only resolvable once the embedding space is known, which is why it could
+  // not be warmed at boot before the client was constructed here.
+  let retrieval: string;
+  if (!embeddingClient) {
+    retrieval = "skipped (no embedding provider configured, so there is no embedding space to open)";
+  } else {
+    try {
+      const stores = await resolveRetrieval({
+        embeddingModel: embeddingClient.model,
+        embeddingDim: embeddingClient.dimension,
+      });
+      retrieval = stores.degradation ? `${stores.vectorStore.id} — DEGRADED: ${stores.degradation}` : stores.vectorStore.id;
+    } catch (error) {
+      // Recorded, not thrown: the API answers deterministic reads without an index, and taking the
+      // process out over an unreachable Postgres would cost far more than it protects.
+      retrieval = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  return { answerCache: shared, budget: shared, sessionMemory: shared, repoMemory: shared, retrieval, providers };
+}
+
+/** True when BOTH a chat and an embedding provider are configured, i.e. the Q&A path can run. */
+export function isQaConfigured(env: Record<string, string | undefined> = process.env): boolean {
+  return Boolean(createLlmClientFromEnv(env) && createEmbeddingClientFromEnv(env));
+}

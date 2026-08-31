@@ -1,14 +1,22 @@
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
-import { connectMongo } from "./db/connectMongo.js";
+import { connectMongo, isMongoConnected } from "./db/connectMongo.js";
+import { warmUpApi } from "./health/warmup.js";
 import { createRedisRateLimitStore } from "./middleware/rateLimit.js";
 import { getSharedRedis, isSharedRedisEnabled } from "./queues/redisClient.js";
+import { isQaConfigured, warmQaDependencies } from "./services/ragQaService.js";
 
 /**
  * API composition root. V3-P0 wires the PRODUCTION rate-limit store here: Guard 4's limit
  * was per-process (an in-memory map), so it neither held across API replicas nor survived a
  * restart. With Redis it does both. No Redis configured (or unreachable) ⇒ the in-memory
  * store is used and the degradation is LOGGED, not hidden.
+ *
+ * V3-FINAL adds the WARM-UP registration (P5 DoD 1e). `/health` has reported `warmedUp` since
+ * V3-P5, but this process registered no warm-up tasks, so the field was structurally always false —
+ * see ./health/warmup.ts. Registration lives here, at the composition root, and NOT in `createApp`:
+ * the app is constructed dozens of times by the suite, and warming a process-global singleton from
+ * a factory would make the health assertions depend on test order.
  */
 try {
   await connectMongo();
@@ -24,10 +32,22 @@ try {
     rateLimit: redis ? { store: createRedisRateLimitStore(redis) } : {},
   });
 
+  // Warm BEFORE listening, so the first request never pays the Postgres schema round trip or a
+  // per-store Redis connect. Awaited rather than fired-and-forgotten: readiness that races the
+  // first request is not readiness.
+  const warm = await warmUpApi({
+    mongoConnected: isMongoConnected,
+    sharedRedis: getSharedRedis,
+    redisConfigured: isSharedRedisEnabled,
+    qaConfigured: () => isQaConfigured(),
+    warmQa: () => warmQaDependencies(),
+  });
+
   app.listen(env.apiPort, () => {
     console.log(
       `codeflow-api listening on port ${env.apiPort} ` +
-        `(rate limit: ${redis ? "redis" : "in-memory"}, budget: ${redis ? "redis (shared)" : "in-memory"})`,
+        `(rate limit: ${redis ? "redis" : "in-memory"}, budget: ${redis ? "redis (shared)" : "in-memory"}, ` +
+        `warmedUp: ${warm.warmedUp})`,
     );
   });
 } catch {

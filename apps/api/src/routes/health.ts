@@ -13,6 +13,14 @@ import { warmupRegistry } from "@codeflow/analyzers";
  * `status` stays `"ok"` while cold, deliberately. The process IS alive and CAN serve — a cold
  * request is slow, not broken — so reporting `"error"` would make a liveness probe kill a healthy
  * container mid-warm-up, which is the opposite of what readiness reporting is for.
+ *
+ * V3-FINAL — WHAT THIS FIELD USED TO BE. V3-P5 shipped the field reading the shared
+ * `warmupRegistry`, but the API process registered no tasks into it, and `warmedUp` is
+ * `required.length > 0 && required.every(warm)` — so it was **structurally always false**, in every
+ * API process, forever. A readiness probe wired to it would have held traffic back from a ready
+ * service permanently. The API's real tasks are now registered at the composition root
+ * (`../health/warmup.ts`), so the boolean reports a fact. It remains false in a process that
+ * registered nothing — which is the honest answer to "did this process come up ready", not a bug.
  */
 export const healthRouter = Router();
 

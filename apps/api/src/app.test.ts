@@ -62,10 +62,13 @@ describe("codeflow api", () => {
     expect(response.body.status).toBe("ok");
     expect(response.body).toHaveProperty("warmedUp");
     expect(typeof response.body.warmedUp).toBe("boolean");
-    // Nothing registered in this process ⇒ NOT warm. "Nothing to do" and "ready" are different
-    // claims, and reporting an unconfigured process as ready is how a misconfiguration ships.
+    // This suite never registers or runs the API's warm-up tasks (registration lives at the
+    // composition root, deliberately — see health/warmup.ts), so `false` here is the HONEST answer
+    // to "did this process come up ready", not the structural always-false V3-FINAL fixed.
+    // `warmup.test.ts` is what proves the flag can reach `true` on the real registration.
     expect(response.body.warmedUp).toBe(false);
     expect(Array.isArray(response.body.warmup.tasks)).toBe(true);
+    expect(response.body.warmup.tasks).toEqual([]);
   });
 
   it("GET /health returns ok", async () => {
