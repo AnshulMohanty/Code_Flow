@@ -1,6 +1,7 @@
 import express from "express";
 import { analyzeRouter } from "./routes/analyze.js";
 import { healthRouter } from "./routes/health.js";
+import { metaRouter } from "./routes/meta.js";
 import { jobsRouter } from "./routes/jobs.js";
 import { resultsRouter } from "./routes/results.js";
 import { askRouter } from "./routes/ask.js";
@@ -29,6 +30,9 @@ export function createApp(options: CreateAppOptions = {}) {
   const rateLimit = createRateLimitMiddleware(options.rateLimit);
 
   app.use(healthRouter);
+  // Read-only chrome facts (version, build, measured p50, real recents). Not rate-limited: it spends
+  // nothing, and the UI reads it on every page load.
+  app.use(metaRouter);
   app.use("/api/analyze", rateLimit);
   app.use(analyzeRouter);
   app.use(jobsRouter);

@@ -1,6 +1,5 @@
-import type { RagChunk, Synthesis } from "@codeflow/shared-types";
+import type { Synthesis } from "@codeflow/shared-types";
 import type { RagEvalQuestion } from "./dataset.js";
-import { retrieve } from "@codeflow/analyzers";
 
 // All scoring is PURE + deterministic given fixed inputs (the mock embeddings are
 // deterministic). Per-question detail is reported, not just aggregates — a single number
@@ -73,6 +72,14 @@ export interface PerQuestionResult {
   hit: boolean;
   /** Expected targets NOT found in the top-k (surfaced, not hidden). */
   missed: string[];
+  /**
+   * True when the question has NO expected targets — a deliberate NEGATIVE CONTROL asking
+   * something the repo cannot answer. Retrieval always returns a top-k, so such a question
+   * has nothing to recall and is EXCLUDED from recall/MRR (see aggregateRag). Its value is
+   * on the answer path, where an honest refusal is the correct behaviour and is scored as
+   * `refusalJustified`. Counting it as recall 0 would penalise exactly the right answer.
+   */
+  negativeControl: boolean;
 }
 
 export interface RagScores {
@@ -80,7 +87,10 @@ export interface RagScores {
   meanRecallAtK: number;
   /** Mean reciprocal rank across questions. */
   mrr: number;
+  /** Questions the means are computed over — negative controls EXCLUDED. */
   questionCount: number;
+  /** Negative-control questions present but not scored here (scored on the answer path). */
+  negativeControlCount: number;
 }
 
 interface Target {
@@ -104,16 +114,44 @@ function targetsFor(question: RagEvalQuestion): Target[] {
   return question.expectedFiles.map((fileId) => ({ fileId, label: fileId }));
 }
 
+/**
+ * The coordinates a scorer needs from a retrieved chunk. Deliberately NOT `RagChunk` or
+ * `RetrievedChunk`: scoring must not be able to read a chunk's text or its scores, or a future
+ * change could quietly start grading the retrieval by something other than what it found.
+ * (V3-P2: this is also all that survives in the analysis document, so the narrow type and the
+ * persisted one now say the same thing.)
+ */
+export interface ScoredCoords {
+  id: string;
+  fileId: string;
+  startLine: number;
+  endLine: number;
+}
+
 /** Does a retrieved chunk satisfy a target (file match, or line-range overlap when tighter)? */
-function chunkHitsTarget(chunk: RagChunk, target: Target): boolean {
+function chunkHitsTarget(chunk: ScoredCoords, target: Target): boolean {
   if (chunk.fileId !== target.fileId) return false;
   if (target.startLine === undefined || target.endLine === undefined) return true;
   return chunk.startLine <= target.endLine && chunk.endLine >= target.startLine;
 }
 
-/** Score one question: retrieve top-k for its query vector, then recall@k + reciprocal rank. */
-export function scoreQuestion(question: RagEvalQuestion, chunks: RagChunk[], queryVector: number[], k: number): PerQuestionResult {
-  const top = retrieve(chunks, queryVector, k);
+/**
+ * Score one question from its ALREADY-RETRIEVED top-k: recall@k + reciprocal rank.
+ *
+ * V3-P2 moved the retrieval call OUT of here. Before, this function embedded the retrieval
+ * primitive itself (`retrieve(chunks, queryVector, k)`), which was fine while the index was an
+ * array of vectors and became wrong the moment retrieval acquired a store, a fusion step and a
+ * reranker: the eval would have kept scoring a brute-force cosine scan while production served
+ * something else. The caller now performs the real retrieval and hands the ranking in, so this
+ * is a pure, order-sensitive scorer over whatever production actually returned.
+ */
+export function scoreQuestion(question: RagEvalQuestion, ranking: readonly ScoredCoords[], k: number): PerQuestionResult {
+  // `k` is ENFORCED here rather than trusted from the caller. After V3-P2 moved retrieval out,
+  // `k` briefly became an unused parameter — and the honest options were to delete it or to
+  // make it mean something. Deleting it would leave a metric called recall@k whose value
+  // depended on however many results the caller happened to pass, so it is applied instead:
+  // recall@5 is recall over the top 5, whatever arrives.
+  const top = ranking.slice(0, Math.max(0, k));
   const targets = targetsFor(question);
 
   const hitTargets = targets.filter((target) => top.some((chunk) => chunkHitsTarget(chunk, target)));
@@ -136,13 +174,30 @@ export function scoreQuestion(question: RagEvalQuestion, chunks: RagChunk[], que
     reciprocalRank,
     hit: recallAtK > 0,
     missed: targets.filter((target) => !hitLabels.has(target.label)).map((target) => target.label),
+    negativeControl: targets.length === 0,
   };
 }
 
 /** Aggregate per-question results into mean recall@k + MRR. */
+/**
+ * Aggregate retrieval scores over the questions that HAVE targets.
+ *
+ * Negative controls (no expected files — a question the repo cannot answer) are excluded
+ * rather than scored 0: retrieval always returns a top-k, so there is nothing for them to
+ * recall, and averaging them in would penalise the very behaviour they exist to test. They
+ * are counted separately so their presence is visible, and they are genuinely scored on the
+ * answer path via `refusalJustified`.
+ */
 export function aggregateRag(perQuestion: PerQuestionResult[], k: number): RagScores {
-  const n = perQuestion.length;
-  const meanRecallAtK = n === 0 ? 0 : perQuestion.reduce((sum, r) => sum + r.recallAtK, 0) / n;
-  const mrr = n === 0 ? 0 : perQuestion.reduce((sum, r) => sum + r.reciprocalRank, 0) / n;
-  return { k, meanRecallAtK, mrr, questionCount: n };
+  const scored = perQuestion.filter((entry) => !entry.negativeControl);
+  const n = scored.length;
+  const meanRecallAtK = n === 0 ? 0 : scored.reduce((sum, r) => sum + r.recallAtK, 0) / n;
+  const mrr = n === 0 ? 0 : scored.reduce((sum, r) => sum + r.reciprocalRank, 0) / n;
+  return {
+    k,
+    meanRecallAtK,
+    mrr,
+    questionCount: n,
+    negativeControlCount: perQuestion.length - n,
+  };
 }

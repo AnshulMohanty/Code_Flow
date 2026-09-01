@@ -1,12 +1,34 @@
 import { createHash } from "node:crypto";
+import { stripCodeFence } from "../llm/completionText.js";
 import { RAG_MIN_SIMILARITY, RAG_TOP_K } from "@codeflow/config";
-import type { AnalysisCacheHandle, BudgetHandle, Rag, RagChunk } from "@codeflow/shared-types";
+import {
+  assertEmbeddingSpace,
+  createLexicalOverlapReranker,
+  hybridSearch,
+  type ChunkTextStore,
+  type HybridSearchTrace,
+  type Reranker,
+  type RetrievedChunk,
+  type VectorStore,
+} from "@codeflow/retrieval";
+import type { AnalysisCacheHandle, BudgetHandle, Rag } from "@codeflow/shared-types";
 import type { LlmClient } from "../llm/llmClient.js";
 import type { EmbeddingClient } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
+import { estimateTokens } from "../util/tokens.js";
 import { embedCacheKey, type CachedEmbedding } from "./embedCache.js";
-import { assertEmbeddingSpace } from "./homogeneity.js";
-import { cosineSimilarity, retrieve } from "./retrieve.js";
+
+/**
+ * The minimum a chunk must expose to be CITED: an id to match the model's claim against, and
+ * the real coordinates to resolve it to. Deliberately narrower than `RetrievedChunk` so the
+ * grounding step cannot accidentally depend on a score or on the chunk text.
+ */
+export interface CitableChunk {
+  id: string;
+  fileId: string;
+  startLine: number;
+  endLine: number;
+}
 
 /** A grounded citation — resolves to a RETRIEVED chunk's real file + line range. */
 export interface RagAnswerCitation {
@@ -24,12 +46,31 @@ export interface RagAnswer {
   answered: boolean;
   /** Citations the LLM emitted that didn't map to a retrieved chunk (dropped by grounding). */
   droppedCitations?: { count: number; ids: string[] };
+  /**
+   * Per-stage retrieval trace (V3-P2): arm hit counts, what each arm found alone, the reranker
+   * that ran (or the error that made it degrade), the vector cosine the refusal floor was
+   * compared against. Present on every answer, including a refusal — a refusal is exactly when
+   * you want to know what retrieval actually saw.
+   */
+  retrieval?: HybridSearchTrace;
 }
 
 export interface AnswerQuestionDeps {
   question: string;
-  /** The already-built index (`result.ai.rag`) — its chunks carry embeddings. */
+  /** The already-built index (`result.ai.rag`) — chunk METADATA + a `store` reference. Since
+   *  V3-P2 the vectors and text live in the two stores below, not in this slice. */
   ragIndex: Rag;
+  /** Where the index's vectors live. Injected: memory in the suite, pgvector in production. */
+  vectorStore: VectorStore;
+  /** Where the index's chunk text lives. Same injection rule. */
+  textStore: ChunkTextStore;
+  /**
+   * Reranker for the hybrid pipeline (V3-P2). Defaults to the deterministic lexical-overlap
+   * one — keyless, in-process, zero-dependency (see `reranker.ts` for the probe that ruled out
+   * every ONNX cross-encoder for the pruned image). Pass `createIdentityReranker()` to turn
+   * reranking off explicitly, or a `createCrossEncoderReranker` once a session exists.
+   */
+  reranker?: Reranker;
   chatClient: LlmClient;
   embeddingClient: EmbeddingClient;
   cache: AnalysisCacheHandle;
@@ -65,16 +106,34 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
 
   // Guard 1 — the question MUST be embedded in the index's space.
   assertEmbeddingSpace(embeddingClient, ragIndex, "RAG index");
+  // Guard 1b (V3-P2) — and the STORE holding that index must be in the same space too. Two
+  // separate checks because they catch two different mistakes: a client/index mismatch is a
+  // stale analysis, a client/store mismatch is a misconfigured deployment.
+  assertEmbeddingSpace(embeddingClient, deps.vectorStore.space, `vector store ${deps.vectorStore.id}`);
 
   const queryVector = await embedQuery(deps);
 
-  const retrieved = retrieve(ragIndex.chunks, queryVector, k);
+  // V3-P2: HYBRID retrieval — vector + BM25, fused by RRF, reranked, diversified by MMR. The
+  // refusal floor is evaluated INSIDE, on the vector arm's real cosine and before any rerank,
+  // so the honest-no-answer behaviour is byte-identical to the pre-hybrid path and a refusal
+  // still costs exactly one vector search.
+  const found = await hybridSearch(
+    {
+      ragIndex,
+      vectorStore: deps.vectorStore,
+      textStore: deps.textStore,
+      reranker: deps.reranker ?? createLexicalOverlapReranker(),
+    },
+    { text: question, vector: queryVector, k, minSimilarity },
+  );
+  const retrieved = found.chunks;
   const retrievedChunkIds = retrieved.map((c) => c.id);
-  const topScore = retrieved.length ? cosineSimilarity(queryVector, retrieved[0].embedding) : 0;
 
-  // Honest no-answer: empty or below the floor ⇒ refuse, do NOT call the answer LLM.
-  if (retrieved.length === 0 || topScore < minSimilarity) {
-    return { answer: NO_ANSWER, citations: [], retrievedChunkIds, answered: false };
+  // Honest no-answer: refused by the floor, or nothing survived grounding ⇒ do NOT call the
+  // answer LLM. The trace travels with the refusal, because "what did retrieval see" is the
+  // first question anyone asks about one.
+  if (found.trace.refused || retrieved.length === 0) {
+    return { answer: NO_ANSWER, citations: [], retrievedChunkIds, answered: false, retrieval: found.trace };
   }
 
   // Answer cache (cache-before-budget): a hit costs zero LLM and never touches the budget.
@@ -86,15 +145,25 @@ export async function answerQuestion(deps: AnswerQuestionDeps): Promise<RagAnswe
 
   const prompt = buildAnswerPrompt(question, retrieved);
   const estimate = estimateTokens(`${SYSTEM_PROMPT}\n${prompt}`);
-  if (deps.budget && !(await deps.budget.check(estimate))) {
+  if (deps.budget && !(await deps.budget.check(estimate, "chat"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; Q&A skipped (demo at capacity).");
   }
 
-  const completion = await chatClient.complete({ system: SYSTEM_PROMPT, prompt, temperature: 0, maxTokens: deps.maxTokens });
-  const answer = deriveAnswer(completion, retrieved, retrievedChunkIds);
+  // `cachePrefix` marks SYSTEM_PROMPT for the provider's prompt cache — it is the only part
+  // stable across questions (the retrieved chunks differ per question by design). An
+  // identical question on the same SHA never reaches here at all: the qa cache above serves
+  // it for zero tokens, which beats any provider cache discount.
+  const completed = await chatClient.complete({
+    cachePrefix: SYSTEM_PROMPT,
+    prompt,
+    temperature: 0,
+    maxTokens: deps.maxTokens,
+  });
+  const answer = { ...deriveAnswer(completed.text, retrieved, retrievedChunkIds), retrieval: found.trace };
 
   await cache.set(qaKey, answer);
-  if (deps.budget) await deps.budget.record(estimate);
+  // Record the provider's REAL usage, not the pre-flight estimate.
+  if (deps.budget) await deps.budget.record(completed.usage, "chat");
   return answer;
 }
 
@@ -106,17 +175,18 @@ async function embedQuery(deps: AnswerQuestionDeps): Promise<number[]> {
   if (hit && Array.isArray(hit.embedding)) return hit.embedding;
 
   const estimate = estimateTokens(question);
-  if (deps.budget && !(await deps.budget.check(estimate))) {
+  if (deps.budget && !(await deps.budget.check(estimate, "embedding"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; Q&A skipped (demo at capacity).");
   }
-  const [vector] = await embeddingClient.embed({ texts: [question], inputType: "query" });
+  const { vectors, usage } = await embeddingClient.embed({ texts: [question], inputType: "query" });
+  const [vector] = vectors;
   await cache.set(key, { embedding: vector, model: embeddingClient.model, dim: embeddingClient.dimension });
-  if (deps.budget) await deps.budget.record(estimate);
+  if (deps.budget) await deps.budget.record(usage, "embedding");
   return vector;
 }
 
 /** Bounded prompt of the RETRIEVED chunks ONLY — never the full index. */
-function buildAnswerPrompt(question: string, retrieved: RagChunk[]): string {
+function buildAnswerPrompt(question: string, retrieved: readonly RetrievedChunk[]): string {
   const lines: string[] = ["## Retrieved code chunks"];
   for (const chunk of retrieved) {
     lines.push(`\n### Chunk ${chunk.id}  (file ${chunk.fileId}, lines ${chunk.startLine}-${chunk.endLine})`);
@@ -128,11 +198,15 @@ function buildAnswerPrompt(question: string, retrieved: RagChunk[]): string {
 }
 
 /** Parse the completion, then GROUND citations: keep only those mapping to a retrieved chunk. */
-export function deriveAnswer(raw: string, retrieved: RagChunk[], retrievedChunkIds: string[]): RagAnswer {
+export function deriveAnswer(
+  raw: string,
+  retrieved: readonly CitableChunk[],
+  retrievedChunkIds: string[],
+): RagAnswer {
   const byId = new Map(retrieved.map((c) => [c.id, c]));
   let parsed: { answer?: unknown; answered?: unknown; citations?: unknown } | null = null;
   try {
-    parsed = JSON.parse(stripCodeFences(raw).trim());
+    parsed = JSON.parse(stripCodeFence(raw).trim());
   } catch {
     parsed = null;
   }
@@ -169,14 +243,7 @@ export function deriveAnswer(raw: string, retrieved: RagChunk[], retrievedChunkI
   };
 }
 
-function stripCodeFences(text: string): string {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fence ? fence[1] : text;
-}
 
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");

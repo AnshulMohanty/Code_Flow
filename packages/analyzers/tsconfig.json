@@ -7,6 +7,7 @@
       "@codeflow/config": ["../config/dist/index.d.ts"],
       "@codeflow/graph": ["../graph/dist/index.d.ts"],
       "@codeflow/parsers": ["../parsers/dist/index.d.ts"],
+      "@codeflow/retrieval": ["../retrieval/dist/index.d.ts"],
       "@codeflow/shared-types": ["../shared-types/dist/index.d.ts"]
     }
   },

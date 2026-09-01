@@ -29,6 +29,18 @@ export interface JobProgress {
   /** Distinct, typed reason for a non-clean outcome (e.g. repo-too-large, budget-exhausted)
    *  so the UI can say "at capacity" / "too large" rather than a generic failure. */
   runStatusReason?: PipelineStatusReason;
+  /**
+   * Stages that were NOT part of this run and produced no output — today, the AI stages
+   * that never registered because their provider key is absent. Without this the UI has no
+   * way to tell "still working" from "never going to run" and leaves those rows spinning
+   * forever. An empty/absent list means every configured stage reported.
+   */
+  skippedStages?: PipelineStageId[];
+  /** How much of the pipeline this run delivered — see RunMode. Mirrors the result field so
+   *  the UI can render an honest banner from the job alone, before the result is fetched. */
+  runMode?: RunMode;
+  /** Typed degradation reasons, mirrored from the result. */
+  degradations?: DegradationNotice[];
   createdAt?: string;
   updatedAt: string;
 }
@@ -97,7 +109,16 @@ export interface DependencyEdge {
   weight: number;
   from?: string;
   to?: string;
-  dependencyType?: "import" | "dynamic-import" | "require" | "python-import" | "heuristic";
+  dependencyType?:
+    | "import"
+    | "dynamic-import"
+    | "require"
+    | "python-import"
+    | "heuristic"
+    // V3-P1 code-property-graph relationships.
+    | "call"
+    | "extends"
+    | "implements";
   confidence?: ParserConfidence;
   evidence?: string;
   sourceLine?: number;
@@ -120,6 +141,13 @@ export interface AnalysisResult {
   createdAt: string;
   commitSha?: string;
   warnings: string[];
+  /**
+   * How much of the pipeline this run delivered (V3-P0). Absent on results produced before
+   * the field existed; treat absent as "unknown", not as "full".
+   */
+  runMode?: RunMode;
+  /** Typed reasons the run was degraded, alongside the human `warnings[]` strings. */
+  degradations?: DegradationNotice[];
   /** Bumped when the assembled shape changes in a breaking way. */
   schemaVersion?: number;
   /**
@@ -138,7 +166,10 @@ export interface AnalysisResult {
   files: FileNode[]; // DERIVED view of graph.nodes at assembly (single FileNode[] home; not a stored slice)
   symbols: SymbolNode[]; // connect (fileId-keyed projection of inventory.symbols — deferred)
   dependencies: DependencyEdge[]; // connect (fileId-keyed; deferred — graph.edges is the edge home)
-  issues: Issue[]; // analyze
+  /** Deterministic structural findings DERIVED from `metrics` at assembly (cycles, blast
+   *  radius, coupling, isolation). Never AI, and never `category: "security"` — no security
+   *  analysis is performed, so a security finding here would be fabricated. */
+  issues: Issue[]; // derived (assembly)
   /** Deterministic graph metrics — centrality/key files, blast radius, cycles, coupling,
    *  complexity proxy (Analyze). Numbers only; no prose. */
   metrics: RepoMetrics; // analyze
@@ -161,6 +192,17 @@ export interface AnalysisResult {
 
   // --- Pipeline run bookkeeping (assembly) ------------------------------------
   pipeline?: PipelineRunSummary;
+  /**
+   * What this run actually SPENT, read back from the providers (V3-FINAL).
+   *
+   * Absent on a run that made no paid call (a cache hit, a keyless deterministic-only run) and on
+   * every result produced before the field existed — so absent means "not known", never "free".
+   *
+   * Six numbers, so this cannot become the growth ledger #20 tracks. It exists because the cost was
+   * being measured per call, recorded against the budget, and then discarded: nothing durable
+   * carried it, so no UI could report a real figure and every "cost" claim would have been a guess.
+   */
+  cost?: CostBreakdown;
 }
 
 export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "generic" | "unknown";
@@ -219,6 +261,10 @@ export type GraphEdgeType =
   | "python-import"
   | "symbol-reference"
   | "heuristic"
+  // V3-P1 code-property-graph edge types (see RepoGraph.cpgEdges).
+  | "call"
+  | "extends"
+  | "implements"
   | "unknown";
 
 export interface GraphNode {
@@ -241,6 +287,13 @@ export interface GraphEdge {
   confidence: ParserConfidence;
   evidence: string;
   sourceLine?: number;
+  /**
+   * Relationship STRENGTH (V3-P1). 1 for a dependency edge (a file either imports another
+   * or it does not); the occurrence count for a CPG call edge, so "A calls 40 symbols in
+   * B" outweighs "A imports a type from B". Weighted modularity in community detection
+   * reads this; the degree/centrality metrics deliberately do not.
+   */
+  weight?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -424,6 +477,18 @@ export interface InventorySymbol {
   exported: boolean;
   /** Language label (matches RepoFile.language), e.g. "TypeScript". */
   language: string;
+  /**
+   * The declaration line, trimmed — signature, not body (V3-P2).
+   *
+   * The parser has produced this since V3-P1 (`ParsedSymbol.signature`); Inventory was simply
+   * dropping it on the floor. RAG chunk enrichment needs it: a chunk torn out of the middle of
+   * a large symbol has lost its own signature, and a signature is where a typed language puts
+   * its types, so carrying it is also how "enriched with types" is satisfied without inventing
+   * a types field nothing could fill.
+   *
+   * Absent when the parser could not determine one (a re-export has no declaration line).
+   */
+  signature?: string;
 }
 
 export type EntryPointKind = "main" | "index" | "server" | "app" | "cli-bin";
@@ -491,6 +556,65 @@ export interface RepoDependencyEdge {
 }
 
 /**
+ * A CODE PROPERTY GRAPH edge: a semantic relationship between two repo files that goes
+ * BEYOND the import statement — a call into an imported symbol, or a class inheriting from
+ * one. `from`/`to` are fileIds (=== repo-relative POSIX path).
+ *
+ * Aggregated per (from, to, kind, symbol) with an occurrence `count` rather than stored
+ * one-edge-per-call-site. That keeps the list COMPLETE (no truncation, no sampling) while
+ * bounding it by distinct symbols instead of by call sites — a 200-call file would
+ * otherwise put tens of thousands of near-identical edges in the cached document.
+ *
+ * HONEST LIMIT: targets are resolved through the file's OWN imports (the cheap tree-sitter
+ * heuristic), so a cpgEdge always refines a relationship the import graph already has —
+ * it never invents a dependency between two files with no import between them. What it
+ * adds is *strength and kind*: "A imports B" vs "A calls 40 symbols in B" vs "A's class
+ * extends B's class". That weighting is what community detection consumes. Compiler-exact
+ * cross-file references need an indexer (SCIP), which is deliberately gated and optional.
+ */
+export interface CpgEdge {
+  from: string;
+  to: string;
+  kind: "call" | "extends" | "implements";
+  /** The symbol the relationship goes through, as written (e.g. `renderTemplate`, `utils.parse`). */
+  symbol: string;
+  /** Occurrences of this exact relationship in `from`. Always >= 1. */
+  count: number;
+  /** 1-based line of the FIRST occurrence — enough to cite the relationship. */
+  line: number;
+}
+
+/** HTTP method label on a detected route. `USE` is an Express mount point; `ALL` matches
+ *  any verb. Uppercase so the value is comparable across frameworks. */
+export type HttpRouteMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "OPTIONS"
+  | "HEAD"
+  | "ALL"
+  | "USE";
+
+/**
+ * An HTTP route declared in a repo file — the "property" half of the code property graph:
+ * a fact about a node, not an edge. Detected from cheap, high-precision syntax only
+ * (Express-style `app.get("/x", …)`, Flask `@app.route("/x")`, FastAPI `@router.get("/x")`)
+ * and only when the path is a STRING LITERAL starting with `/`, so a `map.get(key)` is
+ * never mistaken for a route.
+ */
+export interface HttpRoute {
+  /** References FileNode.id (=== repo-relative POSIX path). */
+  fileId: string;
+  method: HttpRouteMethod;
+  /** The route path exactly as written in source (never normalized or guessed). */
+  path: string;
+  line: number;
+  framework: "express" | "flask" | "fastapi" | "unknown";
+}
+
+/**
  * Import-resolution stats — makes the "real vs simplified" approximation data-backed
  * rather than hidden. Regex extraction + heuristic relative resolution is approximate;
  * tsconfig/package path aliases are out of scope (counted as unresolved).
@@ -520,6 +644,37 @@ export interface RepoGraph {
   /** Resolved repo-file→repo-file edges only (external/unresolved live in `resolution`). */
   edges: RepoDependencyEdge[];
   resolution: GraphResolution;
+  /**
+   * V3-P1 code-property-graph edges (calls / inheritance), sorted by
+   * (from, to, kind, symbol). COMPLETE and never truncated.
+   *
+   * Deliberately a SEPARATE list from `edges`: `edges` is the DEPENDENCY graph, and
+   * `metrics.perFile.fanIn`/`fanOut` are contractually "files that import this one". Folding
+   * call edges into `edges` would silently redefine every existing metric. Algorithms that
+   * want the richer graph opt in — community detection runs on the union, which is why
+   * `metrics.clusters` reflects calls while `fanIn` still means imports.
+   *
+   * Absent (not empty) when the parser engine could not produce them — a regex fallback
+   * yields imports only, and `cpg.engine` records that.
+   */
+  cpgEdges?: CpgEdge[];
+  /** V3-P1 detected HTTP routes, sorted by (fileId, path, method, line). Uncapped. */
+  routes?: HttpRoute[];
+  /** How the code property graph was produced — makes a degraded run visible. */
+  cpg?: CpgProvenance;
+}
+
+/**
+ * Provenance for the code-property-graph enrichment. Without this, a repo whose grammars
+ * failed to load would look like a repo with genuinely no calls or routes.
+ */
+export interface CpgProvenance {
+  /** Files whose CPG facts came from tree-sitter (calls/inheritance/routes are real). */
+  treeSitterFiles: number;
+  /** Files that fell back to the regex engine (imports only — no calls/routes from these). */
+  fallbackFiles: number;
+  /** True when at least one file was parsed by tree-sitter. */
+  enriched: boolean;
 }
 
 // ── Analyze slice (stage 6) ──────────────────────────────────────────────────
@@ -557,12 +712,53 @@ export interface RepoMetricsSummary {
 }
 
 /**
+ * One detected community (module) of files. `id` is canonical: communities are sorted by
+ * size descending, then by their lowest member fileId, and numbered from 0 — so the id does
+ * not depend on any internal iteration order.
+ */
+export interface RepoCluster {
+  id: number;
+  /** Member fileIds, sorted. COMPLETE — never truncated. */
+  files: string[];
+  /** == files.length. */
+  size: number;
+  /** Summed edge weight WITHIN the community (higher ⇒ more cohesive). */
+  internalWeight: number;
+  /** Summed edge weight leaving the community (lower ⇒ more independent). */
+  externalWeight: number;
+}
+
+/**
+ * Deterministic community partition of the code property graph (V3-P1). The ONE canonical
+ * home for clusters/modules — there is no second competing field.
+ *
+ * Computed on the UNION of `graph.edges` and `graph.cpgEdges` (imports + weighted calls +
+ * inheritance), projected undirected: coupling for the purpose of clustering genuinely
+ * includes calls, and a call edge with `count: 40` should outweigh a single type import.
+ * Note this differs from `perFile.fanIn`/`fanOut`, which stay contractually "files that
+ * directly import this one" — that asymmetry is deliberate and documented, not an oversight.
+ */
+export interface RepoClusters {
+  algorithm: "louvain";
+  /** Seed of the deterministic node-visit permutation (no RNG is used). */
+  seed: number;
+  /** Resolution used to steer partition granularity. */
+  resolution: number;
+  /** STANDARD (unscaled) weighted modularity Q of this partition. Higher ⇒ better-separated
+   *  modules; > ~0.3 indicates meaningful structure. 0 for an edgeless graph. */
+  modularity: number;
+  /** == clusters.length. */
+  count: number;
+  /** Every node's community, sorted by fileId. COMPLETE — one entry per graph node. */
+  assignments: Array<{ fileId: string; cluster: number }>;
+  /** The communities themselves, in canonical id order. */
+  clusters: RepoCluster[];
+}
+
+/**
  * Deterministic graph metrics produced by Analyze (stage 6). All rankings are COMPLETE
  * and never truncated (top-N is a P5 render concern only) and deterministically ordered
  * (ties broken by fileId) so the SHA-keyed cache + P3 eval set stay stable.
- *
- * NOTE: `clusters`/modules are intentionally absent — @codeflow/graph has no clustering
- * algorithm yet; adding one is its own session (see CURRENT_STATE deferred ledger).
  */
 export interface RepoMetrics {
   /** Every node's metrics, sorted by fileId. */
@@ -573,23 +769,21 @@ export interface RepoMetrics {
   hotspots: string[];
   /** Every dependency cycle, as fileId lists; deterministic order. */
   cycles: Array<{ files: string[] }>;
+  /**
+   * Community/module partition (V3-P1 — closes the long-standing "no clustering algorithm
+   * yet" gap). Absent only when the graph slice carries no nodes to partition.
+   */
+  clusters?: RepoClusters;
   summary: RepoMetricsSummary;
 }
 
-/** A grounding reference back to real code — every AI claim must carry these. */
-export interface Citation {
-  /** References FileNode.id. */
-  fileId: string;
-  path: string;
-  lineStart?: number;
-  lineEnd?: number;
-}
-
-/** AI 3-line "what is this project" (Orient). */
-export interface ProjectSummary {
-  text: string;
-  citations: Citation[];
-}
+// NOTE (V3-CLEANUP): `Citation` and `ProjectSummary` were removed here. V3-P0 deleted
+// `AiAnalysis.projectSummary` (producerless — nothing wrote it, nothing read it), which left
+// `ProjectSummary` as its only type and `Citation` used solely by `ProjectSummary.citations`.
+// Keeping them would have reproduced exactly the smell V3-P0 removed: a declared contract no
+// code writes or reads. They come back WITH a producer if Orient ever grows its AI summary.
+// The live citation shapes are elsewhere and untouched: `RagAnswerCitation` (@codeflow/
+// analyzers), `AskCitation` (apps/web), and `Synthesis.readingOrder` / `droppedCitations`.
 
 /**
  * One step in the onboarding reading order. `fileId === graph.nodes[].id === repo-relative
@@ -621,14 +815,44 @@ export interface Synthesis {
 }
 
 /**
- * One embedded chunk of repository content (RAG / stage 8). Derived from an inventory
- * symbol (symbol-aware) or a fixed window (docs / uncovered source regions), so every
- * chunk inherits a REAL `fileId` + line range and its citations are grounded by
- * construction. `embedding` is a plain number[] (serializable — no live vector object),
- * needed by the future ask-the-repo query path together with `text`.
+ * V3-P2 AST enrichment for a chunk: what the tree-sitter CPG knows about the code in this
+ * line range, beyond the raw bytes.
+ *
+ * WHY IT EXISTS. A window of lines torn out of the middle of a class embeds badly: the vector
+ * sees a method body with no idea which class it belongs to, what it is called, or what it
+ * documents. Prepending that context to the EMBEDDING INPUT (never to the stored `text` — see
+ * `RagChunk.text`) puts the identifying words into the vector, which is what makes a query
+ * naming the class or the symbol find the chunk at all.
+ *
+ * Every field is DERIVED DETERMINISTICALLY from the deterministic spine (inventory symbols +
+ * the file bytes). No model produces any of it, so the chunk plan stays byte-reproducible.
+ */
+export interface ChunkEnrichment {
+  /** Enclosing symbol chain, outermost first (e.g. ["AuthService"] for one of its methods). */
+  scope?: string[];
+  /** The symbol's declaration line, trimmed — signature, not body. */
+  signature?: string;
+  /** The leading doc comment / docstring, comment markers stripped, truncated. */
+  docstring?: string;
+  /** Language label (matches RepoFile.language), e.g. "TypeScript". */
+  language?: string;
+}
+
+/**
+ * Chunk METADATA (RAG / stage 8). Derived from an inventory symbol (symbol-aware) or a fixed
+ * window (docs / uncovered source regions), so every chunk inherits a REAL `fileId` + line
+ * range and its citations are grounded by construction.
+ *
+ * V3-P2 REMOVED `text` and `embedding` from this type. They were the two heavy fields, and
+ * they lived inside the analysis document: a 1024-dim vector is roughly 8KB of JSON per chunk,
+ * so a mid-sized repo exceeded Mongo's 16MB BSON limit, and every read of an analysis dragged
+ * the whole index across the wire. Both now live in `@codeflow/retrieval`'s stores, keyed by
+ * (namespace, chunk id) — see `Rag.store`. What remains here is exactly what a CITATION needs
+ * (file + line range) plus what a plan/report needs, which is why this slice is still worth
+ * persisting at all. The chunk `id` is UNCHANGED, so it is the join key between the two.
  */
 export interface RagChunk {
-  /** Deterministic: `${fileId}#${startLine}-${endLine}`. */
+  /** Deterministic: `${fileId}#${startLine}-${endLine}`. Also the store key. */
   id: string;
   /** Repo-relative POSIX path; MUST exist in graph.nodes (grounding). */
   fileId: string;
@@ -638,11 +862,24 @@ export interface RagChunk {
   endLine: number;
   /** Set when the chunk aligns to an inventory symbol. */
   symbolName?: string;
-  /** Chunk content (needed by the future query path; uncapped). */
-  text: string;
-  /** The embedding vector (plain serializable; no live vector object). */
-  embedding: number[];
   tokenCount: number;
+  /** V3-P2 AST enrichment, when derivable. Absent is normal (e.g. a docs window). */
+  enrichment?: ChunkEnrichment;
+}
+
+/**
+ * Where an index's heavy fields actually live (V3-P2). Present on every index built from P2
+ * onward; ABSENT on a pre-P2 index, which is the signal that it was inline and is therefore
+ * unreadable by the current query path and must be rebuilt.
+ */
+export interface RagStoreRef {
+  /** The canonical namespace both stores are keyed by (see `retrievalNamespace`). */
+  namespace: string;
+  /** Which vector store holds the vectors, e.g. "pgvector:codeflow_vectors_1024". Recorded
+   *  so a mismatch between the index and the configured store is diagnosable, not mysterious. */
+  vectorStoreId: string;
+  /** Which text store holds the chunk text, e.g. "postgres:codeflow_chunk_text". */
+  textStoreId: string;
 }
 
 /**
@@ -651,9 +888,15 @@ export interface RagChunk {
  * come from an injectable client (cached, content-addressed). Lives under
  * `result.ai.rag`. Index-build only — the retrieve/answer/cite query path is a separate
  * runtime path.
+ *
+ * V3-P2: this slice is now LIGHTWEIGHT METADATA. The vectors and the chunk text were moved
+ * out to `@codeflow/retrieval`'s stores (see `RagChunk` and `RagStoreRef`), so the size of
+ * this slice grows with the chunk COUNT and no longer with the embedding dimension — which is
+ * what took the 16MB BSON ceiling off the index.
  */
 export interface Rag {
-  /** Sorted by (fileId, startLine) — deterministic. */
+  /** Chunk METADATA, sorted by (fileId, startLine) — deterministic. Text + vectors live in
+   *  the stores named by `store`; this list is the plan and the citation keyspace. */
   chunks: RagChunk[];
   chunkCount: number;
   /** e.g. "voyage-code-3". */
@@ -663,13 +906,72 @@ export interface Rag {
   /** Chunks dropped by grounding (fileId not a node, or line range out of file).
    *  Omitted entirely when none (absent ≠ empty) — a non-zero count is a quality signal. */
   droppedChunks?: { count: number; fileIds: string[] };
+  /** V3-P2: where the vectors + text for these chunks live. Absent ⇒ a pre-P2 inline index. */
+  store?: RagStoreRef;
 }
 
-/** The single AI slice. Each field is owned by exactly one AI stage. */
+/**
+ * The single AI slice. Each field is owned by exactly one AI stage.
+ *
+ * V3-P0 REMOVED `projectSummary` (and the `aiProjectSummary` slice key). It was a
+ * producerless slice: PLAN §4 sketched an "AI 3-line summary" for Orient, but Orient only
+ * ever owned `["orientation"]`, nothing wrote the field, and nothing read it. Meanwhile
+ * `Synthesis.summary` already answers "what is this project" — from the full deterministic
+ * fact set rather than the README alone — so the slot was redundant as well as empty.
+ * Reinstate it WITH its producer if Orient ever grows an AI step; a declared-but-unwritten
+ * field is worse than an absent one, because consumers cannot tell the difference.
+ */
 export interface AiAnalysis {
-  projectSummary?: ProjectSummary; // orient
   synthesis?: Synthesis; // synthesize
   rag?: Rag; // rag (stage 8 — RAG index)
+  /**
+   * DOMAIN LANES — what the specialist fan-out found, per community (V3-FINAL).
+   *
+   * INFERENCE, NOT FACT, and that is why it lives under `result.ai` with everything else a model
+   * produced. Any surface rendering it must label it as inferred; a domain lane presented next to
+   * the parser's structural roles without that label would read as the same kind of claim, and it
+   * is not.
+   *
+   * WHY IT IS PERSISTED AT ALL. The fan-out's findings existed only for the duration of the run: the
+   * supervisor read a bounded selection of twelve and the rest was paid for and discarded. V3-P5
+   * consolidated them into a knowledge base — inside the run, because that is the only moment they
+   * are all in hand — and then dropped that too, so nothing a user could see was ever produced from
+   * five specialists' work.
+   *
+   * BOUNDED BY CONSTRUCTION, because ledger #20 tracks this document's growth: at most
+   * `FANOUT_MAX_COMMUNITIES` lanes, each with a bounded module list and no free text beyond a
+   * headline. The findings' full detail is NOT here — that is what would grow without limit.
+   */
+  domains?: DomainLane[];
+}
+
+/**
+ * One inferred domain: a community, the specialists that reported on it, and its modules.
+ *
+ * `moduleIds` are GROUNDED — every one is a real `graph.nodes[].id`, re-checked when the lane is
+ * built. A domain lane citing a file the graph does not contain would be the same failure the three
+ * grounding passes exist to prevent, one layer later.
+ */
+export interface DomainLane {
+  /** The community id this lane came from. */
+  cluster: number;
+  /** A short human title, derived from the community's own modules — never invented prose. */
+  title: string;
+  /**
+   * The specialist that contributed most to this lane, as a tag ("auth-surface", "storage-shape").
+   * Named so a reader knows WHICH lens produced the inference rather than "an agent".
+   */
+  agentTag: string;
+  /** Every specialist that reported on this community, sorted. */
+  specialists: string[];
+  /** Grounded module ids, bounded and sorted. */
+  moduleIds: string[];
+  /** How many of those modules are entry-probable — a derived flag from the graph, not inference. */
+  entryProbable: number;
+  /** The lane's strongest headlines, bounded. Model-written prose; labelled as such wherever shown. */
+  headlines: string[];
+  /** Findings two or more independent lenses agreed on. The strongest signal a fan-out produces. */
+  corroborated: number;
 }
 
 /**
@@ -693,12 +995,20 @@ export interface AnalysisResultSlices {
   entryPoints: EntryPoint[]; // connect (deferred)
   dependencies: DependencyEdge[]; // connect (deferred)
   metrics: AnalysisResult["metrics"]; // analyze
-  issues: Issue[]; // analyze
-  summary: AnalysisSummary; // analyze
+  // `issues` and `summary` are DERIVED at assembly from the deterministic slices — no
+  // stage owns either. An explicit slice still wins if a stage ever produces one.
+  issues: Issue[]; // derived (assembly) from metrics
+  summary: AnalysisSummary; // derived (assembly) from graph + inventory + metrics
   // AI (assembled under result.ai.*)
-  aiProjectSummary: ProjectSummary;
+  // NOTE: `aiProjectSummary` was removed in V3-P0 — see AiAnalysis.
   aiSynthesis: Synthesis;
   aiRag: Rag;
+  /**
+   * Inferred domain lanes (V3-FINAL). Owned by the SAME stage as `aiSynthesis` — the fan-out is the
+   * only thing that produces them, and giving them a stage of their own would put a second stage in
+   * the coverage partition for one derived field of an existing one.
+   */
+  aiDomains: DomainLane[];
 }
 
 export type AnalysisSliceKey = keyof AnalysisResultSlices;
@@ -729,6 +1039,18 @@ export interface ProgressEvent {
   /** Small, flat, JSON-safe teaser for the UI — NEVER the full slice. */
   preview?: Record<string, string | number | boolean | null>;
   error?: { message: string; retriable?: boolean };
+  /**
+   * Provider usage this stage actually spent (V3-FINAL). Present only on a stage that made a paid
+   * call and did not serve it from cache — absent means "spent nothing", which is a different and
+   * equally important fact from "spent zero tokens".
+   *
+   * A FIRST-CLASS FIELD rather than three numbers smuggled through `preview`, for two reasons: it
+   * carries `measured`, and an honesty flag that can be dropped by a loose record is an honesty flag
+   * that will be. And it is what lets the worker attribute cost to the right SPAN — without it the
+   * recording tracer's headline claim ("cost is measured, not estimated") reported $0.00 for every
+   * run, because nothing ever called `recordUsage`.
+   */
+  usage?: TokenUsage;
   emittedAt: string; // ISO-8601
 }
 
@@ -757,11 +1079,46 @@ export interface AnalysisCacheHandle {
  * `check(estimate)` → call the provider → `record(actual)`. When `check` returns false the
  * AI stage degrades gracefully ("partial" + budget-exhausted), it does NOT call the provider.
  */
+/**
+ * What a paid call actually cost, as reported by the provider (V3-P0).
+ *
+ * `measured` is the load-bearing field: the cost invariant is "measured, not estimated",
+ * and the only way to keep that claim honest is to record whether the provider actually
+ * told us. A provider that reports nothing usable (e.g. the Gemini embedding endpoint)
+ * yields `measured: false` with an estimate, and that shows up in the budget ledger rather
+ * than being quietly indistinguishable from a real number.
+ */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  /** True only when these numbers came from the provider's response. */
+  measured: boolean;
+  /** Prompt-cache tokens READ (billed at a discount), when the provider reports them. */
+  cacheReadTokens?: number;
+  /** Prompt-cache tokens WRITTEN (billed at a premium), when the provider reports them. */
+  cacheWriteTokens?: number;
+}
+
+/**
+ * Separate counters per BILLING UNIT. Chat tokens and embedding tokens are priced
+ * differently and exhaust independently, so a single pooled number cannot express either
+ * ceiling correctly.
+ */
+export type BudgetUnit = "chat" | "embedding";
+
 export interface BudgetHandle {
   /** True if spending `estimatedTokens` more this UTC day stays within budget. */
-  check(estimatedTokens: number): Promise<boolean>;
-  /** Add actually-spent tokens to the current UTC day's running total. */
-  record(actualTokens: number): Promise<void>;
+  check(estimatedTokens: number, unit?: BudgetUnit): Promise<boolean>;
+  /**
+   * Add actually-spent tokens to the current UTC day's running total.
+   *
+   * Prefer the `TokenUsage` overload — it carries the provider's real numbers and the
+   * `measured` flag. The plain-number form remains for callers that genuinely have only a
+   * count (and for back-compat with existing tests).
+   */
+  record(actual: number | TokenUsage, unit?: BudgetUnit): Promise<void>;
+  /** Current spend for a unit this UTC day, when the implementation can report it. */
+  spent?(unit?: BudgetUnit): Promise<number>;
 }
 
 /** Immutable trigger for a pipeline run — the same for every stage. */
@@ -802,6 +1159,56 @@ export interface PipelineContext {
   /** Optional interim progress (e.g. "parsed 200/5000"). The canonical, terminal
    *  event for a stage is the one returned in StageResult. */
   emit?(event: ProgressEvent): void;
+  /**
+   * Speculative prefetch, if the orchestrator is running one (V3-P5 task 1, wired V3-FINAL).
+   *
+   * A stage that DECLARED a speculation asks for it back here. Absent ⇒ speculation is off for this
+   * run, and a stage must behave exactly as it did before — computing the thing itself.
+   *
+   * Narrowed to `claim` on purpose. A stage has no business promoting or discarding a speculation:
+   * `commit()`/`rollback()` decide what reaches the shared cache, and that decision belongs to
+   * whoever owns the run, not to one of its stages. Widening this to the full `Speculator` would let
+   * a stage write an unvalidated entry into the cache, which is the one hazard the staging layer
+   * exists to prevent.
+   */
+  speculator?: SpeculationClaim;
+}
+
+/**
+ * The half of a speculator a STAGE is allowed to touch: ask for a staged value by key.
+ *
+ * Structural, and declared here rather than imported, because `PipelineContext` lives in
+ * shared-types while the speculator implementation lives in `@codeflow/analyzers` — and
+ * shared-types depends on nothing. `Speculator` satisfies this without declaring that it does.
+ */
+export interface SpeculationClaim {
+  /** The staged value for `key`, or null when nothing was staged (or it failed). */
+  claim<T>(key: string): Promise<T | null>;
+}
+
+/**
+ * Measured provider spend, aggregated. The shape both `@codeflow/observability` (per span, per
+ * trace) and `AnalysisResult.cost` (per run) use.
+ *
+ * DECLARED HERE rather than in observability, even though observability is where cost is COMPUTED:
+ * the analysis result carries it, and shared-types is the package a result's contract may depend on.
+ * Observability re-exports this rather than defining a twin, because two structurally identical cost
+ * types is how a `measured` flag ends up set on one and dropped on the other.
+ *
+ * `usd: null` and `usd: 0` are DIFFERENT and must stay so: null means no price is known for a
+ * contributing model, zero means the work was genuinely free. Collapsing them would let an
+ * unconfigured price table read as "this run cost nothing".
+ */
+export interface CostBreakdown {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** Null when no price is known for a contributing model — distinct from 0, which means free. */
+  usd: number | null;
+  /** False when ANY contributing usage was a provider ESTIMATE rather than a read-back. */
+  measured: boolean;
+  /** Models that had no price entry, so an unpriced total is explainable rather than mysterious. */
+  unpricedModels: string[];
 }
 
 /** What a stage returns: the slice(s) it owns + its terminal progress event. */
@@ -848,6 +1255,37 @@ export interface StageRunRecord {
 }
 
 export type PipelineRunStatus = "completed" | "partial" | "failed" | "aborted";
+
+/**
+ * How much of the pipeline this run actually delivered (V3-P0).
+ *
+ * SEPARATE from `PipelineRunStatus` on purpose: a run with no provider key completes
+ * successfully — every stage that existed did its job — so its status is legitimately
+ * "completed". What it is NOT is a full analysis. Conflating the two forced the UI to infer
+ * capability from a status that does not carry it, which is how stages 7-8 ended up sitting
+ * at "pending" behind a finished run.
+ *
+ * Also SEPARATE from `AnalysisMode` ("public_hosted"), which describes how the repository was
+ * ACCESSED. Access mode and delivered scope are different axes; overloading one with the
+ * other would make both unreadable.
+ */
+export type RunMode = "full" | "deterministic-only";
+
+/** Typed causes of degradation. A machine-readable reason next to the human `warnings[]`
+ *  string, so the UI can branch instead of pattern-matching prose. */
+export type DegradationReason =
+  | "no-chat-provider"
+  | "no-embedding-provider"
+  | "mongo-unavailable"
+  | "redis-unavailable"
+  | "budget-exhausted";
+
+/** One reason this run delivered less than a full analysis. */
+export interface DegradationNotice {
+  reason: DegradationReason;
+  /** Human-readable detail, including the env var that would fix it where applicable. */
+  detail: string;
+}
 
 /**
  * Typed, machine-readable reason for a non-clean run outcome (P4 guardrails). Distinct

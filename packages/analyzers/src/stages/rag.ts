@@ -1,4 +1,5 @@
 import type {
+  AnalysisResultSlices,
   FileRole,
   Inventory,
   InventorySymbol,
@@ -11,14 +12,35 @@ import type {
   RepoStructure,
   StageEmbeddingTarget,
   StageResult,
+  TokenUsage,
 } from "@codeflow/shared-types";
-import type { EmbeddingClient } from "../embedding/embeddingClient.js";
+import {
+  assertEmbeddingSpace,
+  deriveEnrichment,
+  embedTextFor,
+  retrievalNamespace,
+  type ChunkTextStore,
+  type SymbolSpan,
+  type VectorRecord,
+  type VectorStore,
+} from "@codeflow/retrieval";
+import type { EmbeddingClient, EmbeddingResult } from "../embedding/embeddingClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { embedCacheKey, type CachedEmbedding } from "../rag/embedCache.js";
+import type { StageSpeculationSource } from "../pipeline/speculation.js";
+import { estimateTokens, sumUsage } from "../util/tokens.js";
 
 export interface RagDependencies {
   /** Injectable embedding client — tests mock it (no real API calls). */
   client: EmbeddingClient;
+  /**
+   * Where the VECTORS go (V3-P2). Injected, never constructed here: the hermetic suite passes
+   * `createMemoryVectorStore`, production passes the pgvector adapter, and this stage does not
+   * know or care which. Its `space` is checked against `client` before a single write.
+   */
+  vectorStore: VectorStore;
+  /** Where the chunk TEXT goes (V3-P2). Same injection rule as `vectorStore`. */
+  textStore: ChunkTextStore;
   /**
    * Reads repo-relative file CONTENTS (same shape Inventory/Orient use). Resolves null
    * when unreadable. Only called on the DISK path (ctx.repoPath present); on a no-disk
@@ -52,10 +74,16 @@ const MAX_BATCH_TEXTS = 128;
 const MAX_BATCH_TOKENS = 120_000;
 // Chunk-plan cache-key version — manual cache-bust (bump on a chunking-algorithm change).
 // The embedding-cache key lives in ../rag/embedCache.ts (shared with the query path).
-const PLAN_CACHE_VERSION = "v1";
+// v2 (V3-P2): plan entries now carry `enrichment`, so a v1 cached plan would produce
+// un-enriched chunks on the no-disk retry path — silently worse retrieval, not a crash.
+const PLAN_CACHE_VERSION = "v2";
 
-/** The deterministic chunk plan entry (a RagChunk WITHOUT its vector). */
-type ChunkPlan = Omit<RagChunk, "embedding">;
+/**
+ * The deterministic chunk plan entry: the persisted metadata PLUS the text, which is what
+ * gets embedded and then written to the text store. `RagChunk` itself no longer carries
+ * `text` (V3-P2), so the plan states the extra field explicitly rather than subtracting one.
+ */
+type ChunkPlan = RagChunk & { text: string };
 
 /** What the chunk-plan cache stores (plain serializable; NO vectors). */
 interface CachedChunkPlan {
@@ -76,6 +104,14 @@ interface CachedChunkPlan {
  * Unlike Synthesize there is NO retry on grounding — chunking is deterministic, so
  * re-running cannot change the outcome.
  *
+ * V3-P2 — WHERE THE OUTPUT GOES. The vectors are written to an injected `VectorStore` and
+ * the chunk text to an injected `ChunkTextStore`, both keyed by (namespace, chunk id); the
+ * `aiRag` slice keeps only metadata + a `store` reference. Writes are ordered TEXT FIRST, then
+ * VECTORS, and that order is not arbitrary: the vector store is what a search reads, so if the
+ * process dies between the two, the worst case is text nobody can find (harmless, overwritten
+ * on retry) rather than searchable hits whose text is missing (a retrieved chunk with no
+ * content, which would reach a prompt as a citation of code the model never saw).
+ *
  * Two caches (via ctx.cache, namespaced keys):
  *   1. Embedding cache (content-addressed) — re-embedding unchanged text costs zero API.
  *   2. Chunk-plan cache (SHA-keyed) — enables the no-disk AI-only retry: when ctx.repoPath
@@ -85,18 +121,71 @@ interface CachedChunkPlan {
  * grounding makes the stage THROW → orchestrator records an AI failure → run "partial"
  * with deterministic + synthesis slices intact.
  */
-export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & StageEmbeddingTarget {
+export function createRagStage(
+  deps: RagDependencies,
+): PipelineStage<"aiRag"> & StageEmbeddingTarget & StageSpeculationSource {
   const now = deps.now ?? Date.now;
   const maxAttempts = deps.maxAttempts ?? 3;
   const maxChunkTokens = deps.maxChunkTokens ?? MAX_CHUNK_TOKENS;
   const windowLines = deps.windowLines ?? WINDOW_CHUNK_LINES;
   const client = deps.client;
 
+  /** Where a plan lives in the shared cache. One definition, used by both the stage and its
+   *  speculation — two string templates would be a silent cache miss waiting to happen. */
+  const planKeyFor = (commitSha: string | undefined) => `rag/${PLAN_CACHE_VERSION}/${commitSha ?? "no-sha"}`;
+
   return {
     id: "rag",
     kind: "ai",
     label: "Indexing for Q&A",
     owns: ["aiRag"],
+
+    /**
+     * SPECULATION (V3-P5 task 1, wired V3-FINAL): build the chunk plan early.
+     *
+     * WHY THIS TASK AND NOT ANOTHER. The plan is a pure disk+CPU pass over every source file —
+     * read, split, interval-cover the symbol spans, sweep the gaps. It costs no money and calls no
+     * provider, which is exactly the rule speculation must obey. And it becomes computable the
+     * moment `connect` lands (it needs graph node ids, structure and inventory), while the stage
+     * that needs it runs LAST — after `synthesize` has spent seconds blocked on a chat provider.
+     * In sequential mode that entire wait is currently unused; here it pays for the plan.
+     *
+     * THE VALUE IS BYTE-IDENTICAL, which is what makes it safe on a deterministic-adjacent path:
+     * same function, same inputs, and the inputs are the FROZEN prior slices the stage itself will
+     * receive. A test runs the pipeline with and without speculation and compares the rag slice.
+     *
+     * Returns [] rather than a task when it cannot honestly stage one — no working tree (a no-clone
+     * AI-only retry, which reads the cache anyway) or a missing slice. Staging something this stage
+     * would not claim is the failure mode `hitRate` exists to expose.
+     */
+    speculations(context) {
+      const prior = context.prior as Partial<AnalysisResultSlices> | undefined;
+      const graph = prior?.graph;
+      const structure = prior?.structure;
+      if (!context.repoPath || !graph || !structure) return [];
+      const nodeIds = new Set(graph.nodes.map((node) => node.id));
+      const inventory = prior?.inventory;
+      const repoPath = context.repoPath;
+      return [
+        {
+          key: planKeyFor(context.commitSha),
+          label: `rag chunk plan (${structure.files.length} file(s))`,
+          async compute(): Promise<CachedChunkPlan> {
+            const built = await buildChunkPlan({
+              repoPath,
+              structure,
+              inventory,
+              nodeIds,
+              readFile: deps.readFile,
+              maxChunkTokens,
+              windowLines,
+            });
+            return { chunks: built.chunks, ...(built.droppedChunks ? { droppedChunks: built.droppedChunks } : {}) };
+          },
+        },
+      ];
+    },
+
     // Exposes the (model, dim) this stage will produce so the orchestrator can reject a
     // cached rag slice from a different embedding space (index homogeneity).
     embeddingTarget: { model: client.model, dim: client.dimension },
@@ -109,14 +198,34 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
       const structure = ctx.prior.structure;
       const inventory = ctx.prior.inventory;
       const nodeIds = new Set(graph.nodes.map((node) => node.id));
-      const planCacheKey = `rag/${PLAN_CACHE_VERSION}/${ctx.commitSha ?? "no-sha"}`;
+      const planCacheKey = planKeyFor(ctx.commitSha);
 
-      // --- Resolve the chunk plan: disk → cache → throw -----------------------
+      // --- Resolve the chunk plan: speculation → disk → cache → throw ---------
       let plan: ChunkPlan[];
       let droppedChunks: Rag["droppedChunks"];
       let fromCache = false;
+      let fromSpeculation = false;
 
-      if (ctx.repoPath) {
+      // CLAIM first. A staged plan is the SAME computation this stage would run next, already done
+      // during `synthesize`'s provider wait — so claiming it is not a shortcut, it is collecting work
+      // already paid for. `claim` awaits an in-flight speculation rather than racing it, which is
+      // what stops the plan from ever being built twice.
+      //
+      // Grounding is deliberately NOT skipped: the claimed plan is re-filtered against `nodeIds`
+      // below exactly like a cached one, because "computed from the same slices" is a strong reason
+      // to expect it to hold and not a reason to stop checking.
+      const staged = ctx.speculator ? await ctx.speculator.claim<CachedChunkPlan>(planCacheKey) : null;
+      if (staged) {
+        plan = staged.chunks.filter((chunk) => nodeIds.has(chunk.fileId));
+        droppedChunks = staged.droppedChunks;
+        fromSpeculation = true;
+        // Still WRITTEN to the shared cache here, unchanged from the non-speculative path. The
+        // orchestrator's `commit()` also promotes this key, so it is one redundant write per run —
+        // paid deliberately, because the alternative is weakening the guarantee this line exists for:
+        // the plan must be persisted BEFORE embedding so it survives a mid-embed failure, and
+        // `commit()` runs at the END of the run.
+        await ctx.cache.set(planCacheKey, staged);
+      } else if (ctx.repoPath) {
         if (!structure) {
           throw new Error("RAG requires the structure slice; Map-structure must run first.");
         }
@@ -157,11 +266,55 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
       }
 
       // --- Embed (embedding cache → batch the misses, transient retry) --------
-      const embeddings = await embedChunks(plan, ctx, client, maxAttempts);
+      const { embeddings, usage: embedUsage } = await embedChunks(plan, ctx, client, maxAttempts);
 
-      const chunks: RagChunk[] = plan
-        .map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }))
-        .sort((a, b) => (a.fileId === b.fileId ? a.startLine - b.startLine : a.fileId.localeCompare(b.fileId)));
+      // GUARD (V3-P2): the store must live in the SAME embedding space as the client that
+      // just produced these vectors. Checked here rather than at wiring time because the
+      // client is chosen from env at runtime and a mismatch would otherwise surface as
+      // plausible-looking but meaningless cosine scores forever after.
+      assertEmbeddingSpace(client, deps.vectorStore.space, `vector store ${deps.vectorStore.id}`);
+
+      const ordered = plan
+        .map((chunk, i) => ({ chunk, embedding: embeddings[i] }))
+        .sort((a, b) =>
+          a.chunk.fileId === b.chunk.fileId
+            ? a.chunk.startLine - b.chunk.startLine
+            : a.chunk.fileId.localeCompare(b.chunk.fileId),
+        );
+
+      const namespace = retrievalNamespace({
+        repoFullName: repoFullNameOf(input),
+        commitSha: ctx.commitSha ?? "no-sha",
+        embeddingModel: client.model,
+        embeddingDim: client.dimension,
+      });
+
+      // Drop first, so the namespace ends up holding EXACTLY this chunk set. Without it a
+      // chunking-algorithm change would leave the previous run's chunk ids behind, still
+      // searchable, still citing line ranges the current plan says nothing about.
+      await deps.vectorStore.drop(namespace);
+      await deps.textStore.drop(namespace);
+
+      await deps.textStore.put(
+        namespace,
+        ordered.map(({ chunk }) => ({ id: chunk.id, text: chunk.text })),
+      );
+      const records: VectorRecord[] = ordered.map(({ chunk, embedding }) => ({
+        id: chunk.id,
+        vector: embedding,
+        fileId: chunk.fileId,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...(chunk.symbolName ? { symbolName: chunk.symbolName } : {}),
+      }));
+      await deps.vectorStore.upsert(namespace, records);
+
+      // The persisted slice: metadata only. `text` is stripped here — that strip IS the
+      // 16MB-BSON fix, so it is done by construction rather than by remembering to omit it.
+      const chunks: RagChunk[] = ordered.map(({ chunk }) => {
+        const { text: _text, ...metadata } = chunk;
+        return metadata;
+      });
 
       const rag: Rag = {
         chunks,
@@ -169,6 +322,11 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
         embeddingModel: client.model,
         embeddingDim: client.dimension,
         ...(droppedChunks ? { droppedChunks } : {}),
+        store: {
+          namespace,
+          vectorStoreId: deps.vectorStore.id,
+          textStoreId: deps.textStore.id,
+        },
       };
 
       const event: ProgressEvent = {
@@ -179,9 +337,11 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
         kind: "ai",
         status: "completed",
         label: "Indexing for Q&A",
-        detail: `Indexed ${chunks.length} chunks (${client.model}, dim ${client.dimension})${
-          droppedChunks ? `, ${droppedChunks.count} ungrounded dropped` : ""
-        }${fromCache ? ", plan reused from cache" : ""}.`,
+        detail: `Indexed ${chunks.length} chunks (${client.model}, dim ${client.dimension}) into ${
+          deps.vectorStore.id
+        }${droppedChunks ? `, ${droppedChunks.count} ungrounded dropped` : ""}${
+          fromCache ? ", plan reused from cache" : ""
+        }${fromSpeculation ? ", plan prefetched during synthesis" : ""}.`,
         progress: 0,
         startedAt: new Date(startedAt).toISOString(),
         durationMs: now() - startedAt,
@@ -190,7 +350,15 @@ export function createRagStage(deps: RagDependencies): PipelineStage<"aiRag"> & 
           embeddingModel: client.model,
           droppedChunks: droppedChunks?.count ?? 0,
           planFromCache: fromCache,
+          // Distinct from `planFromCache`: a cache hit means an EARLIER RUN produced the plan, while
+          // this means THIS run produced it early, during a wait it was going to spend anyway. They
+          // are different facts about latency and collapsing them would hide which one happened.
+          planFromSpeculation: fromSpeculation,
+          vectorStore: deps.vectorStore.id,
+          model: client.model,
         },
+        // Absent when every chunk came from the embedding cache — see `embedChunks`.
+        ...(embedUsage ? { usage: embedUsage } : {}),
         emittedAt: new Date(now()).toISOString(),
       };
 
@@ -238,14 +406,38 @@ async function buildChunkPlan(args: BuildChunkPlanArgs): Promise<{ chunks: Chunk
     const lineCount = lines.length;
     if (lineCount === 0 || (lineCount === 1 && lines[0] === "")) continue; // empty file
 
+    const fileSymbols = symbolsByFile.get(file.path) ?? [];
     const planned =
       mode === "source"
-        ? planSourceFile(file.path, lines, symbolsByFile.get(file.path) ?? [], args)
+        ? planSourceFile(file.path, lines, fileSymbols, args)
         : planWindowFile(file.path, lines, args.windowLines, args.maxChunkTokens);
+
+    // V3-P2 AST ENRICHMENT — a POST-PASS over the planned ranges, deliberately.
+    //
+    // Running it after planning rather than threading symbol context down through
+    // planSourceFile → windowChunks → splitByTokens → makeChunk keeps the interval-cover and
+    // gap-sweep code exactly as V3-P1 left it, which is what guarantees the acceptance
+    // condition "chunk id unchanged": ids are `fileId#start-end`, the ranges are computed by
+    // untouched code, so enrichment cannot move a boundary even by accident.
+    //
+    // Note `spansFor` passes EVERY symbol in the file, not just the top-level ones the interval
+    // cover selected — the nested ones are precisely what makes a scope chain possible.
+    const spans = spansFor(fileSymbols, lineCount);
+    const enriched = planned.map((chunk) => {
+      const enrichment = deriveEnrichment({
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...(chunk.symbolName ? { symbolName: chunk.symbolName } : {}),
+        symbols: spans,
+        lines,
+        language: file.language,
+      });
+      return enrichment ? { ...chunk, enrichment } : chunk;
+    });
 
     // GROUNDING (enforced by code, never trusted): drop chunks whose fileId is not a
     // graph node or whose range falls outside the file.
-    for (const chunk of planned) {
+    for (const chunk of enriched) {
       const grounded =
         args.nodeIds.has(chunk.fileId) &&
         chunk.startLine >= 1 &&
@@ -289,6 +481,23 @@ interface Span {
   start: number;
   end: number;
   name: string;
+}
+
+/**
+ * Every symbol in the file as a resolved `[startLine, endLine]` span, for enrichment.
+ *
+ * Distinct from the interval-cover spans in `planSourceFile`: that function selects
+ * NON-OVERLAPPING top-level spans (a method inside a selected class is subsumed), because it is
+ * deciding chunk boundaries. Enrichment wants the opposite — the overlaps are the scope chain.
+ * A symbol with no `endLine` is given a zero-width span rather than a guessed one, so it can
+ * still supply a signature but can never be claimed to enclose anything.
+ */
+function spansFor(symbols: InventorySymbol[], lineCount: number): SymbolSpan[] {
+  return symbols.map((symbol) => {
+    const start = clamp(symbol.line, 1, lineCount);
+    const end = symbol.endLine === undefined ? start : clamp(symbol.endLine, start, lineCount);
+    return { name: symbol.name, startLine: start, endLine: end, ...(symbol.signature ? { signature: symbol.signature } : {}) };
+  });
 }
 
 /**
@@ -416,10 +625,17 @@ async function embedChunks(
   ctx: PipelineContext,
   client: EmbeddingClient,
   maxAttempts: number,
-): Promise<number[][]> {
-  // Document-side embedding-cache keys (shared helper): scoped by provider/model/dim AND
-  // input_type, so a chunk and a query with identical text never collide.
-  const keys = plan.map((chunk) => embedCacheKey(client.provider, client.model, client.dimension, "document", chunk.text));
+): Promise<{ embeddings: number[][]; usage: TokenUsage | null }> {
+  // V3-P2: what gets EMBEDDED is the enriched text (path + scope + signature + docstring,
+  // then the raw bytes) — see `embedTextFor`. What gets STORED stays byte-exact for the line
+  // range, because that is what a citation resolves to.
+  //
+  // The cache key hashes the embedded text, so turning enrichment on invalidates every
+  // document-side entry exactly once. That is correct rather than unfortunate: the old vectors
+  // describe different text, and serving them would mean the index disagreed with itself.
+  const embedTexts = plan.map((chunk) => embedTextFor(chunk));
+  const embedTokens = embedTexts.map((text) => estimateTokens(text));
+  const keys = embedTexts.map((text) => embedCacheKey(client.provider, client.model, client.dimension, "document", text));
   const embeddings: (number[] | null)[] = new Array(plan.length).fill(null);
 
   // 1) Embedding cache READ (wallet defense) — an unchanged repo costs ZERO API.
@@ -436,14 +652,26 @@ async function embedChunks(
   // hit ⇒ missing.length === 0 ⇒ budget untouched, free). Pre-check the daily budget with
   // a deterministic estimate (summed chunk tokenCount); if exhausted, degrade gracefully
   // (throw budget-exhausted ⇒ orchestrator "partial") WITHOUT calling the provider.
-  const estimatedTokens = missing.reduce((sum, i) => sum + plan[i].tokenCount, 0);
-  if (missing.length > 0 && ctx.budget && !(await ctx.budget.check(estimatedTokens))) {
+  // Estimated on the EMBED text (what is actually sent), not the raw chunk text.
+  const estimatedTokens = missing.reduce((sum, i) => sum + embedTokens[i], 0);
+  if (missing.length > 0 && ctx.budget && !(await ctx.budget.check(estimatedTokens, "embedding"))) {
     throw new BudgetExceededError("Daily LLM budget exhausted; RAG embedding skipped (demo at capacity).");
   }
 
-  for (const batch of batchIndices(missing, plan)) {
-    const texts = batch.map((i) => plan[i].text);
-    const vectors = await embedWithRetry(client, texts, maxAttempts, ctx);
+  const usageParts: TokenUsage[] = [];
+  for (const batch of batchIndices(missing, embedTokens)) {
+    const texts = batch.map((i) => embedTexts[i]);
+    const { vectors, usage } = await embedWithRetry(client, texts, maxAttempts, ctx);
+    usageParts.push(usage);
+    // CHARGED PER BATCH — FIXED V3-FINAL. The budget used to be recorded once, after the whole loop,
+    // so a throw on batch 7 discarded the usage of batches 1-6: real embedding spend that the daily
+    // ceiling never saw. The provider charged for them regardless of whether the stage finished.
+    if (ctx.budget) await ctx.budget.record(usage, "embedding");
+    if (!usage.measured) {
+      ctx.logger.warn("RAG: embedding provider reported no usage; budget recorded an ESTIMATE.", {
+        provider: client.provider,
+      });
+    }
     for (let j = 0; j < batch.length; j++) {
       const i = batch[j];
       embeddings[i] = vectors[j];
@@ -452,23 +680,30 @@ async function embedChunks(
     }
   }
 
-  // Record actual spend AFTER successful embedding. (Estimate-based for now; wiring the
-  // provider's real usage.total_tokens through EmbeddingClient is a P7 refinement.)
-  if (missing.length > 0 && ctx.budget) await ctx.budget.record(estimatedTokens);
+  // Summed unconditionally, not only when a budget exists: the budget is one CONSUMER of this
+  // number and the trace is another, so computing it inside the budget branch is what made the
+  // trace's cost structurally $0.00 whenever the budget was unset.
+  const usage = sumUsage(usageParts);
 
-  return embeddings.map((value, i) => {
-    if (value === null) throw new Error(`RAG: chunk ${plan[i].id} was never embedded.`);
-    return value;
-  });
+  return {
+    embeddings: embeddings.map((value, i) => {
+      if (value === null) throw new Error(`RAG: chunk ${plan[i].id} was never embedded.`);
+      return value;
+    }),
+    // Null when nothing was embedded (every chunk came from the embedding cache). Distinct from a
+    // zero-token usage: one means "spent nothing", the other means "a provider charged us nothing".
+    usage: missing.length > 0 ? usage : null,
+  };
 }
 
-/** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS. */
-function batchIndices(indices: number[], plan: ChunkPlan[]): number[][] {
+/** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS.
+ *  Sized by the EMBED-text token estimate — the payload the provider limits are about. */
+function batchIndices(indices: number[], tokensPerIndex: number[]): number[][] {
   const batches: number[][] = [];
   let current: number[] = [];
   let tokens = 0;
   for (const i of indices) {
-    const t = plan[i].tokenCount;
+    const t = tokensPerIndex[i];
     if (current.length > 0 && (current.length >= MAX_BATCH_TEXTS || tokens + t > MAX_BATCH_TOKENS)) {
       batches.push(current);
       current = [];
@@ -487,7 +722,7 @@ async function embedWithRetry(
   texts: string[],
   maxAttempts: number,
   ctx: PipelineContext,
-): Promise<number[][]> {
+): Promise<EmbeddingResult> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -514,10 +749,18 @@ async function embedWithRetry(
  * NOT billed. Deterministic (byte-stable) so the embedding cache key stays stable.
  * Flagged for P4 tuning against measured Voyage token counts.
  */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * `owner/name` for the retrieval namespace, falling back to the bare name when there is no
+ * owner (a local or zip repo). Only used as a namespace component, so it needs to be stable
+ * and distinguishing, not canonical.
+ */
+function repoFullNameOf(input: PipelineInput): string {
+  const ref = input.repositoryRef;
+  return ref.owner ? `${ref.owner}/${ref.name}` : ref.name;
 }

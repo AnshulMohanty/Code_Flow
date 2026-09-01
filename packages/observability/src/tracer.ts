@@ -1,0 +1,319 @@
+import type { TokenUsage } from "@codeflow/shared-types";
+import type {
+  AttributeValue,
+  CostBreakdown,
+  InteractionGraph,
+  PricingTable,
+  RecordedSpan,
+  RecordingTracer,
+  Span,
+  TraceClock,
+  TraceReport,
+} from "./contracts.js";
+
+/**
+ * The in-memory recording tracer (V3-P5 task 2) — the HERMETIC DEFAULT.
+ *
+ * Not a stub. This is what the suite asserts against and what the run reports from; an OTel adapter
+ * exports the same recorded spans onward. Building the recorder first and the exporter second is
+ * deliberate: a trace you can assert on in a unit test is worth more than one you can only inspect
+ * in a hosted UI, and it is the only version that can gate CI.
+ *
+ * IDS ARE DETERMINISTIC — `s1`, `s2`, ... in creation order, not UUIDs. A random id would make every
+ * recorded trace unassertable, and a test that has to regex around ids stops checking structure. The
+ * cost of the choice, stated: these ids are unique within a trace and are NOT globally unique, so
+ * the OTel adapter mints real ids at export.
+ */
+export interface RecordingTracerOptions {
+  traceId?: string;
+  /** Injectable clock, ms relative to tracer creation. Defaults to a real monotonic-ish clock. */
+  clock?: TraceClock;
+  /** Prices per model. Injected — see `ModelPricing` for why it is not baked in. */
+  pricing?: PricingTable;
+}
+
+/**
+ * Separator for the interaction-graph edge key.
+ *
+ * NUL, because it is the one character that cannot appear in a span name, so `a|b` and `a` + `|b`
+ * can never collide. Written as an ESCAPE rather than as a literal control byte: the first version
+ * embedded a raw 0x00 in the source, which made every tool treat this file as BINARY -- grep skipped
+ * it, and a diff or a copy-paste could silently drop the byte. The runtime value is identical.
+ */
+const EDGE_KEY_SEPARATOR = "\u0000";
+
+export function createRecordingTracer(options: RecordingTracerOptions = {}): RecordingTracer {
+  const traceId = options.traceId ?? "trace-1";
+  const started = Date.now();
+  const clock = options.clock ?? (() => Date.now() - started);
+  const pricing = options.pricing ?? {};
+
+  let spans: RecordedSpan[] = [];
+  let nextId = 1;
+
+  const makeSpan = (
+    name: string,
+    kind: RecordedSpan["kind"],
+    parentId: string | null,
+    attributes: Record<string, AttributeValue> = {},
+  ): Span => {
+    const record: RecordedSpan = {
+      id: `s${nextId++}`,
+      parentId,
+      name,
+      kind,
+      startMs: clock(),
+      status: "unset",
+      attributes: { ...attributes },
+      events: [],
+    };
+    spans.push(record);
+    let ended = false;
+
+    return {
+      id: record.id,
+      setAttribute(key, value) {
+        record.attributes[key] = value;
+      },
+      setAttributes(next) {
+        Object.assign(record.attributes, next);
+      },
+      addEvent(eventName, eventAttributes) {
+        record.events.push({
+          name: eventName,
+          atMs: clock(),
+          ...(eventAttributes ? { attributes: { ...eventAttributes } } : {}),
+        });
+      },
+      recordUsage(usage) {
+        // ACCUMULATED, not replaced: a span that makes three provider calls (a retrying stage, a
+        // best-of-N specialist) has three usages, and keeping only the last would under-report the
+        // bill by exactly the amount that is interesting.
+        record.usage = record.usage ? addUsage(record.usage, usage) : { ...usage };
+      },
+      setStatus(status, error) {
+        record.status = status;
+        if (error) record.error = error;
+      },
+      end() {
+        // Idempotent: ending twice is a caller bug, and letting it overwrite `endMs` would corrupt
+        // the duration of a span that had already finished correctly.
+        if (ended) return;
+        ended = true;
+        record.endMs = clock();
+        record.durationMs = record.endMs - record.startMs;
+        // An un-set status at end means nothing went wrong — the alternative (leaving it "unset")
+        // would make every successful span look unfinished in a report.
+        if (record.status === "unset") record.status = "ok";
+      },
+      child(childName, childKind, childAttributes) {
+        return makeSpan(childName, childKind, record.id, childAttributes);
+      },
+    };
+  };
+
+  return {
+    id: "recording-tracer",
+    startSpan(name, kind, attributes) {
+      return makeSpan(name, kind, null, attributes);
+    },
+    report(): TraceReport {
+      return buildReport(traceId, spans, pricing);
+    },
+    reset() {
+      spans = [];
+      nextId = 1;
+    },
+  };
+}
+
+/** Sum two usages, keeping `measured` HONEST: false wins, because a total containing one estimate
+ *  is an estimate. */
+export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    ...(a.cacheReadTokens !== undefined || b.cacheReadTokens !== undefined
+      ? { cacheReadTokens: (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0) }
+      : {}),
+    measured: a.measured && b.measured,
+  };
+}
+
+const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0, measured: true };
+
+/**
+ * Cost from usage + prices.
+ *
+ * `usd` is NULL when any contributing model has no price entry, and the unpriced models are named.
+ * Reporting 0 instead would read as "this was free", which is the single most misleading thing a
+ * cost report can say.
+ */
+export function computeCost(
+  entries: ReadonlyArray<{ usage: TokenUsage; model?: string }>,
+  pricing: PricingTable,
+): CostBreakdown {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let measured = true;
+  let usd = 0;
+  const unpriced = new Set<string>();
+
+  for (const entry of entries) {
+    inputTokens += entry.usage.inputTokens;
+    outputTokens += entry.usage.outputTokens;
+    cacheReadTokens += entry.usage.cacheReadTokens ?? 0;
+    measured = measured && entry.usage.measured;
+
+    const model = entry.model;
+    const price = model ? pricing[model] : undefined;
+    if (!price) {
+      unpriced.add(model ?? "(unknown model)");
+      continue;
+    }
+    const cacheRead = entry.usage.cacheReadTokens ?? 0;
+    // Cache-read tokens are billed at their own (cheaper) rate and are NOT also billed as input —
+    // double-counting them would inflate the reported cost of the very optimisation that saved money.
+    const billedInput = Math.max(0, entry.usage.inputTokens - cacheRead);
+    usd +=
+      (billedInput / 1_000_000) * price.inputPerMillion +
+      (entry.usage.outputTokens / 1_000_000) * price.outputPerMillion +
+      (cacheRead / 1_000_000) * (price.cacheReadPerMillion ?? price.inputPerMillion);
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    usd: unpriced.size > 0 ? null : usd,
+    measured,
+    unpricedModels: [...unpriced].sort(),
+  };
+}
+
+/**
+ * Derive the interaction graph from the span tree.
+ *
+ * DERIVED, never recorded separately — a hand-maintained second structure would be a second thing
+ * to keep in step, and the first time it drifted the graph would be lying while looking authoritative.
+ *
+ * Nodes are keyed by span NAME, not id, so 60 `specialist:security` spans collapse into one node
+ * with `calls: 60`. That collapse is the whole point: a flat list of 300 fan-out spans is unreadable,
+ * whereas "supervisor ← specialist:security ×60" is a shape a human can hold.
+ */
+export function buildInteractionGraph(spans: readonly RecordedSpan[]): InteractionGraph {
+  const byId = new Map(spans.map((span) => [span.id, span]));
+  const nodes = new Map<string, InteractionGraph["nodes"][number]>();
+  const edges = new Map<string, InteractionGraph["edges"][number]>();
+
+  for (const span of spans) {
+    const node = nodes.get(span.name) ?? {
+      name: span.name,
+      kind: span.kind,
+      calls: 0,
+      totalDurationMs: 0,
+      usage: { ...ZERO_USAGE },
+      errors: 0,
+    };
+    node.calls += 1;
+    node.totalDurationMs += span.durationMs ?? 0;
+    if (span.usage) node.usage = addUsage(node.usage, span.usage);
+    if (span.status === "error") node.errors += 1;
+    nodes.set(span.name, node);
+
+    if (span.parentId) {
+      const parent = byId.get(span.parentId);
+      if (parent) {
+        const key = `${parent.name}${EDGE_KEY_SEPARATOR}${span.name}`;
+        const edge = edges.get(key) ?? {
+          from: parent.name,
+          to: span.name,
+          count: 0,
+          totalDurationMs: 0,
+          usage: { ...ZERO_USAGE },
+        };
+        edge.count += 1;
+        edge.totalDurationMs += span.durationMs ?? 0;
+        if (span.usage) edge.usage = addUsage(edge.usage, span.usage);
+        edges.set(key, edge);
+      }
+    }
+  }
+
+  return {
+    // Sorted so a report is deterministic and diffable between runs.
+    nodes: [...nodes.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    edges: [...edges.values()].sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to)),
+  };
+}
+
+function buildReport(traceId: string, spans: RecordedSpan[], pricing: PricingTable): TraceReport {
+  const ordered = [...spans].sort((a, b) => a.startMs - b.startMs || a.id.localeCompare(b.id));
+  const withUsage = ordered
+    .filter((span) => span.usage)
+    .map((span) => ({
+      usage: span.usage as TokenUsage,
+      ...(typeof span.attributes.model === "string" ? { model: span.attributes.model } : {}),
+    }));
+
+  const costByKind: TraceReport["costByKind"] = {};
+  for (const kind of new Set(ordered.filter((span) => span.usage).map((span) => span.kind))) {
+    costByKind[kind] = computeCost(
+      ordered
+        .filter((span) => span.kind === kind && span.usage)
+        .map((span) => ({
+          usage: span.usage as TokenUsage,
+          ...(typeof span.attributes.model === "string" ? { model: span.attributes.model } : {}),
+        })),
+      pricing,
+    );
+  }
+
+  const root = ordered.find((span) => span.parentId === null);
+  return {
+    traceId,
+    spans: ordered,
+    durationMs: root?.durationMs ?? 0,
+    cost: computeCost(withUsage, pricing),
+    costByKind,
+    interactions: buildInteractionGraph(ordered),
+    errors: ordered
+      .filter((span) => span.status === "error")
+      .map((span) => ({ span: span.name, error: span.error ?? "unknown error" })),
+    // A trace with an unended span is INCOMPLETE, and saying so matters: any duration read from it
+    // is a lower bound, and a reader who does not know that will quote it as fact.
+    complete: ordered.length > 0 && ordered.every((span) => span.endMs !== undefined),
+  };
+}
+
+/** One-line-per-span rendering, for a log. Indented by depth so the tree is readable as text. */
+export function renderTrace(report: TraceReport): string {
+  const depthOf = (span: RecordedSpan): number => {
+    let depth = 0;
+    let current: RecordedSpan | undefined = span;
+    const byId = new Map(report.spans.map((entry) => [entry.id, entry]));
+    while (current?.parentId) {
+      depth += 1;
+      current = byId.get(current.parentId);
+    }
+    return depth;
+  };
+
+  const lines = [
+    `trace ${report.traceId} — ${report.spans.length} span(s), ${report.durationMs}ms` +
+      `${report.complete ? "" : " (INCOMPLETE — durations are lower bounds)"}`,
+    `cost: ${report.cost.usd === null ? "unpriced" : `$${report.cost.usd.toFixed(6)}`}` +
+      ` · in ${report.cost.inputTokens} / out ${report.cost.outputTokens} tokens` +
+      `${report.cost.measured ? "" : " (contains ESTIMATES)"}` +
+      `${report.cost.unpricedModels.length ? ` · unpriced: ${report.cost.unpricedModels.join(", ")}` : ""}`,
+  ];
+  for (const span of report.spans) {
+    lines.push(
+      `${"  ".repeat(depthOf(span) + 1)}${span.name} [${span.kind}] ${span.durationMs ?? "?"}ms` +
+        `${span.status === "error" ? ` ERROR: ${span.error ?? ""}` : ""}` +
+        `${span.usage ? ` · ${span.usage.inputTokens}+${span.usage.outputTokens} tok` : ""}`,
+    );
+  }
+  return lines.join("\n");
+}

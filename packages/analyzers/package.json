@@ -12,8 +12,11 @@
     }
   },
   "scripts": {
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build",
     "build": "tsc -p tsconfig.json",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build",
     "test": "vitest run --passWithNoTests",
     "lint": "tsc -p tsconfig.json --noEmit"
   },
@@ -21,6 +24,7 @@
     "@codeflow/config": "workspace:*",
     "@codeflow/graph": "workspace:*",
     "@codeflow/parsers": "workspace:*",
+    "@codeflow/retrieval": "workspace:*",
     "@codeflow/shared-types": "workspace:*"
   }
 }

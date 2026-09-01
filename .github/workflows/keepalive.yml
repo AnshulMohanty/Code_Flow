@@ -1,0 +1,60 @@
+# Keep-alive ping (V3-P5 task 5). CODE ONLY — this workflow is DISABLED until the deploy exists.
+#
+# It runs on `workflow_dispatch` plus a schedule, and the schedule is GUARDED on the
+# `CODEFLOW_API_URL` repository variable being set. Without it the job exits 0 immediately rather
+# than failing every ten minutes for a service that has not been deployed yet — a red cron that
+# nobody can fix is worse than no cron.
+#
+# TO ENABLE (Phase 7, see GO_LIVE.md):
+#   gh variable set CODEFLOW_API_URL --body "https://<your-api-host>"
+# and nothing else. Removing the variable disables it again.
+
+name: keepalive
+
+on:
+  schedule:
+    # Every 10 minutes. Chosen against the thing it is defeating: hobby tiers suspend after ~15
+    # minutes idle, so the interval has to be meaningfully under that. Every 5 would be twice the
+    # requests for no additional protection; every 14 leaves no margin for a skipped run, and
+    # GitHub's scheduler is explicitly best-effort under load.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# One ping at a time. Overlapping runs would only stack requests on a service that is, by
+# hypothesis, slow to wake.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check whether a deployment is configured
+        id: guard
+        env:
+          API_URL: ${{ vars.CODEFLOW_API_URL }}
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "CODEFLOW_API_URL is not set — no deployment to keep alive. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.configured == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.configured == 'true'
+        with:
+          node-version: 20
+
+      - name: Ping /health
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          CODEFLOW_API_URL: ${{ vars.CODEFLOW_API_URL }}
+        # No install step: the script uses only built-in `fetch`, deliberately, so a keep-alive
+        # cannot be broken by a dependency.
+        run: node scripts/keepalive.mjs

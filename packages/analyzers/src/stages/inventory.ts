@@ -73,6 +73,16 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
         throw new Error("Inventory requires the structure slice; Map-structure must run first.");
       }
 
+      // Load the tree-sitter grammars before the parse fan-out. Idempotent and shared with
+      // Connect; if a grammar is unavailable the registry's parsers fall back to regex, so
+      // this never fails the stage.
+      const treeSitter = await registry.ready();
+      if (!treeSitter.ready) {
+        ctx.logger.warn("Inventory: no tree-sitter grammar loaded; parsing with the regex fallback.", {
+          failed: treeSitter.failed.map((entry) => entry.language),
+        });
+      }
+
       const symbols: InventorySymbol[] = [];
       const loc: Record<string, number> = {};
       const unparsedFiles: string[] = [];
@@ -213,6 +223,10 @@ function collectSymbols(
       ...(parsed.lineEnd !== undefined ? { endLine: parsed.lineEnd } : {}),
       exported: parsed.exported === true,
       language: file.language,
+      // V3-P2: carried through rather than discarded — RAG chunk enrichment reads it, and it
+      // is where a typed language states its types. Only when non-empty: an empty string would
+      // be indistinguishable from "the parser found one and it was blank".
+      ...(parsed.signature ? { signature: parsed.signature } : {}),
     });
   }
 

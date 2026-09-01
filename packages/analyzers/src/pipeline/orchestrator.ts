@@ -3,7 +3,6 @@ import type {
   AnalysisResult,
   AnalysisResultSlices,
   AnalysisSliceKey,
-  AnalysisSummary,
   AnalysisCacheHandle,
   BudgetHandle,
   PipelineContext,
@@ -20,6 +19,10 @@ import type {
   StageStatus,
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
+import { computeLayers, describeSchedule, STAGE_READS } from "./schedule.js";
+import { createSpeculator, isSpeculationSource, type SpeculationStats, type Speculator } from "./speculation.js";
+import { deriveIssues } from "./issues.js";
+import { deriveSummary } from "./summary.js";
 
 /** A sink for progress events (e.g. the SSE writer in the worker). */
 export type PipelineEmitter = (event: ProgressEvent) => void;
@@ -54,15 +57,75 @@ export interface RunPipelineOptions {
   signal?: AbortSignal;
   /** Injectable clock (ms) for deterministic timing in tests. */
   now?: () => number;
+  /**
+   * How stages are executed (V3-P5 task 1).
+   *
+   * `"sequential"` (default) runs them in declared order, one at a time — the behaviour every
+   * earlier phase was built and tested against.
+   *
+   * `"layered"` computes the stage DAG (see `./schedule.js`) and runs the members of each layer
+   * CONCURRENTLY. In this pipeline exactly one layer is wider than 1 — `synthesize` ∥ `rag` — and
+   * those are the two provider-bound stages, so it is the layer worth having.
+   *
+   * Opt-in rather than the default, deliberately: this is the deterministic spine, and the
+   * invariant is that the same input yields byte-identical slices. Layered execution PRESERVES
+   * that — each layer member gets the same FROZEN `ctx.prior`, slices are assigned in declared
+   * order, records and events stay in declared order — and a test asserts the two modes produce
+   * identical results. But "proven identical" and "the default" are different bars, and the escape
+   * hatch costs one line.
+   */
+  schedule?: "sequential" | "layered";
+  /**
+   * Speculative prefetch (V3-P5 task 1 — wired V3-FINAL). Default ON.
+   *
+   * WHAT IT DOES. Once a stage's declared reads are satisfied but before the stage runs, the
+   * orchestrator asks that stage (if it implements `StageSpeculationSource`) what it will want, and
+   * launches those tasks in the background. The stage then `claim()`s them when it runs. On this
+   * pipeline the one that pays for itself is RAG's chunk plan: a pure disk+CPU pass over every
+   * source file, which becomes computable the moment `connect` lands and is otherwise paid AFTER
+   * `synthesize` has finished waiting on a provider. Computing it during that wait costs wall-clock
+   * nothing.
+   *
+   * WHY IT IS SAFE TO DEFAULT ON, where layered scheduling is not. A speculation is the SAME
+   * function over the SAME inputs — the staged value is byte-identical to the one the stage would
+   * have computed, which a test asserts by running both ways and comparing the slice. And nothing
+   * unvalidated can leak: staged values reach the shared cache only through `commit()`, and only for
+   * keys a stage actually asked for. A run that fails rolls back and the cache never sees them.
+   *
+   * `false` turns it off entirely — no speculator is created, `ctx.speculator` is absent, and every
+   * stage computes its own inputs exactly as it did before.
+   */
+  speculate?: boolean;
 }
 
 export interface PipelineRunResult {
   result: AnalysisResult;
   /** True when Ingest found a cached analysis and short-circuited the run. */
   cached: boolean;
+  /**
+   * What speculation actually did, when it ran. Absent when `speculate: false` or on a cache
+   * short-circuit (nothing was speculated).
+   *
+   * `hitRate` is the number that decides whether speculating is worth doing at all: a rate near zero
+   * means the prediction is wrong and the CPU is being burned for nothing. Reported rather than
+   * assumed, because a latency feature nobody measures is a latency feature nobody can retire.
+   */
+  speculation?: SpeculationStats;
 }
 
 const SLICE_VERSION = 1;
+
+/** What a stage returns, as far as the orchestrator's bookkeeping cares. */
+type StageResultLike = Awaited<ReturnType<PipelineStage["run"]>>;
+
+/**
+ * A launched-but-not-yet-consumed stage. The error is CAPTURED rather than left to reject, so a
+ * layer's failure cannot become an unhandled rejection while a sibling is still running — it waits
+ * to be rethrown on the consume path, where the existing error contract handles it.
+ */
+type LaunchedStage =
+  | { ok: true; value: StageResultLike; startedAt: number; durationMs: number }
+  | { ok: false; error: unknown; startedAt: number; durationMs: number };
 
 /**
  * Run stages in declared order. Assembles the AnalysisResult by per-key slice
@@ -87,15 +150,29 @@ export async function runPipeline(
   const records: StageRunRecord[] = [];
   const warnings: string[] = [];
 
+  const cache = options.cache ?? createMemoryCache();
+  // Created here, not per stage: staging is per RUN, and a speculator per stage could not stage a
+  // value for a LATER stage — which is the only kind of speculation this pipeline has.
+  //
+  // maxConcurrent 1, deliberately below the module default of 3. The declared task on this pipeline
+  // is a full disk+CPU pass over the repository, and running two of those beside `connect` (which is
+  // itself parse-bound) would take CPU from the critical path to save time off it. Speculation must
+  // never starve the work it is trying to speed up.
+  const speculator: Speculator | null =
+    options.speculate === false ? null : createSpeculator({ cache, maxConcurrent: 1, logger });
+
   const ctx: PipelineContext = {
     prior: {},
-    cache: options.cache ?? createMemoryCache(),
+    cache,
     budget: options.budget,
     logger,
     signal: signal ?? new AbortController().signal,
     emit,
+    ...(speculator ? { speculator } : {}),
   };
 
+  /** Real elapsed span per layered stage, captured at launch (see the consume path). */
+  const layerDurations = new Map<PipelineStageId, number>();
   let deterministicFailed = false;
   let aiFailed = false;
   let aborted = false;
@@ -120,6 +197,10 @@ export async function runPipeline(
       logger.info("Cache full hit (pre-ingest); returning cached result, no stages run.", {
         commitSha: input.requestedCommitSha,
       });
+      // Nothing has been speculated yet (no stage has run), but rolling back is unconditional rather
+      // than conditional on that staying true — a future reordering must not be able to leak a
+      // staged value into the cache on a path that ran no stages.
+      speculator?.rollback();
       return { result: decision.result, cached: true };
     }
     if (decision.action === "ai-retry") {
@@ -136,6 +217,130 @@ export async function runPipeline(
     // check can still try by the RESOLVED sha (covers a branch/unknown-sha first analysis).
   }
 
+  // --- Parallel execution by DEPENDENCY READINESS (V3-P5 task 1) --------------
+  //
+  // A first implementation used pure LAYER BARRIERS and measurably under-parallelised this DAG. The
+  // measured layer shape is [1,1,1,1,1,2,1]: `rag` reads only {graph, structure, inventory}, so it
+  // becomes ready alongside `analyze` — and a layer barrier then blocks `synthesize` (which needs
+  // `metrics`) behind `rag` finishing. That serialises the slow embedding stage against the slow
+  // synthesis stage, which is exactly the pair worth overlapping.
+  //
+  // So a stage is launched as soon as ITS OWN declared reads are satisfied, not when its layer is.
+  // On this pipeline that means `rag` starts right after `connect`, `analyze` runs beside it, and
+  // `synthesize` launches the moment `metrics` lands — while `rag` is still in flight.
+  //
+  // DETERMINISM, which is the invariant that had to survive: each stage is launched with a snapshot
+  // containing every slice it declared, slices are per-key and written by exactly one stage, and
+  // nothing mutates a slice after assignment. So a stage sees identical inputs regardless of WHEN it
+  // launched, and results are assigned in declared order. The result is byte-identical to the
+  // sequential run — asserted by a test.
+  const layered = options.schedule === "layered";
+  if (layered) logger.info(`Pipeline schedule: ${describeSchedule(computeLayers(stages))}`);
+  const producedBy = new Map<AnalysisSliceKey, PipelineStageId>();
+  for (const stage of stages) for (const key of stage.owns) producedBy.set(key, stage.id);
+  const ingestPresent = stages.some((stage) => stage.id === "ingest");
+  /** Stage ids whose results have been folded into `slices`. */
+  const settled = new Set<PipelineStageId>();
+  /** Launched-but-not-yet-consumed outcomes, keyed by stage id. */
+  const launched = new Map<PipelineStageId, Promise<LaunchedStage>>();
+
+  /** True when every declared read of `stage` is already assigned (and Ingest has run). */
+  const readyToLaunch = (stage: PipelineStage): boolean => {
+    if (ingestPresent && stage.id !== "ingest" && !settled.has("ingest")) return false;
+    for (const key of STAGE_READS[stage.id] ?? []) {
+      const producer = producedBy.get(key);
+      // A slice nobody in this run produces is not a dependency — the pipeline legitimately runs
+      // without the AI stages, and a phantom dependency would deadlock those runs.
+      if (!producer || producer === stage.id) continue;
+      if (!settled.has(producer)) return false;
+    }
+    return true;
+  };
+
+  /**
+   * Launch every not-yet-launched stage whose reads are satisfied.
+   *
+   * Called AFTER the post-Ingest cache decision rather than immediately after slice assignment,
+   * because that decision can seed slices and change `coveredStageIds` — launching before it could
+   * start a stage the cache was about to make unnecessary.
+   */
+  const launchReady = () => {
+    if (!layered) return;
+    for (const candidate of stages) {
+      if (launched.has(candidate.id) || settled.has(candidate.id)) continue;
+      if (coveredStageIds.has(candidate.id)) continue;
+      if (aborted || signal?.aborted || deterministicFailed) continue;
+      // INGEST IS NEVER LAUNCHED, and this is a correctness requirement rather than an optimisation.
+      // Ingest is the one stage that MUTATES `ctx` (it resolves `repoPath` and `commitSha`), and a
+      // launched stage receives its own `{...ctx, prior}` copy — so a mutation inside a launched
+      // Ingest would land on the copy and never reach the stages that need it. Found by the
+      // local-first CLI, whose first stage does exactly that; it would equally have broken a hosted
+      // run with layered scheduling enabled. Launching Ingest also buys nothing: everything else
+      // depends on it, so it is a barrier by construction.
+      if (candidate.id === "ingest") continue;
+      if (!readyToLaunch(candidate)) continue;
+      const snapshot = { ...slices };
+      const candidateCtx: PipelineContext = { ...ctx, prior: snapshot };
+      const at = now();
+      launched.set(
+        candidate.id,
+        candidate
+          .run(input, candidateCtx)
+          .then((value) => ({ ok: true as const, value, startedAt: at, durationMs: now() - at }))
+          .catch((error: unknown) => ({ ok: false as const, error, startedAt: at, durationMs: now() - at })),
+      );
+    }
+  };
+
+  /** Stage ids whose speculations have already been launched — never speculate the same twice. */
+  const speculated = new Set<PipelineStageId>();
+
+  /**
+   * Launch the declared speculations of every stage that COULD run but has not started.
+   *
+   * "Could run but has not started" is the whole window, and it is why this lives in the
+   * orchestrator: it is the only place that knows both facts. Called in sequential mode as well as
+   * layered — and sequential is where it matters most, because there `rag` runs strictly AFTER
+   * `synthesize` has finished waiting on a provider, so the wait is entirely unused.
+   */
+  const launchSpeculations = () => {
+    if (!speculator) return;
+    if (aborted || signal?.aborted || deterministicFailed) return;
+    for (const candidate of stages) {
+      if (speculated.has(candidate.id) || settled.has(candidate.id)) continue;
+      if (coveredStageIds.has(candidate.id)) continue;
+      // Already in flight (layered) ⇒ the window has closed; it is computing the thing itself now.
+      if (launched.has(candidate.id)) continue;
+      // Ingest MUTATES ctx, so it cannot be speculated for — same reason it is never launched.
+      if (candidate.id === "ingest") continue;
+      if (!isSpeculationSource(candidate)) continue;
+      if (!readyToLaunch(candidate)) continue;
+
+      speculated.add(candidate.id);
+      let tasks;
+      try {
+        tasks = candidate.speculations({
+          // The SAME snapshot the stage will receive, so a speculation cannot be computed from
+          // slices the stage itself will not see.
+          prior: { ...slices },
+          ...(ctx.repoPath !== undefined ? { repoPath: ctx.repoPath } : {}),
+          ...(ctx.commitSha !== undefined ? { commitSha: ctx.commitSha } : {}),
+        });
+      } catch (error) {
+        // A declaration that throws is a non-event, like a failed speculation: this is an
+        // optimisation asking a question, and it must not be able to fail the run.
+        logger.warn(`Speculation declaration for stage "${candidate.id}" threw (ignored).`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      for (const task of tasks) speculator.speculate(task);
+      if (tasks.length > 0) {
+        logger.info(`Speculating ${tasks.length} task(s) for stage "${candidate.id}": ${tasks.map((task) => task.label).join(", ")}`);
+      }
+    }
+  };
+
   for (let i = 0; i < stages.length; i++) {
     const stage = stages[i];
     const stageIndex = i + 1;
@@ -145,6 +350,9 @@ export async function runPipeline(
     // so the re-stamped producedBy stays honest, and emit a "reused" event. For Ingest this
     // is exactly what avoids the clone on an AI-only retry.
     if (coveredStageIds.has(stage.id)) {
+      // A cache-covered stage IS settled: its slice was seeded, so downstream reads are satisfied.
+      // Without this an AI-only retry would never launch anything in layered mode.
+      settled.add(stage.id);
       records.push({ stage: stage.id, kind: stage.kind, status: "completed" });
       emitEvent(emit, {
         input,
@@ -198,10 +406,32 @@ export async function runPipeline(
 
     // Expose accumulated slices to this stage as a read-only snapshot.
     ctx.prior = { ...slices };
-    const startedAt = now();
+    let startedAt = now();
 
     try {
-      const stageResult = await stage.run(input, ctx);
+      // Launch anything now runnable (including this stage, if it has not started yet). Each
+      // launched stage gets its OWN ctx with its own frozen `prior` — never the shared mutable one,
+      // or reaching the next stage would reassign `ctx.prior` while an earlier one was mid-await.
+      launchReady();
+      launchSpeculations();
+
+      const pending = launched.get(stage.id);
+      let stageResult: StageResultLike;
+      if (pending) {
+        launched.delete(stage.id);
+        const outcome = await pending;
+        // Use the LAUNCH time and the real elapsed span, not the moment we got round to consuming
+        // this member — otherwise the second stage of a layer reports a duration near zero and the
+        // latency numbers become fiction.
+        startedAt = outcome.startedAt;
+        layerDurations.set(stage.id, outcome.durationMs);
+        // Rethrown here so the existing catch below handles a layered failure identically to a
+        // sequential one. One error contract, not two.
+        if (!outcome.ok) throw outcome.error;
+        stageResult = outcome.value;
+      } else {
+        stageResult = await stage.run(input, ctx);
+      }
 
       // Per-key slice assignment — NOT a deep merge.
       for (const key of stage.owns) {
@@ -210,8 +440,9 @@ export async function runPipeline(
           assignSlice(slices, key, value);
         }
       }
+      settled.add(stage.id);
 
-      const durationMs = now() - startedAt;
+      const durationMs = layerDurations.get(stage.id) ?? now() - startedAt;
       records.push({ stage: stage.id, kind: stage.kind, status: "completed", startedAt: iso(startedAt), durationMs });
       emitEvent(emit, {
         input,
@@ -225,6 +456,10 @@ export async function runPipeline(
         now,
         detail: stageResult.event.detail,
         preview: stageResult.event.preview,
+        // The stage's PROVIDER USAGE, forwarded (V3-FINAL). The orchestrator rebuilds the emitted
+        // event rather than passing the stage's through, so a field it does not copy is a field that
+        // never leaves the stage — which is why the measured cost reached nothing before.
+        usage: stageResult.event.usage,
       });
 
       // Post-Ingest cache decision (by the RESOLVED sha) — the fallback for when the SHA
@@ -240,6 +475,9 @@ export async function runPipeline(
         const decision = decideCacheAction(cached, stages);
         if (decision.action === "full-hit") {
           logger.info("Cache full hit (post-ingest); short-circuiting the pipeline.", { commitSha: ctx.commitSha });
+          // ROLLBACK, not commit: a full hit means no stage will run, so nothing staged was ever
+          // validated. Committing here would write an unclaimed guess into the shared cache.
+          speculator?.rollback();
           return { result: decision.result, cached: true };
         }
         if (decision.action === "ai-retry") {
@@ -256,8 +494,13 @@ export async function runPipeline(
           });
         }
       }
+
+      // Now that this stage's slice is assigned AND the cache decision has settled, anything whose
+      // reads are satisfied can start — while this loop moves on to the next declared stage.
+      launchReady();
+      launchSpeculations();
     } catch (error) {
-      const durationMs = now() - startedAt;
+      const durationMs = layerDurations.get(stage.id) ?? now() - startedAt;
       const message = error instanceof Error ? error.message : "Unknown stage error.";
       // Capture a typed guardrail reason (repo-too-large / budget-exhausted) if the stage
       // threw one, so the run summary can carry a distinct, machine-readable cause.
@@ -315,8 +558,26 @@ export async function runPipeline(
     completedAt: iso(now()),
   };
 
+  // --- Settle speculation -----------------------------------------------------
+  // COMMIT promotes only what a stage actually claimed; everything else is discarded. On a failed or
+  // aborted run, ROLLBACK: nothing was validated by a real request, so nothing may reach the shared
+  // cache. That asymmetry is the whole point of the staging layer — a wrong guess costs the CPU it
+  // used and nothing else.
+  let speculation: SpeculationStats | undefined;
+  if (speculator) {
+    speculation =
+      deterministicFailed || aborted ? speculator.rollback() : await speculator.commit();
+    if (speculation.launched > 0) {
+      logger.info(
+        `Speculation: ${speculation.hits}/${speculation.launched} claimed ` +
+          `(hit rate ${(speculation.hitRate * 100).toFixed(0)}%), ${speculation.discarded} discarded, ` +
+          `${speculation.failed} failed.`,
+      );
+    }
+  }
+
   const result = assembleResult(input, ctx, slices, runSummary, warnings, now);
-  return { result, cached: false };
+  return { result, cached: false, ...(speculation ? { speculation } : {}) };
 }
 
 /**
@@ -426,12 +687,13 @@ function seedSlicesFromResult(
   if (result.graph) slices.graph = result.graph;
   if (result.metrics) slices.metrics = result.metrics;
   if (result.summary) slices.summary = result.summary;
-  if (result.issues) slices.issues = result.issues;
-  // Orient's AI summary rides its (deterministic) stage; the true AI stages are seeded
-  // ONLY when covered, so an uncovered slice (e.g. a vector-space-mismatched RAG) is NOT
-  // hydrated — it must be rebuilt by the re-run, never returned stale if that re-run fails.
-  if (result.ai?.projectSummary) slices.aiProjectSummary = result.ai.projectSummary;
+  if (result.issues?.length) slices.issues = result.issues;
+  // The AI stages are seeded ONLY when covered, so an uncovered slice (e.g. a
+  // vector-space-mismatched RAG) is NOT hydrated — it must be rebuilt by the re-run, never
+  // returned stale if that re-run fails.
+  // (V3-P0 removed `aiProjectSummary`: it had no producer and no consumer — see AiAnalysis.)
   if (covered.has("synthesize") && result.ai?.synthesis) slices.aiSynthesis = result.ai.synthesis;
+  if (covered.has("synthesize") && result.ai?.domains) slices.aiDomains = result.ai.domains;
   if (covered.has("rag") && result.ai?.rag) slices.aiRag = result.ai.rag;
 }
 
@@ -468,13 +730,18 @@ function assembleResult(
     producedBy: producedStageIds(pipeline),
 
     // deterministic slices (empty defaults when not yet produced)
-    summary: slices.summary ?? defaultSummary(input),
+    // `summary` is DERIVED from the other slices at assembly (no stage owns it) — see
+    // deriveSummary. An explicit slice, if a stage ever produces one, still wins.
+    summary: slices.summary ?? deriveSummary(input, slices),
     // `files` is a DERIVED view of the graph's nodes (single FileNode[] home — Connect
     // owns `graph`, not a separate `files` slice). Falls back to any explicit slice.
     files: slices.graph?.nodes ?? slices.files ?? [],
     symbols: slices.symbols ?? [],
     dependencies: slices.dependencies ?? [],
-    issues: slices.issues ?? [],
+    // `issues` is DERIVED from Analyze's metrics at assembly (no stage owns it), the same
+    // pattern `summary` uses. Before V3-P0 it was an always-empty list that the web read in
+    // four places — an absent producer rendered as a finding of "no problems".
+    issues: slices.issues ?? deriveIssues(slices),
     metrics: slices.metrics ?? emptyMetrics(),
     graph: slices.graph,
     orientation: slices.orientation,
@@ -490,14 +757,16 @@ function assembleResult(
 }
 
 function buildAi(slices: Partial<AnalysisResultSlices>): AiAnalysis | undefined {
-  const { aiProjectSummary, aiSynthesis, aiRag } = slices;
-  if (!aiProjectSummary && !aiSynthesis && !aiRag) {
+  const { aiSynthesis, aiRag, aiDomains } = slices;
+  if (!aiSynthesis && !aiRag && !aiDomains) {
     return undefined;
   }
   return {
-    projectSummary: aiProjectSummary,
     synthesis: aiSynthesis,
     rag: aiRag,
+    // Omitted rather than set to [] when the fan-out did not run: an empty array would say "no
+    // domains were detected", which is a different claim from "no fan-out happened".
+    ...(aiDomains && aiDomains.length > 0 ? { domains: aiDomains } : {}),
   };
 }
 
@@ -509,18 +778,6 @@ function emptyMetrics(): AnalysisResultSlices["metrics"] {
     hotspots: [],
     cycles: [],
     summary: { fileCount: 0, edgeCount: 0, cycleCount: 0, isolatedFileCount: 0, maxBlastRadius: 0 },
-  };
-}
-
-function defaultSummary(input: PipelineInput): AnalysisSummary {
-  return {
-    repository: input.repositoryRef,
-    mode: input.mode,
-    files: 0,
-    functions: 0,
-    connections: 0,
-    healthScore: null,
-    healthGrade: null,
   };
 }
 
@@ -537,6 +794,8 @@ interface EmitArgs {
   detail?: string;
   preview?: ProgressEvent["preview"];
   error?: ProgressEvent["error"];
+  /** Provider usage the stage reported. Forwarded verbatim — see the call site. */
+  usage?: ProgressEvent["usage"];
 }
 
 /** Build the authoritative ProgressEvent (orchestrator owns index/count/progress/timing). */
@@ -556,6 +815,7 @@ function emitEvent(emit: PipelineEmitter | undefined, args: EmitArgs): void {
     durationMs: args.durationMs,
     preview: args.preview,
     error: args.error,
+    ...(args.usage ? { usage: args.usage } : {}),
     emittedAt: iso(args.now()),
   };
   emit(event);

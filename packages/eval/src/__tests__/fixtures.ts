@@ -1,14 +1,29 @@
 import type { AnalysisResult, RagChunk } from "@codeflow/shared-types";
-import type { EmbeddingClient, EmbeddingRequest } from "@codeflow/analyzers";
+import type { EmbeddingClient, EmbeddingRequest, EmbeddingResult } from "@codeflow/analyzers";
+import {
+  createMemoryChunkTextStore,
+  createMemoryVectorStore,
+  type IndexedChunk,
+  type RetrievedChunk,
+} from "@codeflow/retrieval";
 import type { EvalDataset } from "../dataset.js";
+import type { EvalRetrieval } from "../runEval.js";
 
 // Synthetic fixture in a TINY 3-d embedding space whose nearest neighbours are known by
 // construction — no real model, no guesses. Basis: auth=[1,0,0], db=[0,1,0], util=[0,0,1].
+//
+// V3-P2 SPLIT THIS FIXTURE IN THREE, mirroring the three lifetimes the production types now
+// have: `INDEXED_CHUNKS` (metadata + text + vector) is what the RAG stage writes to the
+// stores, `CHUNK_META` is what the analysis document persists, and `RETRIEVED_CHUNKS` is what
+// the query path hands back. Keeping one blob would have let a test read a vector off the
+// persisted slice, which is precisely the thing that is no longer possible in production.
 
 export const EMBED_MODEL = "mock-embed";
 export const EMBED_DIM = 3;
+/** The namespace the fixture index lives under — matches what `retrievalNamespace` produces. */
+export const FIXTURE_NAMESPACE = "synthetic/fixture@fixturesha0000000000/mock-embed/3";
 
-function chunk(fileId: string, startLine: number, endLine: number, embedding: number[]): RagChunk {
+function indexed(fileId: string, startLine: number, endLine: number, embedding: number[]): IndexedChunk {
   return {
     id: `${fileId}#${startLine}-${endLine}`,
     fileId,
@@ -20,11 +35,22 @@ function chunk(fileId: string, startLine: number, endLine: number, embedding: nu
   };
 }
 
-export const CHUNKS: RagChunk[] = [
-  chunk("src/auth.ts", 1, 10, [1, 0, 0]),
-  chunk("src/db.ts", 1, 10, [0, 1, 0]),
-  chunk("src/util.ts", 1, 5, [0, 0, 1]),
+/** The full chunks, as the RAG stage produced them in flight. Written to the stores. */
+export const INDEXED_CHUNKS: IndexedChunk[] = [
+  indexed("src/auth.ts", 1, 10, [1, 0, 0]),
+  indexed("src/db.ts", 1, 10, [0, 1, 0]),
+  indexed("src/util.ts", 1, 5, [0, 0, 1]),
 ];
+
+/** What the analysis document persists: metadata only, no text, no vectors. */
+export const CHUNK_META: RagChunk[] = INDEXED_CHUNKS.map(({ text: _text, embedding: _embedding, ...metadata }) => metadata);
+
+/** What the query path returns: metadata + text + the scores that put it there. */
+export const RETRIEVED_CHUNKS: RetrievedChunk[] = INDEXED_CHUNKS.map(({ embedding: _embedding, ...rest }) => ({
+  ...rest,
+  fusedScore: 0,
+  sources: ["vector"],
+}));
 
 // Question text → authored query vector (deterministic). The mock client is a pure lookup.
 export const QUERY_VECTORS: Record<string, number[]> = {
@@ -49,6 +75,33 @@ export const DATASET: EvalDataset = {
   ],
 };
 
+/**
+ * In-memory stores holding the fixture index, under the namespace `fixtureResult()` declares.
+ *
+ * This is the same pair `hydrateEvalIndex` builds from a sidecar file; constructed directly
+ * here so the fixture stays a fixture. The eval then retrieves through `vectorRetrieve` — the
+ * production function — rather than through a test-only ranking helper.
+ */
+export async function fixtureRetrieval(): Promise<EvalRetrieval> {
+  const vectorStore = createMemoryVectorStore({ embeddingModel: EMBED_MODEL, embeddingDim: EMBED_DIM });
+  const textStore = createMemoryChunkTextStore();
+  await textStore.put(
+    FIXTURE_NAMESPACE,
+    INDEXED_CHUNKS.map((chunk) => ({ id: chunk.id, text: chunk.text })),
+  );
+  await vectorStore.upsert(
+    FIXTURE_NAMESPACE,
+    INDEXED_CHUNKS.map((chunk) => ({
+      id: chunk.id,
+      vector: chunk.embedding,
+      fileId: chunk.fileId,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+    })),
+  );
+  return { vectorStore, textStore };
+}
+
 function node(id: string) {
   return { id, path: id, name: id.split("/").pop()!, layer: "source", language: "TypeScript", lines: 10, symbolCount: 1 };
 }
@@ -67,6 +120,27 @@ export function fixtureResult(overrides: Partial<AnalysisResult> = {}): Analysis
     symbols: [],
     dependencies: [],
     issues: [],
+    // V3-P2: a real graph slice. It was absent before, which was an inconsistency —
+    // `producedBy` claims "connect" ran — and it became load-bearing once the synthetic
+    // flywheel started generating questions FROM the graph: with no graph it generated
+    // nothing, and every assertion about generated questions passed trivially.
+    //
+    // Shape: index.ts -> auth.ts, index.ts -> db.ts, auth.ts -> util.ts. index.ts is the entry
+    // point. Deliberately leaves util.ts importing nobody, so `imports-of util.ts` has an
+    // answer and `imports-of index.ts` is an exact negative control.
+    graph: {
+      nodes: [node("src/index.ts"), node("src/auth.ts"), node("src/db.ts"), node("src/util.ts")],
+      edges: [
+        { from: "src/index.ts", to: "src/auth.ts", kind: "import", specifier: "./auth" },
+        { from: "src/index.ts", to: "src/db.ts", kind: "import", specifier: "./db" },
+        { from: "src/auth.ts", to: "src/util.ts", kind: "import", specifier: "./util" },
+      ],
+      resolution: { resolved: 3, external: 0, unresolved: 0, externalModules: [], unresolvedImports: [] },
+      cpgEdges: [{ from: "src/index.ts", to: "src/auth.ts", kind: "call", symbol: "login", count: 2, line: 4 }],
+      routes: [],
+      cpg: { treeSitterFiles: 4, fallbackFiles: 0, enriched: true },
+    },
+    entryPoints: [{ fileId: "src/index.ts", reason: "index" }],
     metrics: {
       perFile: [],
       keyFiles: ["src/index.ts", "src/auth.ts", "src/db.ts", "src/util.ts"],
@@ -83,7 +157,17 @@ export function fixtureResult(overrides: Partial<AnalysisResult> = {}): Analysis
           { fileId: "src/db.ts", order: 3, reason: "data" },
         ],
       },
-      rag: { chunks: CHUNKS, chunkCount: CHUNKS.length, embeddingModel: EMBED_MODEL, embeddingDim: EMBED_DIM },
+      rag: {
+        chunks: CHUNK_META,
+        chunkCount: CHUNK_META.length,
+        embeddingModel: EMBED_MODEL,
+        embeddingDim: EMBED_DIM,
+        store: {
+          namespace: FIXTURE_NAMESPACE,
+          vectorStoreId: "memory-vector-store",
+          textStoreId: "memory-chunk-text-store",
+        },
+      },
     },
     ...overrides,
   };
@@ -101,9 +185,12 @@ export function mockEmbeddingClient(opts: { model?: string; dimension?: number }
     model: opts.model ?? EMBED_MODEL,
     dimension: opts.dimension ?? EMBED_DIM,
     calls,
-    async embed(request: EmbeddingRequest): Promise<number[][]> {
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
       calls.push(request);
-      return request.texts.map((text) => QUERY_VECTORS[text] ?? new Array(EMBED_DIM).fill(0));
+      return {
+        vectors: request.texts.map((text) => QUERY_VECTORS[text] ?? new Array(EMBED_DIM).fill(0)),
+        usage: { inputTokens: request.texts.length * 5, outputTokens: 0, measured: true },
+      };
     },
   };
 }

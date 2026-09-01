@@ -23,3 +23,7 @@ COPY apps/web/docker/40-codeflow-config.sh /docker-entrypoint.d/40-codeflow-conf
 RUN chmod +x /docker-entrypoint.d/40-codeflow-config.sh
 # API_BASE_URL is injected at RUN (e.g. -e API_BASE_URL=https://api.codeflow.example).
 EXPOSE 80
+# HEALTHCHECK against nginx's OWN /healthz, not against `/`. The SPA fallback returns index.html
+# for any unmatched path, so probing `/` would report healthy even with the asset directory
+# missing entirely. `wget` is busybox's, already in the alpine base -- no added layer.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3   CMD wget -q -O /dev/null http://127.0.0.1/healthz || exit 1

@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "@codeflow/config": ["packages/config/dist/index.d.ts"],
+      "@codeflow/shared-types": ["packages/shared-types/dist/index.d.ts"]
+    }
+  },
+  "include": ["src"]
+}

@@ -7,6 +7,7 @@ import { createInMemoryRateLimitStore } from "./middleware/rateLimit.js";
 import { setAnalysisQueueEnqueueForTests } from "./queues/analysisQueue.js";
 import { setProgressSubscriberForTests } from "./queues/progressChannel.js";
 import { BudgetExceededError } from "@codeflow/analyzers";
+import { ANALYZER_VERSION } from "@codeflow/config";
 import { streamProgress } from "./routes/jobs.js";
 import { createInMemoryEventLogStore } from "./queues/eventLogStore.js";
 import { setAskHandlerForTests } from "./services/ragQaService.js";
@@ -52,6 +53,23 @@ describe("codeflow api", () => {
     });
     return { id: record.id, result: record.result };
   }
+
+  it("GET /health reports readiness SEPARATELY from liveness (V3-P5)", async () => {
+    // A container that takes traffic before its caches are warm serves its first users a latency
+    // that looks like a bug. `status` stays "ok" while cold — the process is alive and CAN serve, so
+    // reporting an error would make a liveness probe kill a healthy container mid-warm-up.
+    const response = await request(app).get("/health").expect(200);
+    expect(response.body.status).toBe("ok");
+    expect(response.body).toHaveProperty("warmedUp");
+    expect(typeof response.body.warmedUp).toBe("boolean");
+    // This suite never registers or runs the API's warm-up tasks (registration lives at the
+    // composition root, deliberately — see health/warmup.ts), so `false` here is the HONEST answer
+    // to "did this process come up ready", not the structural always-false V3-FINAL fixed.
+    // `warmup.test.ts` is what proves the flag can reach `true` on the real registration.
+    expect(response.body.warmedUp).toBe(false);
+    expect(Array.isArray(response.body.warmup.tasks)).toBe(true);
+    expect(response.body.warmup.tasks).toEqual([]);
+  });
 
   it("GET /health returns ok", async () => {
     const response = await request(app).get("/health").expect(200);
@@ -193,10 +211,20 @@ describe("codeflow api", () => {
       expect.objectContaining({
         jobId: response.body.jobId,
         mode: "public_hosted",
-        commitSha: "mock-facebook-react-main",
-        analyzerVersion: "mock-v1",
+        // Placeholder SHA until Ingest resolves the real HEAD; the cache-key namespace is
+        // a real version, never "mock-*".
+        commitSha: "pending-facebook-react-main",
+        analyzerVersion: ANALYZER_VERSION,
       }),
     ]);
+  });
+
+  it("namespaces the analysis cache with a real version, never a 'mock' placeholder", () => {
+    // analyzerVersion is the third component of the Mongo analysis_cache_key, so a "mock-*"
+    // default silently namespaced every real cached analysis under a fake version.
+    expect(env.analyzerVersion).not.toMatch(/mock/i);
+    expect(env.analyzerVersion).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(ANALYZER_VERSION).toBe(env.analyzerVersion);
   });
 
   it("GET /api/job/:id returns queued progress before a worker completes it", async () => {
@@ -301,7 +329,10 @@ describe("codeflow api", () => {
           chunkCount: 1,
           embeddingModel: "mock-embed",
           embeddingDim: 3,
-          chunks: [{ id: "src/index.ts#1-5", fileId: "src/index.ts", startLine: 1, endLine: 5, text: "x", embedding: [1, 0, 0], tokenCount: 2 }],
+          // V3-P2: the persisted slice is metadata + a store reference. The route only needs
+          // ai.rag to EXIST (the ask handler is mocked in this suite), so no store is stood up.
+          chunks: [{ id: "src/index.ts#1-5", fileId: "src/index.ts", startLine: 1, endLine: 5, tokenCount: 2 }],
+          store: { namespace: "facebook/react@sha/mock-embed/3", vectorStoreId: "memory-vector-store", textStoreId: "memory-chunk-text-store" },
         },
       };
     }
@@ -357,6 +388,52 @@ describe("codeflow api", () => {
     const response = await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(200);
     expect(response.body.atCapacity).toBe(true);
     expect(response.body.answered).toBe(false);
+  });
+
+  it("POST /api/result/:id/ask passes a sessionId through and echoes it back (V3-P3)", async () => {
+    // The conversation contract: the client sends a session id, the handler receives it (so the
+    // agent can load prior turns), and the response echoes it so the client can continue.
+    const seen: Array<{ sessionId?: string; analysisId?: string }> = [];
+    setAskHandlerForTests(async ({ sessionId, analysisId }) => {
+      seen.push({ sessionId, analysisId });
+      return { answer: "ok", answered: true, citations: [], retrievedChunkIds: [] };
+    });
+    const jobId = await seedAskJob();
+
+    const response = await request(app)
+      .post(`/api/result/${jobId}/ask`)
+      .send({ question: "what about its callers?", sessionId: "sess-abc_1.2" })
+      .expect(200);
+    expect(response.body.sessionId).toBe("sess-abc_1.2");
+    expect(seen[0].sessionId).toBe("sess-abc_1.2");
+    // The analysis id is passed too, so a session cannot mix two repositories.
+    expect(seen[0].analysisId).toBeTruthy();
+  });
+
+  it("POST /api/result/:id/ask omits the session entirely for a stateless ask", async () => {
+    // A one-shot ask must not create a session, or a shared store fills with single-turn
+    // sessions nobody can address again.
+    const seen: Array<string | undefined> = [];
+    setAskHandlerForTests(async ({ sessionId }) => {
+      seen.push(sessionId);
+      return { answer: "ok", answered: true, citations: [], retrievedChunkIds: [] };
+    });
+    const jobId = await seedAskJob();
+    const response = await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(200);
+    expect(seen[0]).toBeUndefined();
+    expect(response.body.sessionId).toBeUndefined();
+  });
+
+  it("POST /api/result/:id/ask REJECTS a malformed sessionId rather than sanitising it", async () => {
+    // A session id becomes a STORE KEY: unbounded length is a memory-exhaustion vector, and
+    // separators could collide with another namespace in a shared Redis. Rejecting beats silently
+    // rewriting, which would hand the client a session it cannot address again.
+    setAskHandlerForTests(async () => ({ answer: "ok", answered: true, citations: [], retrievedChunkIds: [] }));
+    const jobId = await seedAskJob();
+    for (const bad of ["a".repeat(65), "has spaces", "colon:separated", "slash/es"]) {
+      await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?", sessionId: bad }).expect(400);
+    }
+    await request(app).post(`/api/result/${jobId}/ask`).send({ question: "q?", sessionId: 42 }).expect(400);
   });
 
   it("POST /api/result/:id/ask rejects an empty question (400) and an unknown job (404)", async () => {

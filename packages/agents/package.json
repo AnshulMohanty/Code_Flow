@@ -1,0 +1,32 @@
+{
+  "name": "@codeflow/agents",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/observability build && pnpm --filter @codeflow/analyzers build",
+    "build": "tsc -p tsconfig.json",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/observability build && pnpm --filter @codeflow/analyzers build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/observability build && pnpm --filter @codeflow/analyzers build",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codeflow/analyzers": "workspace:*",
+    "@codeflow/config": "workspace:*",
+    "@codeflow/graph": "workspace:*",
+    "@codeflow/memory": "workspace:*",
+    "@codeflow/observability": "workspace:*",
+    "@codeflow/retrieval": "workspace:*",
+    "@codeflow/shared-types": "workspace:*"
+  }
+}

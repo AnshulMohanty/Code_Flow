@@ -1,0 +1,261 @@
+# CodeFlow — Render Blueprint (Infrastructure as Code).
+#
+# NOTHING HERE HAS BEEN APPLIED. This file is the deployment described so it can be reviewed;
+# creating the services, filling the secrets and paying for the plans are owner steps. The ordered
+# walkthrough is DEPLOY.md — read that, not this, to deploy.
+#
+# ── The shape of the system, and why it is four services and not one ──────────────────────────
+#
+#   codeflow-api      web     Express + SSE. Accepts an analysis request, streams progress, answers
+#                             questions. Stateless; scale on request volume.
+#   codeflow-worker   worker  BullMQ consumer. Clones and parses repositories and calls the model
+#                             providers. This is where all the time and all the money goes.
+#   codeflow-web      static  The built SPA. No server.
+#   codeflow-postgres  pg     pgvector — the Q&A index. The worker WRITES it and the api READS it,
+#                             which is the whole reason it cannot be per-process memory.
+#   codeflow-keyvalue  kv     The BullMQ queue, the shared rate limit and the shared daily budget.
+#
+# MongoDB is NOT here: Atlas is external and has no Render equivalent, so `MONGO_URI` is a secret
+# the owner fills. Create the cluster FIRST — the worker refuses to boot without it.
+#
+# apps/mcp and apps/local-cli are deliberately absent. The MCP server speaks stdio to a model
+# client on a developer's machine and the local CLI runs on a laptop; neither is a web service.
+# Their distribution channel is `npm publish`, not a deploy. See DEPLOY.md § "Not deployed".
+#
+# ── The two things most likely to bite ────────────────────────────────────────────────────────
+#
+#  1. `maxmemoryPolicy: noeviction` on the Key Value instance is REQUIRED, not tuning. BullMQ
+#     stores job state in Redis; under any `allkeys-*` policy the store evicts keys when it fills
+#     and jobs disappear mid-flight with no error anywhere. The default on many managed Redis
+#     offerings is an eviction policy.
+#  2. `CORS_ORIGINS` cannot be resolved here. It needs the web site's URL, and the web build needs
+#     the api's — a mutual reference Render cannot resolve on first create. It is `sync: false` and
+#     DEPLOY.md makes setting it an explicit step. Until it is set, the browser gets CORS errors
+#     against a healthy API, which reads like an outage and is not one.
+
+services:
+  # ── API ─────────────────────────────────────────────────────────────────────────────────────
+  - type: web
+    name: codeflow-api
+    runtime: docker
+    dockerfilePath: ./apps/api/Dockerfile
+    # The Dockerfile installs the whole pnpm workspace, so the build context is the repo root.
+    dockerContext: .
+    plan: starter
+    region: oregon
+    # /health, not /ready. Render restarts an instance that fails its health check, and /ready is
+    # 503 while warm-up loads the tree-sitter grammars — pointing the check there would restart
+    # every instance for being cold, forever.
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: codeflow-shared
+      - key: NODE_ENV
+        value: production
+      # PORT is assigned by Render and read by apps/api/src/config/port.ts. API_PORT is
+      # deliberately NOT set here: it takes precedence, so setting it would bind a port the
+      # Render proxy is not routing to. The API logs which variable chose the port at boot.
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: codeflow-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: codeflow-keyvalue
+          property: connectionString
+      # Comma-separated browser origins for REST + SSE. See note 2 above: this needs the web
+      # site's URL, so it is an owner step after the first deploy.
+      - key: CORS_ORIGINS
+        sync: false
+
+  # ── Worker ──────────────────────────────────────────────────────────────────────────────────
+  - type: worker
+    name: codeflow-worker
+    runtime: docker
+    dockerfilePath: ./apps/worker/Dockerfile
+    dockerContext: .
+    # No free plan exists for a Render worker, and a free instance would be the wrong choice
+    # anyway: this process holds a job for minutes and is killed on idle spin-down.
+    plan: starter
+    region: oregon
+    # A worker has no HTTP surface on Render, so there is no healthCheckPath. The image still
+    # starts its own /health /ready /metrics on WORKER_HEALTH_PORT (4100, set in the Dockerfile);
+    # it is reachable only from inside the service, which is where the autoscale signal is read.
+    envVars:
+      - fromGroup: codeflow-shared
+      - key: NODE_ENV
+        value: production
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: codeflow-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: codeflow-keyvalue
+          property: connectionString
+      # Jobs per instance. 2 is the default in apps/worker/src/config/scaling.ts and the ceiling
+      # is 8; past that, scale OUT. Autoscale on queue depth from /metrics, never on CPU — this
+      # process is idle-looking while it waits on a provider call, which is most of a run.
+      - key: WORKER_CONCURRENCY
+        value: "2"
+
+  # ── Web (static SPA) ────────────────────────────────────────────────────────────────────────
+  - type: web
+    name: codeflow-web
+    runtime: static
+    # Only the two packages the SPA actually imports are built first; `pnpm -r build` here would
+    # also build the api, the worker and the MCP server to produce a folder of static files.
+    # VITE_API_BASE_URL is set HERE and not in envVars because Render does not expand `$VAR`
+    # inside an envVar `value:` -- it would bake the literal string `https://$CODEFLOW_API_HOST`
+    # into the bundle. The build command is a real shell, so the expansion happens.
+    buildCommand: >-
+      corepack enable &&
+      pnpm install --frozen-lockfile &&
+      pnpm --filter @codeflow/shared-types --filter @codeflow/config build &&
+      VITE_API_BASE_URL="https://$CODEFLOW_API_HOST"
+      pnpm --filter @codeflow/web build
+    staticPublishPath: apps/web/dist
+    pullRequestPreviewsEnabled: false
+    envVars:
+      # A STATIC SITE HAS NO ENTRYPOINT, so the runtime /config.js injection that the web
+      # Dockerfile does (apps/web/docker/40-codeflow-config.sh) cannot run here — the API URL is
+      # baked at build time instead, which means a change to it needs a REBUILD, not a restart.
+      # That is the trade for not paying for a container. apps/web/src/lib/apiClient.ts prefers
+      # the runtime value and falls back to this one, so the Docker path still works unchanged.
+      # `property: host` yields a bare hostname (no scheme), which the build command turns into
+      # the absolute URL the SPA needs.
+      - key: CODEFLOW_API_HOST
+        fromService:
+          type: web
+          name: codeflow-api
+          property: host
+    routes:
+      # SPA fallback. Client-side routing means a deep link must return index.html rather than a
+      # 404 — the static equivalent of the `try_files ... /index.html` in apps/web/docker/nginx.conf.
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      # Vite emits content-hashed asset names, so an asset can never be stale under its own name
+      # and a year is exact rather than aggressive. index.html is the one file whose name is
+      # stable while its contents change, so caching it is precisely how a deploy fails to reach
+      # users. Same reasoning as nginx.conf, restated because a static site does not read that file.
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache, must-revalidate
+      - path: /config.js
+        name: Cache-Control
+        value: no-store
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+
+  # ── Key Value (Redis-compatible): queue + shared guards ─────────────────────────────────────
+  - type: keyvalue
+    name: codeflow-keyvalue
+    plan: starter
+    region: oregon
+    # REQUIRED — see note 1 at the top. Under an eviction policy BullMQ jobs vanish silently.
+    maxmemoryPolicy: noeviction
+    # Reachable only from inside the Render network. The queue carries repository URLs and job
+    # state; nothing about it should be on the public internet.
+    ipAllowList: []
+
+databases:
+  # ── Postgres + pgvector: the Q&A index ──────────────────────────────────────────────────────
+  - name: codeflow-postgres
+    databaseName: codeflow
+    user: codeflow
+    plan: basic-256mb
+    region: oregon
+    # pgvector needs 15+. The extension itself is created by the application, not here:
+    # `createPgvectorStore.ensureSchema()` runs CREATE EXTENSION IF NOT EXISTS vector, then the
+    # dimension-typed table and the HNSW cosine index, all IF NOT EXISTS so a redeploy re-runs
+    # cleanly. A migration step that has to be remembered is a migration step that gets forgotten.
+    postgresMajorVersion: "16"
+    ipAllowList: []
+
+envVarGroups:
+  # One group, attached to both the api and the worker, because they MUST agree. Two processes
+  # that read their own copy of the provider config are two processes that can disagree, and here
+  # disagreeing means the worker builds an index in an embedding space the api cannot query.
+  - name: codeflow-shared
+    envVars:
+      # ── Required: MongoDB (Atlas, external) ──
+      # The worker refuses to boot without it. The api degrades to per-process memory and says so.
+      - key: MONGO_URI
+        sync: false
+
+      # ── Required: at least one model provider ──
+      # No chat key ⇒ the run completes as `runMode: "deterministic-only"`: a real dependency map
+      # and no onboarding narrative. No embedding key ⇒ no Q&A index, and /ask says so instead of
+      # erroring. Both are honest degradations, not failures — but they are not the product.
+      - key: LLM_PROVIDER
+        sync: false # anthropic | gemini. Needed only when BOTH keys are set.
+      - key: EMBEDDING_PROVIDER
+        sync: false # voyage | gemini
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: VOYAGE_API_KEY
+        sync: false
+
+      # ── Optional: model overrides. Unset ⇒ the defaults in @codeflow/config. ──
+      - key: SYNTHESIS_MODEL
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false
+      - key: VOYAGE_MODEL
+        sync: false
+      - key: GEMINI_EMBEDDING_MODEL
+        sync: false
+      - key: GEMINI_EMBEDDING_DIM
+        sync: false
+      # A cheap tier for the many small specialist calls. Unset ⇒ ONE tier and the client is used
+      # unwrapped, so cache keys stay byte-identical to a non-routed deployment.
+      - key: FAST_MODEL
+        sync: false
+
+      # ── Optional: features that are off by default, each for a stated reason ──
+      # Runs independent pipeline stages concurrently, scheduled by dependency readiness. Slices
+      # are asserted byte-identical to the sequential run; opt-in because it is the deterministic
+      # spine, and "proven identical" is a different bar from "default".
+      - key: PARALLEL_STAGES
+        value: "false"
+      # Synthesis via the 5N+1 specialist fan-out instead of one call. THIS IS ALSO WHAT PRODUCES
+      # THE DOMAINS TAB — without it there are no inferred domain lanes and the tab says so.
+      # Default off because of cost SHAPE: right for a real onboarding guide, wrong for a demo.
+      - key: FANOUT_SYNTHESIS
+        value: "false"
+
+      # ── Optional: cost reporting ──
+      # UNSET ⇒ cost reports `usd: null` with the unpriced models NAMED. Tokens are measured
+      # either way; only the dollar figure is missing, and the UI renders an em-dash rather than a
+      # zero. Prices are not baked in on purpose: they change per account and region, and a stale
+      # constant reports a confident wrong number where an empty table reports "we do not know".
+      # Format: {"claude-sonnet-4-5":{"inputPerMillion":3,"outputPerMillion":15}}
+      - key: LLM_PRICING
+        sync: false
+
+      # ── Optional: tracing. A PARTIAL config is treated as OFF. ──
+      - key: LANGFUSE_HOST
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: HELICONE_API_KEY
+        sync: false
+
+      # ── Optional: build identity. Unset ⇒ the site footer shows an em-dash, deliberately:
+      # a build id nobody can look up is decoration. Render exposes the commit as RENDER_GIT_COMMIT.
+      - key: SOURCE_COMMIT
+        sync: false

@@ -1,0 +1,80 @@
+{
+  "evalSchemaVersion": 1,
+  "provenance": {
+    "authoredOn": "2026-08-30",
+    "authoredIn": "V3-P0 §0.4",
+    "method": "Cloned at the pinned SHA and read the source. Every expectedFile and every expectedLines range below was verified against the actual file at that SHA — nothing here is inferred from the library's reputation or from memory.",
+    "measures": "The tree-sitter parsing + CPG pipeline from V3-P1 (ANALYZER_VERSION 1.1.0). A pre-V3-P1 regex-parsed run is NOT comparable: for Python, tree-sitter recovers `async def f(...) -> T:` definitions and decorated methods that the line-oriented regex parser missed entirely.",
+    "whyThisRepo": "A real, widely-read Python package with a src-layout, deep class hierarchies (mixins + inheritance), and a clear public-API/internals split. It exercises the Python grammar, relative-import resolution across `src/requests/`, and the V3-P1 CPG's inheritance edges — which chalk, having no classes to speak of, does not.",
+    "thresholdStatus": "EVAL_THRESHOLDS are still PLACEHOLDERS. Calibrate them from the out-of-band scored run against this dataset before any gating decision."
+  },
+  "repoUrl": "https://github.com/psf/requests",
+  "commitSha": "5460f467b02e49471c0fd6cfc9ca0adab6351f98",
+  "embeddingModel": "gemini-embedding-001",
+  "embeddingDim": 768,
+  "synthesis": {
+    "expectedEntryPoints": ["src/requests/__init__.py", "src/requests/api.py"]
+  },
+  "questions": [
+    {
+      "id": "requests-q1",
+      "question": "Where are the top-level get, post and put helper functions defined?",
+      "expectedFiles": ["src/requests/api.py"],
+      "expectedLines": [{ "fileId": "src/requests/api.py", "startLine": 24, "endLine": 137 }]
+    },
+    {
+      "id": "requests-q2",
+      "question": "How does requests follow HTTP redirects?",
+      "expectedFiles": ["src/requests/sessions.py"],
+      "expectedLines": [{ "fileId": "src/requests/sessions.py", "startLine": 186, "endLine": 380 }]
+    },
+    {
+      "id": "requests-q3",
+      "question": "How is HTTP basic authentication encoded into the request header?",
+      "expectedFiles": ["src/requests/auth.py"],
+      "expectedLines": [{ "fileId": "src/requests/auth.py", "startLine": 34, "endLine": 115 }]
+    },
+    {
+      "id": "requests-q4",
+      "question": "Where is the connection pool set up and where is TLS certificate verification handled?",
+      "expectedFiles": ["src/requests/adapters.py"],
+      "expectedLines": [
+        { "fileId": "src/requests/adapters.py", "startLine": 239, "endLine": 306 },
+        { "fileId": "src/requests/adapters.py", "startLine": 307, "endLine": 380 }
+      ]
+    },
+    {
+      "id": "requests-q5",
+      "question": "What exception is raised when a request times out, and what does it inherit from?",
+      "expectedFiles": ["src/requests/exceptions.py"],
+      "expectedLines": [{ "fileId": "src/requests/exceptions.py", "startLine": 82, "endLine": 101 }]
+    },
+    {
+      "id": "requests-q6",
+      "question": "How does a Request get turned into a PreparedRequest before it is sent?",
+      "expectedFiles": ["src/requests/models.py"],
+      "expectedLines": [{ "fileId": "src/requests/models.py", "startLine": 378, "endLine": 500 }]
+    },
+    {
+      "id": "requests-q7",
+      "question": "How does a Session send a prepared request and pick the right transport adapter?",
+      "expectedFiles": ["src/requests/sessions.py"],
+      "expectedLines": [{ "fileId": "src/requests/sessions.py", "startLine": 752, "endLine": 830 }]
+    },
+    {
+      "id": "requests-q8",
+      "question": "How are cookies persisted between requests in a session?",
+      "expectedFiles": ["src/requests/cookies.py", "src/requests/sessions.py"]
+    },
+    {
+      "id": "requests-q9",
+      "question": "Where does requests define its case-insensitive dictionary for headers?",
+      "expectedFiles": ["src/requests/structures.py"]
+    },
+    {
+      "id": "requests-q10",
+      "question": "How does the React component tree get hydrated on the client?",
+      "expectedFiles": []
+    }
+  ]
+}

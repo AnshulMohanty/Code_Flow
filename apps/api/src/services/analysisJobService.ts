@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { AnalysisMode, JobProgress, JobStatus, PipelineRunStatus, PipelineStatusReason, RepositoryRef } from "@codeflow/shared-types";
+import type { AnalysisMode, DegradationNotice, JobProgress, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, RepositoryRef, RunMode } from "@codeflow/shared-types";
 import { ApiError } from "../middleware/errorHandler.js";
 import { isMongoConnected } from "../db/connectMongo.js";
 import { JobModel } from "../db/models/JobModel.js";
+import { withPersistenceDegradation } from "./persistenceHealth.js";
 
 export interface AnalysisJobRecord {
   id: string;
@@ -22,6 +23,11 @@ export interface AnalysisJobRecord {
   error?: string;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  /** Stages the worker reported as never-configured (unconfigured AI providers). */
+  skippedStages?: PipelineStageId[];
+  /** V3-P0: delivered scope + typed degradation reasons (see RunMode). */
+  runMode?: RunMode;
+  degradations?: DegradationNotice[];
   createdAt: string;
   updatedAt: string;
 }
@@ -41,6 +47,10 @@ export interface CreateAnalysisJobInput {
   totalFiles?: number;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  skippedStages?: PipelineStageId[];
+  /** V3-P0: delivered scope + typed degradation reasons (see RunMode). */
+  runMode?: RunMode;
+  degradations?: DegradationNotice[];
 }
 
 const inMemoryJobs = new Map<string, AnalysisJobRecord>();
@@ -57,15 +67,20 @@ export async function createAnalysisJob(input: CreateAnalysisJobInput): Promise<
     mode: input.mode,
     status,
     progress,
-    currentStep: input.currentStep ?? (status === "completed" ? "Mock analysis completed" : "Analysis job queued."),
-    parsedFiles: input.parsedFiles ?? (status === "completed" ? 42 : 0),
-    totalFiles: input.totalFiles ?? 42,
+    currentStep: input.currentStep ?? (status === "completed" ? "Analysis completed." : "Analysis job queued."),
+    // File counts are only known once the worker has walked the tree; 0 until then rather
+    // than a fabricated placeholder.
+    parsedFiles: input.parsedFiles ?? 0,
+    totalFiles: input.totalFiles ?? 0,
     commitSha: input.commitSha,
     analyzerVersion: input.analyzerVersion,
     analysisId: input.analysisId,
     cached: input.cached ?? false,
     runStatus: input.runStatus,
     runStatusReason: input.runStatusReason,
+    skippedStages: input.skippedStages,
+    runMode: input.runMode,
+    degradations: input.degradations,
     createdAt: now,
     updatedAt: now,
   };
@@ -87,6 +102,9 @@ export async function createAnalysisJob(input: CreateAnalysisJobInput): Promise<
     cached: job.cached,
     runStatus: job.runStatus,
     runStatusReason: job.runStatusReason,
+    skippedStages: job.skippedStages,
+    runMode: job.runMode,
+    degradations: job.degradations,
     repositoryRef: job.repositoryRef,
     mode: job.mode,
     commitSha: job.commitSha,
@@ -101,7 +119,19 @@ export async function updateAnalysisJob(
   patch: Partial<
     Pick<
       AnalysisJobRecord,
-      "status" | "progress" | "currentStep" | "parsedFiles" | "totalFiles" | "analysisId" | "cached" | "error" | "runStatus" | "runStatusReason"
+      | "status"
+      | "progress"
+      | "currentStep"
+      | "parsedFiles"
+      | "totalFiles"
+      | "analysisId"
+      | "cached"
+      | "error"
+      | "runStatus"
+      | "runStatusReason"
+      | "skippedStages"
+      | "runMode"
+      | "degradations"
     >
   >,
 ): Promise<AnalysisJobRecord> {
@@ -148,6 +178,7 @@ export async function getAnalysisJobProgress(jobId: string): Promise<JobProgress
   createdAt: string;
 }> {
   const job = await getAnalysisJob(jobId);
+  const degradations = withPersistenceDegradation(job.degradations);
   return {
     id: job.jobId,
     jobId: job.jobId,
@@ -164,6 +195,12 @@ export async function getAnalysisJobProgress(jobId: string): Promise<JobProgress
     // #19 — terminal pipeline outcome on REST (SSE is for live watching only).
     ...(job.runStatus ? { runStatus: job.runStatus } : {}),
     ...(job.runStatusReason ? { runStatusReason: job.runStatusReason } : {}),
+    // Never-configured stages, so the UI can settle those rows instead of spinning.
+    ...(job.skippedStages?.length ? { skippedStages: job.skippedStages } : {}),
+    // V3-P0: the honest-degradation signal the web banner branches on. Mongo-down is merged
+    // in at READ time — it is a property of this process right now, not of the job record.
+    ...(job.runMode ? { runMode: job.runMode } : {}),
+    ...(degradations.length ? { degradations } : {}),
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   };
@@ -192,6 +229,9 @@ function fromMongoDocument(doc: any): AnalysisJobRecord {
     error: doc.error,
     runStatus: doc.runStatus,
     runStatusReason: doc.runStatusReason,
+    skippedStages: doc.skippedStages,
+    runMode: doc.runMode,
+    degradations: doc.degradations,
     createdAt: new Date(doc.createdAt).toISOString(),
     updatedAt: new Date(doc.updatedAt).toISOString(),
   };

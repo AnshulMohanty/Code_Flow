@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stripCodeFence } from "../llm/completionText.js";
 import type {
   FileMetrics,
   PipelineContext,
@@ -9,9 +10,11 @@ import type {
   RepoGraph,
   Synthesis,
   StageResult,
+  TokenUsage,
 } from "@codeflow/shared-types";
 import type { LlmClient } from "../llm/llmClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
+import { estimateTokens, sumUsage } from "../util/tokens.js";
 
 export interface SynthesizeDependencies {
   /** Injectable LLM client — tests mock it (no real API calls). */
@@ -97,15 +100,25 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
       }
 
       let lastError: unknown;
+      /** Every attempt's usage — so the terminal event reports what the STAGE spent, not one call. */
+      const totalUsage: TokenUsage[] = [];
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let completion: string;
+        let usage: TokenUsage;
         try {
-          completion = await deps.client.complete({
-            system: SYSTEM_PROMPT,
+          // `cachePrefix` marks the STABLE prefix for the provider's prompt cache. Only
+          // SYSTEM_PROMPT is stable across repos; the per-repo facts are already protected
+          // by the SHA-keyed completion cache above, which is strictly cheaper than a
+          // provider cache hit (zero tokens vs discounted tokens). Whether the provider
+          // actually cached is read back below, never assumed.
+          const completed = await deps.client.complete({
+            cachePrefix: SYSTEM_PROMPT,
             prompt,
             temperature: 0,
             maxTokens: deps.maxTokens,
           });
+          completion = completed.text;
+          usage = completed.usage;
         } catch (error) {
           lastError = error;
           ctx.logger.warn("Synthesis LLM call failed; retrying if attempts remain.", {
@@ -115,13 +128,44 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
           continue;
         }
 
+        // CHARGED THE MOMENT THE CALL SUCCEEDS, before the output is judged — FIXED V3-FINAL.
+        //
+        // This used to sit AFTER `deriveSynthesis`, inside the try below, so a completion rejected by
+        // the schema or grounding check was never recorded. The provider charged for it either way,
+        // which meant three rejected attempts spent real money against a daily ceiling that never saw
+        // a token of it: the wallet guard was blind to exactly the failure mode that retries most.
+        // The retry loop makes this a multiple, not a rounding error.
+        totalUsage.push(usage);
+        if (ctx.budget) await ctx.budget.record(usage, "chat");
+        if (!usage.measured) {
+          ctx.logger.warn("Synthesis: provider reported no usage; budget recorded an ESTIMATE.", {
+            provider: deps.client.provider,
+          });
+        }
+        // An INTERIM event carrying the usage, so a failed or retried stage's spend still reaches the
+        // trace. The terminal event only exists on the success path, so without this a run that spent
+        // money and then failed would report a cost of zero — the same dishonesty in a new place.
+        ctx.emit?.({
+          jobId: input.jobId,
+          stage: "synthesize",
+          stageIndex: 7,
+          stageCount: 7,
+          kind: "ai",
+          status: "running",
+          label: "Synthesizing",
+          detail: `Provider call ${attempt}/${maxAttempts} completed.`,
+          progress: 0,
+          startedAt: new Date(startedAt).toISOString(),
+          // The pricing table is keyed by model, so a usage report without it prices as UNKNOWN.
+          preview: { model: deps.client.model, attempt },
+          usage,
+          emittedAt: new Date(now()).toISOString(),
+        });
+
         try {
           const synthesis = deriveSynthesis(completion, nodeIds);
           await ctx.cache.set(cacheKey, completion); // cache only valid+grounded completions
-          // Record actual spend AFTER a successful call. (Estimate-based for now; wiring the
-          // provider's real usage.total_tokens through LlmClient is a P7 refinement.)
-          if (ctx.budget) await ctx.budget.record(estimatedTokens);
-          return finish(synthesis, { cached: false });
+          return finish(synthesis, { cached: false, usage: sumUsage(totalUsage) });
         } catch (error) {
           lastError = error;
           ctx.logger.warn("Synthesis output rejected (schema/grounding); retrying if attempts remain.", {
@@ -135,7 +179,10 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
         `Synthesis failed after ${maxAttempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
       );
 
-      function finish(synthesis: Synthesis, meta: { cached: boolean }): StageResult<"aiSynthesis"> {
+      function finish(
+        synthesis: Synthesis,
+        meta: { cached: boolean; usage?: TokenUsage },
+      ): StageResult<"aiSynthesis"> {
         const event: ProgressEvent = {
           jobId: input.jobId,
           stage: "synthesize",
@@ -154,7 +201,11 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
             readingSteps: synthesis.readingOrder.length,
             droppedCitations: synthesis.droppedCitations ?? 0,
             cached: meta.cached,
+            model: deps.client.model,
           },
+          // Absent on a cache hit, which is the honest shape: a served completion spent nothing, and
+          // reporting zero tokens would be indistinguishable from a free provider call.
+          ...(meta.usage ? { usage: meta.usage } : {}),
           emittedAt: new Date(now()).toISOString(),
         };
         return { partial: { aiSynthesis: synthesis }, event };
@@ -168,7 +219,7 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
 /** Parse the raw completion, schema-validate it, then drop ungrounded reading steps.
  *  Throws on malformed JSON, schema miss, or an empty-after-grounding reading order. */
 export function deriveSynthesis(raw: string, nodeIds: Set<string>): Synthesis {
-  const cleaned = stripCodeFences(raw).trim();
+  const cleaned = stripCodeFence(raw).trim();
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
@@ -229,20 +280,13 @@ export function deriveSynthesis(raw: string, nodeIds: Set<string>): Synthesis {
   };
 }
 
-function stripCodeFences(text: string): string {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fence ? fence[1] : text;
-}
-
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
 /** Deterministic token estimate for the budget pre-check (~4 chars/token). Precise
  *  provider tokenization is a P7 refinement; this is the wallet-guard estimate. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+
 
 // --- Bounded prompt construction (reads uncapped slices read-only) ----------
 

@@ -3,7 +3,94 @@
 > Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
 > [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
 
-_Last updated: 2026-06-10 (i) — P6 ship-prep: 3 service Dockerfiles + GitHub Actions CI (hermetic, no secrets) (branch `codeflow-cleanup`)._
+_Last updated: 2026-08-31 — V3-P4: bounded agent fan-out + test-time compute (specialists over communities, blackboard, supervisor, best-of-N) (branch `v3/p4-agent-fanout`)._
+
+> ✅ **V3-P4 is DONE** — the multi-agent centrepiece. Stage 7 is now a fan-out of five specialist
+> lenses over V3-P1's **Louvain communities** (low-coupling BY CONSTRUCTION, which is why the
+> parallelism is earned rather than assumed), collected on a shared blackboard, synthesised by ONE
+> supervisor. Never an open mesh. All four risks the brief named are handled in code and **measured**:
+> the supervisor's prompt is **668 tokens at 12 communities and 668 at 60** (5× the workers, 5× the
+> findings, the same prompt — the documented failure at 4+ workers, avoided structurally); wall-clock
+> **496ms → 126ms (3.9×)** with peak concurrency OBSERVED by a counter rather than inferred from a
+> stopwatch; best-of-N costs **0% overhead when nothing routes hard and 33% with one hard community
+> of four**, with two hard ceilings so the N-times bill cannot run away; and the spine is asserted
+> byte-identical across a fan-out, because agents are AI LEAVES. The Synthesize contract survives
+> intact — grounding, a cache now keyed on the community PARTITION as well as the SHA, cache-before-
+> budget, and "throws only when nothing is grounded". The choice of path is made at RUN time (clusters
+> do not exist until stage 6), the single-shot path is KEPT for graph-less cached analyses, and the
+> fan-out is opt-in via `FANOUT_SYNTHESIS` on cost shape. **955 tests** (was 881).
+
+> ✅ **V3-P3 is DONE** — `/api/result/:id/ask` is a BOUNDED multi-turn agent. Two new packages:
+> `@codeflow/agents` (the loop + `find_references`/`get_callers`/`get_blast_radius`/`symbol_search`
+> over the V3-P1 CPG, plus V3-P2 hybrid retrieval and `what_changed` as tools) and
+> `@codeflow/memory` (session + repository memory, everything bounded because memory feeds the
+> prompt). **Prompted tool-calling, not native** — `LlmClient` has no tool-calling and both
+> providers expose it differently, so the loop is ReAct over a completion; the cost is recorded and
+> native is a P5 upgrade behind the same `AgentTool` interface. Both risks the brief named are
+> handled IN CODE: `AGENT_MAX_TURNS`/`AGENT_MAX_TOOL_CALLS` are hard caps (**a test caught that the
+> tool cap was not actually capping** — it stopped offering tools while still executing them), and
+> honest-no-answer has three guards, the strongest being that **`answered: true` with no grounded
+> evidence is downgraded to a refusal** — the check is on EVIDENCE, not on the model's claim.
+> Follow-ups resolve deterministically in code ("what about its callers?" with no argument), and an
+> AMBIGUOUS path suffix is refused rather than guessed. Task 3's context hygiene ships with the loop
+> because it IS the loop's bounds: per-step tool curation (descriptions are prompt text paid every
+> turn) and per-PILLAR metering, since a total says the prompt grew while only a breakdown says
+> which bug did it. **881 tests** (was 742).
+
+> ✅ **V3-P2 is DONE** — retrieval is a real pipeline and the index has left the Mongo document.
+> New `@codeflow/retrieval` sits BELOW analyzers and owns the ONE `VectorStore` interface: an
+> in-memory exact-cosine pair is the hermetic default the whole suite and the eval run against,
+> pgvector + Postgres is production behind an injected `SqlClientLike`, and one factory
+> (`createRetrievalStores`) serves both the worker and the API so they cannot disagree about which
+> index they are talking to. `Rag` is now metadata + a `store` reference — **ledger #8 resolved**;
+> a pre-P2 index is refused with a rebuild instruction rather than answered from zero chunks.
+> Chunks are AST-enriched on the EMBEDDING side only (`RagChunk.text` stays byte-exact for its line
+> range), measured hermetically at **recall@3 0.500 → 1.000, MRR 0.333 → 0.667, 3 won / 0 lost** —
+> with the mechanism-not-magnitude caveat written into the module. Query time is
+> **BM25 + vector → RRF → rerank → MMR**, and the **similarity-floor refusal is unchanged**: it
+> reads the vector arm's real cosine, before any rerank, asserted by a test. NO cross-encoder
+> dependency: `onnxruntime-node` is 211 MB with a downloading postinstall, transformers.js adds
+> `sharp`, fastembed is native NAPI — so the deterministic lexical reranker ships and the real one
+> is a drop-in behind `CrossEncoderSession`. Plus the **synthetic-data flywheel**: guaranteed-correct
+> Q&A generated from the CPG with labels from the graph oracle (never a model), graph-shaped hard
+> negatives, and generated negative controls. **742 tests** (was 526).
+
+> ✅ **V3-CLEANUP is DONE** — a leaner tree by PROOF, not by eye. The audit lives in
+> [CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md), committed **before** anything was deleted: 13 REMOVE
+> verdicts each with a grep/import-graph receipt, 12 KEEP verdicts each with the reason written down
+> so the next pass does not re-litigate them, and 3 items left for the owner to call. Removed the
+> empty `@codeflow/exports` package, the `apps/card-action` stub, two never-written Mongo models,
+> six unreferenced web files (two of them placeholders superseded by shipped work) + 71 lines of
+> orphaned CSS, the `Citation`/`ProjectSummary` types V3-P0 orphaned, and 11 dead symbols — including
+> the `llmBudgetSchema`/`LlmBudgetModel` that V3-P0's move to the Redis budget left behind.
+> **331 → 318 tracked files, net −265 lines, and 526 tests + legacy 25/25 unchanged** — nothing
+> referenced any of it, which is the whole point. **Three of the brief's premises were wrong**:
+> ledger #4 and #15 were already done (the files do not exist here), and `card/examples/*.svg` are
+> real 1.7–12 KB SVGs, not zero-byte. `card/` is KEPT — it is a **published GitHub Action** with
+> external consumers whose analyzer reads `legacy/index.html` at runtime. Closes ledger #4 and #15.
+
+> ✅ **V3-P0 (Foundations + Arena) is DONE** — ran AFTER P1, out of plan order and by design (P1 did
+> not depend on it). Cost is now **measured**: one token utility, real provider usage read-back, and
+> ONE Redis budget the worker and the API both decrement (they used to keep two blind ceilings).
+> Guard 4 has its Redis store. Degradation is **visible**: `runMode: "deterministic-only"` + typed
+> `degradations[]`, including the previously-silent Mongo-down fallback. `issues` has a producer and
+> `aiProjectSummary` is gone. The eval scores the **answer path** with a calibration-gated judge
+> against a **real golden set** (chalk + requests, cloned and read at pinned SHAs), split into a
+> keyless CI check and a manual scored workflow. New `@codeflow/arena` grades exactly with **no LLM
+> call**. This closes ledger 14(b), 14(c), #9 and #19; **#17 remains open** until the scored run —
+> the dataset exists, the number does not yet.
+
+> ✅ **V3-P1 (tree-sitter CPG + communities) is DONE** — parsing is tree-sitter (WASM) with the regex
+> parsers as a per-language fallback, Connect builds a code property graph (calls / inheritance /
+> HTTP routes alongside imports), and `metrics.clusters` carries a **deterministic** Louvain partition
+> with modularity (closing deferred ledger #3). Accuracy is MEASURED, not asserted: on 6 authored
+> ground-truth cases tree-sitter scores **100% precision and recall** on both symbols and imports vs
+> the regex baseline's 88.9%/59.3% and 94.7%/90.0%. `ParserAdapter` is unchanged and the grammars are
+> proven to load inside the pruned `node:20-slim` image with no native toolchain.
+> ⚠️ **But the V3 Phase 0 entry gate was NOT met at the time** (no eval golden set, no Arena, no token
+> utility), so the scored "retrieval >= Phase 0 baseline" comparison could not be run — see ledger #17.
+> (V3-P0 has since been backfilled: the golden set, the Arena and the token utility all exist now. Only
+> the scored RUN itself is still owed, because it needs a real key.)
 
 > ✅ **Ship-prep (Dockerfiles + CI) is DONE** (authored; CI/P7 is the build proof): three
 > pnpm-workspace-aware multi-stage Dockerfiles (api/worker/web) + `.dockerignore` + `.env.example` +
@@ -526,13 +613,474 @@ guards + their tests only.
   by the CI `docker-build` job (GitHub's Docker-enabled runners) / P7 — not this session. Every CI
   GATE command (typecheck/lint/serial-test/build/legacy) was run locally and is green.
 
+### V3-P5 — marvel + reach (branch `v3/p5-marvel-reach`)
+
+> Full detail and the honest deviations: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P5`,
+> backfilled 2026-09-01).
+
+| # | Task | Status |
+|---|---|---|
+| 1 | **Latency** — readiness-based parallel stages, warm pool, model routing, speculative prefetch, `/health.warmedUp`, four latency tiers | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** Scheduling, warm-up, routing and the tiers all landed and are measured (sequential 67ms → layered 38ms, **1.76×**, orchestration-only). Two pieces did NOT resolve truthfully: `createSpeculator` had zero call sites, and `/health.warmedUp` on the API was structurally always false. |
+| 2 | **Observability** — OTel-shaped traces, per-agent interaction graph, per-step tokens/$, Langfuse/Helicone, versioned blackboard | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** The tracer, the interaction graph and the cost model are real. But `exportersFromEnv`, `createVersionedBlackboard` and `Span.recordUsage` all had zero production call sites — so every trace went nowhere and **every cost report read $0.00**. |
+| 3 | **MCP server** (`apps/mcp`) — graph + retrieval + verifier tools, default-deny scopes | ✅ **MET.** Built on `@modelcontextprotocol/sdk` after a dependency probe; the tools are the SAME objects the internal agent uses, so the two cannot drift. ⚠️ Never called by a real external agent — that is manual. |
+| 4 | **Local-first CLI** — on-device parse, embedded store, local embeddings, zero egress | ✅ **MET, with two named substitutions.** Shares the core packages; only the embedder and store differ. LanceDB (656 MB, NAPI, drags back onnxruntime) and int8 MiniLM (needs a NAPI tokenizer) were probed and REJECTED on evidence; a JSON file store and feature-hashed bag-of-words ship instead. **Both OWNER-DEFERRED** — see the ledger. |
+| 5 | **Deploy** — HEALTHCHECK, autoscale, CDN, keepalive, live benchmark | ✅ **CONFIG MET, execution deferred.** Worker `/health` `/ready` `/metrics` with a pure handler; `WORKER_CONCURRENCY` clamped-and-announced; web probes nginx's own `/healthz`. Resolved **ledger #20** and **#21**. ⚠️ Nothing deployed; the live benchmark against a deployed URL is owner-manual. |
+| 6 | **Offline memory consolidation** — per-community findings into a queryable repo KB | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** The consolidation is real, extractive and byte-deterministic. But the KB was built inside the run and discarded with it — nothing persisted it, so no surface could show what five specialists found. |
+
+**Gates at ship:** typecheck ✅ · lint ✅ · **1207 tests** ✅ · build ✅ · legacy 25/25 ✅ · compose ✅
+
+**Why the gates were green with four unwired modules:** a unit test proves a module WORKS. It does not
+prove anything USES it. Every one of the four had a full passing suite.
+
+---
+
+### V3-FINAL — wire-in + frontend build + verify (branch `v3/final-build-verify`)
+
+> Full detail: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-09-01 — V3-FINAL`).
+> Per-check verdicts and the still-remaining owner list: **[VERIFICATION_REPORT.md](VERIFICATION_REPORT.md)**.
+
+**Part 1 — the unwired modules**
+
+| Item | Status |
+|---|---|
+| `exportersFromEnv` on the live path (P5 DoD 2d) | ✅ **DONE.** Resolved once at boot; default is a bounded in-memory replay buffer (no network); Langfuse/Helicone fan out beside it from env. `/metrics` reports exported/retained/dropped and the last trace's cost. Test asserts 0 before a run, 1 after. |
+| `/health.warmedUp` honest (P5 DoD 1e) | ✅ **DONE.** Three real API tasks — `mongo-connection` (required), `shared-redis`, `qa-dependencies` — registered from an injected, testable module at the composition root. The Postgres schema round trip that was paid inside the first `/ask` is now paid at boot. |
+| `createVersionedBlackboard` on the live fan-out (P5 DoD 2e) | ✅ **DONE.** The running state IS the log; the supervisor's read is recorded against the version it saw with the bounded-selection count. `maxVersions` derived, clock injected, history byte-identical across runs. |
+| `createSpeculator` in the orchestrator (P5 DoD 1d) | ✅ **DONE.** Stages DECLARE (`StageSpeculationSource`), the orchestrator launches. RAG's chunk plan is built during synthesis's provider wait — **the disk pass happens once, not twice** — and the rag slice is byte-identical with and without. **Two real bugs in the unwired module fixed:** a queued task was invisible to `claim`, and settle did not drain the queue. |
+| `Span.recordUsage` + `pricing` + the wallet bug | ✅ **DONE** (beyond the brief; found by the audit). Cost was structurally $0.00 for every run, and `budget.record` sat after the grounding check — so a rejected completion was charged by the provider and never by us. Measured on the retry path: **3 paid attempts, $31.50, recorded three times.** |
+
+**Part 2 — the frontend**
+
+| Item | Status |
+|---|---|
+| Marketing site (paper/light): nav + status pill, hero + mesh + ticker, 01 Resolve, 02 Grounding, 03 Numbers, CTA, footer | ✅ **BUILT**, wired to real analysis output. Four em-dashes with their reasons when nothing is analysed. |
+| Workbench (dark): entry, resolving, 01 SYSTEM · 02 EXPLORE · 03 IMPACT · 04 DOMAINS | ✅ **BUILT.** Tabs appear only once a result exists. |
+| Deterministic derivations (lanes, edge classes, hop tiers, API reachability, test reachability, entry-probable) | ✅ **ADDED HERMETICALLY** — `apps/web/src/lib/architecture.ts`, 35 tests. |
+| Domain lanes surfaced as INFERENCE | ✅ **ADDED.** `AnalysisResult.ai.domains` — bounded, re-grounded, titles derived from real paths. Labelled inferred three times on TAB 04. |
+| Measured chrome facts | ✅ **ADDED.** `/api/meta` + a measured per-process p50 with its scope and sample count. |
+| Architectural VIOLATION rules | ✅ **OWNER-DECIDED, then built.** Two rules: UI→platform direct, API skips domain. No third. The legend key is omitted when neither fires. |
+| "TESTS THAT COVER IT" | ✅ **OWNER-DECIDED, then built.** Relabelled to **TEST FILES THAT REACH IT** — role=test files reaching it by import, with the nearest hop count, and the caption says "by import reachability, NOT coverage". |
+| The mock-data path | ✅ **REMOVED.** `PublicRepoInput`'s "Use Mock Data Instead" button loaded fabricated modules and metrics into every view; the fixture moved to `src/test/fixture.ts`. |
+| Dead code from the rebuild | ✅ **REMOVED.** 5 ui primitives, `graphView`, `pipeline`, `dashboard`, `analysisNormalizer`, `types/web`, plus the `react-force-graph-2d` and `zustand` dependencies. |
+
+**Part 3 — verification**
+
+All nine checks in `VERIFICATION_REPORT.md`. One finding fixed in-pass: the Arena's citation verifier
+had no consumer and `@codeflow/eval` kept its own copy, so V3-P0 §0.5's stated benefit was not true.
+The RULE (not the async wrapper) is now shared.
+
+**Gates:** typecheck ✅ (exit 0) · lint ✅ (exit 0) · **1336 tests** ✅ (1207 → 1336, **+129**) ·
+build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval check ✅
+
+### V3-P4 — bounded agent fan-out + test-time compute (branch `v3/p4-agent-fanout`)
+
+> Full detail, every measurement and six flagged judgment calls:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P4`).
+
+- **Parallelism is EARNED.** Five specialists over "the repo" would be five agents reading the same
+  files and reporting overlapping paragraphs — parallel in wall-clock, redundant in content. The
+  fan-out is over COMMUNITIES, which modularity guarantees are low-coupling, so per-community work is
+  genuinely independent and the results genuinely compose. The five lenses (architecture, data-flow,
+  security, api-surface, dependency-risk) are five different QUESTIONS, which is what lets a
+  supervisor compose them. Specialists are given deterministic graph FACTS, not file contents: the
+  graph already knows the imports, calls, cycles, symbols and routes, and handing those over is
+  cheaper, more reliable, and makes every claim checkable.
+- **Orchestrator context does not grow with worker count — measured.** 1/3/12/60 communities produce
+  5/15/60/300 findings and supervisor prompts of 417/667/**668**/**668** tokens. Findings are
+  individually bounded and the supervisor reads at most `SUPERVISOR_MAX_FINDINGS`, selected
+  ROUND-ROBIN across communities — a plain importance sort would let one loud community eat the cap
+  and leave the supervisor synthesising one corner while believing it saw everything. The FULL list is
+  still kept for the report; the bound applies to the prompt.
+- **Genuinely parallel — observed, not timed.** `peakConcurrency` comes from a counter around each
+  call, because a wall-clock comparison is flaky on a loaded machine and can pass by accident. The
+  wall-clock number is reported too: **496ms → 126ms (3.9×)** over 15 jobs. `mapWithConcurrency` is a
+  worker POOL, not batches, since batching idles the pool behind one slow call per batch.
+- **N-times cost only on the routed-hard tail.** Routing is deterministic and free — four clamped
+  difficulty signals with STATED, uncalibrated weights, and an edgeless community scores 0 on coupling
+  rather than 1 (dividing by zero and calling it cohesion would invent a signal from missing data).
+  Two ceilings: `MAX_HARD_COMMUNITIES` bounds the N-times spend per run, `FANOUT_MAX_COMMUNITIES`
+  bounds coverage — and what was dropped is REPORTED, because a silent cap reads as "covered
+  everything". Measured at **0% overhead** with nothing hard and **33%** with one hard community of
+  four. Sampling stops on a refusal; the scorer is exact and free, because a judge per candidate on
+  top of an N-times bill would be unaffordable and a varying scorer would make the winner
+  unreproducible.
+- **The phase gate, four checks per specialist:** input safety (own community only, bounded, sorted),
+  schema (rejects rather than coerces — a headline coerced to `""` reaches the supervisor as a bullet
+  that looks like a fact), grounding **to the community** (stricter than "in the graph", because a
+  specialist citing another community's file has left its evidence), and budget (exhaustion skips the
+  remaining lenses rather than failing the run — four lenses beat none). **Refusal is first-class with
+  a reason**, since treating "nothing to report" as failure pushes a model toward inventing findings.
+- **Agents are AI LEAVES.** The spine is computed before any agent runs and is read-only; asserted
+  byte-identical across a fan-out, and the ROUTING is asserted identical across two runs even though
+  the specialists are not. The blackboard is sorted before posting, so entry order never depends on
+  scheduling.
+- **The Synthesize contract survives intact.** Grounding, cache-before-budget, and "throws only when
+  nothing is grounded" all behave as the single-shot stage did. The cache is now keyed on the community
+  PARTITION as well as the SHA (a different partition is a different fan-out at the same commit), it
+  stores the OUTCOME because there is no single completion to cache, it re-grounds on read, and it
+  never caches a fallback — a transient supervisor failure must not freeze the degraded answer in for
+  the whole SHA. A DETERMINISTIC FALLBACK exists because a fan-out that spent five calls and returned
+  nothing would be strictly worse than the one call it replaced; it is honest about being one.
+- **The path is chosen at RUN time**, because `metrics.clusters` does not exist until stage 6 while
+  the worker assembles its stage list before the pipeline starts. The adaptive stage keeps the same
+  `id`/`kind`/`owns`, or stage 7 would silently leave the orchestrator's coverage partition. The
+  single-shot path is KEPT for graph-less cached analyses, and the fan-out is opt-in via
+  `FANOUT_SYNTHESIS` on cost shape (5N+1 calls vs 1).
+
+### V3-P3 — agentic Q&A + memory (branch `v3/p3-agentic-memory`)
+
+> Full detail, including the `LlmClient` audit finding and every judgment call:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P3`).
+
+- **`@codeflow/agents` (new, 91 tests).** A bounded ReAct loop over a plain completion, because the
+  audit found `LlmClient` has **no native tool-calling** and its two adapters expose tool use
+  differently — changing that contract before an agent existed would have been the wrong order. The
+  cost of prompted tool-calling (less reliable output, hence a forgiving parser and a bounded retry)
+  is recorded in the code, and native is a P5 upgrade behind the SAME `AgentTool` interface.
+- **Bounds in code, not in the prompt.** `AGENT_MAX_TURNS` (6) and `AGENT_MAX_TOOL_CALLS` (10) are
+  hard caps; a hallucinated tool name counts against the budget (or a model inventing names loops for
+  free); observations are truncated with the truncation STATED; the daily budget is checked before
+  every turn and exhaustion keeps the turns already paid for. When the tool budget runs out the agent
+  gets one FINAL tool-free turn — a loop cut off mid-thought has spent its whole budget for no answer.
+- **Honest-no-answer survives an agent, three ways.** The similarity floor lives inside `search_code`
+  with **no model-settable argument**; grounding is enforced afterwards against evidence a tool
+  actually returned (existing in the repository is NOT evidence); and **`answered: true` with no
+  grounded evidence is DOWNGRADED to a refusal**, so a model answering from pre-training cannot
+  produce an answered response.
+- **Exact graph tools.** `find_references` LABELS direction (imports vs imported-by is the confusion
+  V3-P2's flywheel mines as a hard negative); `get_callers` states its honest limit rather than
+  presenting an approximate answer as exhaustive; `get_blast_radius` uses `@codeflow/graph`'s own
+  traversal so the agent cannot drift from the product on what "affected" means; `symbol_search`
+  returns exact matches ALONE when there are any. No tool ever invents a fileId, which is what makes
+  file-level citations trustworthy by construction.
+- **`@codeflow/memory` (new, 45 tests).** Session memory (turns including REFUSALS, retrieved-chunk
+  history, resolved entities most-recent-first) and repo memory (a small sorted SNAPSHOT per commit —
+  storing whole results per SHA would re-introduce, per commit, the document-size problem V3-P2 just
+  solved). Everything BOUNDED, with the bounds shared by every store and applied on read as well as
+  write: two implementations trimming differently would mean the same conversation behaved differently
+  depending on whether Redis happened to be configured. A session is scoped to ONE analysis, so a
+  follow-up cannot resolve "it" to a file from another repository. The Redis store FAILS SOFT and
+  reports — a lost session costs context for one question, which beats a 500.
+- **Follow-ups resolve in code, deterministically.** An exact node, a UNIQUE path suffix (models
+  shorten paths), or the last remembered file — and an AMBIGUOUS suffix is refused, because silently
+  answering about the wrong file is worse than not answering.
+- **Context hygiene (task 3) ships with the loop, because it IS the loop's bounds.** Tool descriptions
+  are prompt text paid on every turn whether called or not, so curating them is the largest lever —
+  and a quality lever too, since a model offered six tools picks worse than one offered three. Rules
+  are deterministic: no model decides what a model may see. Metering is per PILLAR because a total
+  only says the prompt grew, while the breakdown says whether that is a memory-bounds bug, a routing
+  bug, an agent looping, or retrieval working as intended; the pillars SUM to the total.
+- **Wired ADDITIVELY.** `AgentAnswer` is a superset of `RagAnswer`, so the web app is untouched. The
+  single-shot path stays as the fallback for an analysis with an index but no GRAPH (a pre-V3-P1
+  cached result), where the agent's tools would return nothing and it would burn turns finding out.
+  `sessionId` is runtime-validated and REJECTED rather than sanitised, because it becomes a store key.
+
+### V3-P2 — retrieval (branch `v3/p2-retrieval`)
+
+> Full detail, including the reranker dependency probe and every judgment call:
+> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P2`).
+
+- **`@codeflow/retrieval` (new, 155 tests).** Owns `VectorStore`, `ChunkTextStore`, `Reranker`, the
+  embedding-space homogeneity guard and the cosine primitive. Depends only on `shared-types` +
+  `config`; **sits BELOW `@codeflow/analyzers`**, which is why `cosineSimilarity`, `retrieve` and
+  `assertEmbeddingSpace` moved DOWN into it — the stores and MMR need them, and keeping them in
+  analyzers would have made the dependency a cycle. Analyzers re-exports all three, so there is
+  still exactly ONE definition of each and every existing import path resolves.
+- **The index left the document (ledger #8).** A 1024-dim vector is ~8KB of JSON per chunk, so a
+  mid-sized repo exceeded Mongo's 16MB BSON limit and every read of an analysis dragged the whole
+  index across the wire. `Rag` is now metadata + a `store` reference; a test walks the persisted
+  slice AND `JSON.stringify`s it to prove no vector survives. An index with no `store` is PRE-P2 —
+  unreadable, not empty — and is refused with a rebuild instruction, because answering from zero
+  chunks would look exactly like an honest refusal.
+- **In-memory vs prod, deliberately.** The in-memory pair is not a stub: it is what the suite and
+  the eval run against, and it is an EXACT cosine scan, so a ranking difference against pgvector is
+  attributable to ANN recall rather than to different maths. pgvector puts **the dimension in the
+  table name** (`codeflow_vectors_1024`), because `vector(n)` is fixed-width and that makes Postgres
+  itself enforce homogeneity. Reached through an injected `SqlClientLike`, so the suite asserts the
+  real emitted SQL against a recording fake — no container, no port, no cleanup.
+- **AST-enriched embeddings.** `embedTextFor` prepends path + path-words, language, scope chain,
+  symbol, signature and docstring to what is EMBEDDED, never to what is STORED. `deriveEnrichment`
+  is a POST-PASS over the planned ranges, so V3-P1's interval-cover is untouched and chunk ids
+  cannot move — the task's acceptance condition, held by construction. `InventorySymbol` gained the
+  `signature` the parser has produced since V3-P1 and Inventory was discarding. Measured
+  hermetically: **recall@3 0.500 → 1.000, MRR +0.333, 3 questions won, 0 lost** — with a
+  bag-of-words embedder, so it establishes the mechanism and the direction, not the magnitude.
+- **Hybrid query path:** BM25 (deterministic, code-aware tokenizer, IDF floored at zero) fused with
+  the vector arm by **RRF over RANKS** (a cosine and a BM25 score are not comparable quantities),
+  then a reranker, then MMR for diversity. The **refusal floor is unchanged** — it reads the vector
+  arm's real cosine BEFORE any rerank, and a test asserts every returned chunk's fused score is
+  below the floor that admitted it. A reranker failure degrades to the fused order and RECORDS it.
+- **No cross-encoder dependency, on probe evidence.** `onnxruntime-node` installs at **211 MB** with
+  a binary-downloading postinstall; transformers.js adds `sharp`; fastembed is native NAPI;
+  `onnxruntime-web` is WASM-clean but needs a tokenizer that is itself NAPI. So
+  `createLexicalOverlapReranker` ships (keyless, in-process, zero-dep, and flagged
+  `kind: "deterministic"` in the data so no report mistakes it for a cross-encoder), and
+  `createCrossEncoderReranker` is already tested behind an injected `CrossEncoderSession`.
+- **The synthetic-data flywheel.** `@codeflow/arena` generates guaranteed-correct Q&A from the code
+  property graph — **labels from the oracle, never from a model** — with graph-shaped hard negatives
+  (reverse-direction imports, upstream dependencies, same-community non-callers) and GENERATED
+  negative controls. The oracle run as the agent over its own set scores 1.0 on every task, which is
+  the flywheel's self-check. Generated sets are deliberately NOT written into
+  `packages/eval/datasets/`: that directory's value is that a human stands behind every question.
+- **Dev infra:** `pgvector/pgvector:pg16` added to `docker-compose.yml` (dev-only), `POSTGRES_URL`
+  documented for both processes. UNSET is a supported single-container mode; configured-but-
+  unreachable is reported as a degradation and logged at startup by the worker and the API.
+
+### V3-CLEANUP — dead code + orphan files (branch `v3/cleanup-deadcode`)
+
+> Full audit + every verdict with its evidence: **[CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md)**
+> (committed before any deletion, so the reasoning is reviewable separately from the diffs).
+
+- **Method, not vibes.** An import-graph orphan sweep over all 220 tracked `.ts`/`.tsx` files —
+  counting a reference from a test, a `package.json` script, a tsconfig path, a compose file,
+  a Dockerfile or a CI workflow as "referenced" — plus `tsc --noUnusedLocals --noUnusedParameters`
+  per package run as a REPORT (the flags were not committed), plus a targeted grep per candidate.
+- **Removed** (6 commits, full gate after each, none reverted): `packages/exports` (`export {};`,
+  zero importers) + its tsconfig paths entry · `apps/card-action` (placeholder, zero references,
+  and `V3_PLAN` §5 redirects that work to `apps/mcp`) · `PRReportModel` + `ShareModel` (never
+  imported ⇒ their collections were never read or written) · six unreferenced web files, two of them
+  placeholders superseded by shipped work (`GraphLegend`/`GraphToolbar` vs the real 2D graph's own
+  legend and controls) · 71 lines of CSS orphaned by those removals plus the last ledger-#15
+  remnants · the `Citation`/`ProjectSummary` types V3-P0 orphaned · 11 dead symbols.
+- **Two of the removals were my own V3-P0 leftovers**: the `Citation`/`ProjectSummary` types (orphaned
+  when `AiAnalysis.projectSummary` went) and `llmBudgetSchema`/`LlmBudgetModel` (orphaned when the
+  budget moved to Redis). Worth naming — a phase that removes hollowness can leave its own behind.
+- **Kept, with the reason recorded so it is not re-litigated.** `card/` is a **published GitHub
+  Action** (`action.yml` + a documented external-workflow consumer) whose `lib/analyzer.js` reads
+  `legacy/index.html` at runtime — an external consumer the hermetic suite cannot see, so deleting it
+  would be an external break. `legacy/index.html` is load-bearing twice (4 legacy tests parse it, and
+  `card/` reads it). **`docker-compose.yml` is not a duplicate** of `docker-compose.app.yml` — it is
+  dev-infra only (mongo + redis), which is what `pnpm dev:api`/`dev:worker` and the deferred wire
+  smoke need. `mockAnalysis.ts` backs 8 test files and a live demo button. `apps/local-cli` is
+  referenced by the root `dev:local` script. The commented-out `require` in the parity corpus is a
+  deliberate fixture proving the regex parser hallucinates imports from comments.
+- **Delta:** tracked files **331 → 318**; **−282/+17** lines (net −265); `styles.css` 1278 → 1207;
+  two fewer pnpm workspace packages (so two fewer invocations per `pnpm -r` run); 1.96 MB of
+  already-gitignored working-tree junk (`tmp/`, `temp/`, `codeflow.zip`) cleared off disk with zero
+  repo change. `tsc --noUnusedLocals --noUnusedParameters` now reports **zero** unused locals or
+  parameters repo-wide (was 11).
+- **Nothing broke.** Test counts are identical before and after — see Verification below.
+
+### V3-P0 — Foundations + Arena (branch `v3/p0-backfill-foundations-arena`)
+
+> Ran **AFTER** V3-P1, out of plan order and by design: P1 did not depend on anything P0 builds, so
+> it shipped first. The only cost was P1's eval acceptance, which had no golden set to measure
+> against — paid back here. Branched off `v3/p1-treesitter-cpg`.
+
+**Cost is MEASURED now, not estimated.**
+- **One token utility** (`analyzers/src/util/tokens.ts`) replaces three identical
+  `Math.ceil(text.length/4)` copies. It draws the line that mattered: `estimateTokens` is ADMISSION
+  CONTROL only (you must guess before calling) and drives the deterministic chunk plan; `TokenUsage`
+  is the real cost read back afterwards, and the only thing a paid path gives `budget.record()`. The
+  4-chars/token rate is unchanged on purpose — it moves RAG chunk boundaries, so tuning it would
+  change every embedding. Grep confirms no `length / 4` anywhere else.
+- **No local tokenizer, deliberately.** This talks to Anthropic, Gemini and Voyage, whose
+  vocabularies differ, so one local tokenizer is precisely *wrong* for two of the three. The provider
+  bills us and reports what it billed.
+- **Provider usage read-back** (resolves ledger 14(b)): `LlmClient.complete` → `{text, usage}`,
+  `EmbeddingClient.embed` → `{vectors, usage}`; all four fetch adapters read the real counters
+  (Anthropic input/output + cache read/creation, Gemini `usageMetadata`, Voyage `total_tokens`),
+  parsed defensively so a missing counter cannot book 0 or NaN against the wallet.
+  `TokenUsage.measured` is the honest half — **the Gemini batch-embed endpoint reports no usage**, so
+  that one path is an estimate, says so, and is logged.
+- **ONE shared Redis budget** (resolves the #9/14 split): the worker counted in Mongo and the API in
+  process memory, so "the global daily ceiling" was two ceilings blind to each other. Both now
+  decrement one Redis counter per (UTC day, billing unit) — per-unit because chat and embedding
+  tokens are priced differently and exhaust independently. `check` **fails OPEN** on a Redis error
+  (explicit, logged): a blip taking the AI surface down is worse than briefly overspending a margin.
+  The Mongo handle was DELETED rather than kept as a second implementation of one counter.
+  `@codeflow/analyzers` stays dependency-free — it declares `BudgetRedisLike`, the apps inject
+  `ioredis`.
+- **Prompt caching**: `LlmCompletionRequest.cachePrefix` → an Anthropic `cache_control` breakpoint /
+  a Gemini leading `systemInstruction`. A hit is READ BACK as `cacheReadTokens`, never assumed. Only
+  SYSTEM_PROMPT is marked, because the per-repo facts are already covered by the SHA-keyed completion
+  cache — zero tokens beats a discount.
+
+**Degradation is visible, and the prod fallbacks are real stores.**
+- **Redis `RateLimitStore`** (resolves 14(c)) — the prod swap the interface has promised since Guard 4;
+  the limit now holds across replicas and survives a restart. Window derived from
+  `floor(now/windowMs)`, so INCR+EXPIRE stays atomic with no Lua. Also fails open.
+- **New `RunMode`** ("full" | "deterministic-only") + typed `DegradationNotice[]`, on BOTH the job and
+  the RESULT so the scope survives a reload and a cache hit. A no-key run legitimately reports
+  `runStatus: "completed"` — every stage that existed ran — and `runMode` is what says it was not a
+  full analysis. Deliberately NOT a value on `AnalysisMode` ("public_hosted"): access mode and
+  delivered scope are different axes.
+- **The silent Mongo fallback is surfaced.** The API falls back to per-process in-memory Maps when
+  Mongo is down; that stays (it keeps the service answering) but is now reported as a
+  `mongo-unavailable` notice naming MONGO_URI, computed at READ time because it is a property of the
+  process right now, not of the job record.
+- **Web**: the existing honest banner is unchanged; `uncoveredDegradations` renders only what the
+  banner does not already explain, so a dead database gets its own notice while missing keys and
+  budget exhaustion are not said twice.
+- Kept from the Aug-28 partial (not redone): `skippedStages`, the cache-hit-safe `skippedAiStages()`,
+  the env-var-naming warnings, the `"skipped"` visual bucket.
+
+**No producerless slices.** Opposite verdicts, decided by whether a consumer exists:
+- **`issues` is now PRODUCED** (`pipeline/issues.ts`, derived from Analyze's metrics at assembly —
+  the same no-stage-owns-it pattern as `summary`). It was read in four places by the web's
+  `analysisNormalizer`, so an always-empty list was rendering as a finding of "no problems". Cycles
+  by length, structural hubs as a SHARE of the repo (and only once the repo is big enough for a share
+  to mean anything), coupling by absolute degree, and a mostly-disconnected graph collapsed into ONE
+  dependency issue. **No `category: "security"` issue is ever emitted** — no security analysis is
+  performed, so `summary.securityIssues` is a real count that is structurally always 0.
+- **`aiProjectSummary` was REMOVED** from the type: no producer, no consumer, and `Synthesis.summary`
+  already answers "what is this project". A declared-but-unwritten field is worse than an absent one.
+  Reinstate it *with* its producer — the intent is recorded on `AiAnalysis`.
+- `summary` already had its producer from Aug 28 (`deriveSummary` + `scoreHealth`); untouched.
+
+**The eval grades the ANSWER now, and the golden set is real.**
+- **Answer-path scoring**: `citationValidity` (does each citation's file+line span sit inside a chunk
+  the answer actually retrieved — an independent check that production grounding held),
+  `citationRelevance` (cited real code, but the RIGHT real code?), and refusals split JUSTIFIED vs
+  UNJUSTIFIED and counted separately, because an honest refusal and a real miss are different
+  outcomes that one "answer rate" would hide.
+- **Calibration-gated judge**: `calibrateJudge` reports Cohen's **kappa**, not raw agreement — with
+  19/20 labels "faithful", a judge that always says faithful scores 95% while carrying zero
+  information, and kappa scores it 0. `judgeIsGateable` needs sample size AND kappa AND a
+  confidence-interval lower bound. `runEval` reports faithfulness always and **refuses to fail a
+  threshold on an uncalibrated judge**. No human labels ship yet, so it is advisory by construction.
+- **Real golden set**: `datasets/chalk.json` (JS, 8q) + `datasets/requests.json` (Python, 10q), 14
+  with line-range truth. Both repos were **cloned at the pinned SHA and read** — every expected file
+  and line range verified against the real file, nothing recalled. Each records PROVENANCE, including
+  that the numbers measure the V3-P1 tree-sitter pipeline and are NOT comparable against a
+  pre-V3-P1 regex-parsed run.
+- Both carry a **negative control** (a question the repo cannot answer), which exposed a real bug:
+  `aggregateRag` would have scored a zero-target question as recall 0, penalising the exact refusal
+  behaviour the control tests. Negative controls are now excluded from recall/MRR (and counted) and
+  scored on the answer path instead.
+- **`assertDatasetShape` is real runtime validation** at an untrusted file boundary: full-40-hex
+  commit pinning, schema version, duplicate ids, POSIX paths, non-inverted 1-based ranges. Each check
+  exists because getting it wrong yields a silently WRONG SCORE, not a crash.
+- **CI split**: `ci.yml` gains a keyless `eval check` (validation + determinism + both parser
+  families) beside P1's parity step; the scored run moved to a manual-dispatch `eval-scored.yml` with
+  an approval environment, a concurrency lock, and `fail-on-threshold` defaulting to **false** —
+  thresholds are still placeholders and gating on uncalibrated numbers is what this phase prevents.
+
+**New package `@codeflow/arena` — the verifier / environment layer (gates Phase 4).**
+- `TaskSpec` / `Sandbox` / `AgentHarness` / `Verifier` / `Reward` as typed interfaces + a contract
+  test (repo convention; no zod, and no runtime validation — an in-process sandbox built from an
+  already-validated result is not an untrusted boundary).
+- A `Sandbox` is a FROZEN result at a pinned SHA, read-only: an agent must not change the world it is
+  graded in. Loading is injected so production reuses the existing SHA-keyed cache; null means "not
+  cached" (never "analyze on demand" — that would make grading cost money and vary by cache state);
+  a SHA mismatch is REFUSED rather than silently compared.
+- **Graph oracle — exact, deterministic, zero LLM calls**: imports-of, who-calls, blast-radius,
+  entry-points, cycle-through. `who-calls` is only possible because of V3-P1's `graph.cpgEdges`;
+  before the CPG the only honest answer was "we know who imports it", and the tests pin the
+  distinction with a file that is imported but never called through. `blast-radius` reuses
+  `@codeflow/graph`'s own traversal so oracle and product cannot drift on "affected".
+- The oracle also implements `AgentHarness`, making it **self-checkable**: run it as the agent, grade
+  it with itself, 1.0 on every kind is the minimum bar. If that round trip fails, derivation and
+  comparison have drifted and every Arena score is suspect.
+- **The three grounding passes** are wrapped as reusable verifiers so the eval and the Arena share one
+  implementation. They stay enforced in production where they belong — grounding is enforced at the
+  point of production, not merely measured after.
+- `runArenaTask` requires EVERY applicable verifier to pass, not the mean to clear a bar: a correct
+  answer citing a nonexistent file is not 80% correct, it is ungrounded. No verifier ran ⇒ NOT a pass.
+
+**Still hermetic.** No test touches Redis, Mongo, a provider, or the network. The Redis stores are
+driven by injected fakes; in-memory remains the default everywhere.
+
+### V3-P1 — tree-sitter CPG + communities (branch `v3/p1-treesitter-cpg`)
+
+> ⚠️ **Entry gate was NOT satisfied and this is unresolved.** V3 Phase 0 is not green:
+> `packages/eval/datasets/` is EMPTY (no golden set, §0.4), `packages/arena` does not exist (§0.5),
+> `analyzers/src/util/tokens.ts` does not exist (§0.1). The Aug-28 commits on `phase1-rebuild` cover
+> parts of §0.2/§0.3 only. Phase 1 shipped in full anyway (its work is independent), but the
+> **scored-eval "retrieval ≥ Phase 0 baseline" comparison could not be run** and is OWED —
+> ledger #17. The parser accuracy claim below rests on a different, hermetic measurement instead.
+
+- **Parsing is tree-sitter now, with the regex parsers as a per-language FALLBACK.**
+  `@codeflow/parsers/src/treesitter/` — `runtime.ts` (wasm load), `ast.ts`, `jsLike.ts`, `python.ts`,
+  `parseTreeSitter.ts`, `cpg.ts`. Dep: **`web-tree-sitter` + `@vscode/tree-sitter-wasm`** — chosen
+  because the official grammar packages carry `"install": "node-gyp-build"` (a native compile in
+  `node:20-slim`) while this one is pure wasm assets with no install script, and because
+  `tree-sitter-wasms@0.1.13`'s ABI-14 grammars do not load under web-tree-sitter 0.26 (probed).
+  Grammars: javascript / typescript / tsx / python; `.jsx` uses the JavaScript grammar (it parses JSX
+  natively). The wasm locator is **injectable** and `node:module` is imported lazily, so the same code
+  runs in a browser — local-first groundwork at no cost.
+- **`ParserAdapter` is unchanged.** `parseFile` stays SYNCHRONOUS; only grammar loading is async
+  (`initTreeSitter()`, idempotent, shared). Inventory + Connect `await registry.ready()` before their
+  fan-out. Inventory/Connect input and output shapes did not move.
+- **Coverage never regresses, and degradation is visible.** Falls back to regex when: no grammar for
+  the language, the grammar failed to load, or the file exceeds `TREE_SITTER_MAX_BYTES` (new
+  `@codeflow/config` guard, 2 MB — a **byte** ceiling, never a clock, because a time-based bail-out
+  would make the deterministic spine non-deterministic). `ParsedFile.parserVersion` reports the engine
+  (`treesitter-v1` / `parser-v1`).
+- **Parity-or-better is MEASURED, hermetically** — new `@codeflow/eval/src/parity/` harness scores BOTH
+  engines against **6 authored ground-truth cases**. Micro-averaged: symbols regex P 88.9% / R 59.3% →
+  tree-sitter **P 100% / R 100%**; imports regex P 94.7% / R 90.0% → tree-sitter **P 100% / R 100%**.
+  Real, hand-confirmed regex gaps: multi-line imports, `export default function X`,
+  `export const X: T = () => …`, `async def f(...) -> T:`, class methods (regex found **none** for
+  JS/TS), enums, top-level consts — plus two *fabricated* edges from commented-out imports. Runs with
+  **no keys** (`pnpm --filter @codeflow/eval run parity`) and is a **CI step**. Note: the harness's
+  `coreSymbols` dimension is a **recall floor only** — its truth set is partial by design, so its
+  precision is meaningless and explicitly not gated (`PARITY_GATES`).
+- **Deliberately better output** (accepted, covered by the cache bump): symbols carry a real `lineEnd`
+  (tightens RAG chunk spans — the stage already honoured `endLine`), class methods are emitted, and
+  top-level plain consts become `variable` symbols. `ANALYZER_VERSION` **1.0.0 → 1.1.0** because that
+  changes `symbolCount` → the declared `complexity` proxy, so cached analyses must miss.
+- **Connect builds a CODE PROPERTY GRAPH** from one tree-sitter pass per source file
+  (`extractCpgFacts`), replacing `registry.parseFile` + its own re-export regex. New on the
+  Connect-owned `graph` slice: **`cpgEdges`** (call / extends / implements, aggregated per
+  `(from, to, kind, symbol)` with an occurrence `count` + first line), **`routes`** (Express / Flask /
+  FastAPI), **`cpg`** (provenance: `treeSitterFiles` / `fallbackFiles` / `enriched`).
+  `fileId === repo-relative POSIX path`; both new lists are uncapped and deterministically sorted.
+- **`cpgEdges` is a SEPARATE list from `edges`, on purpose.** `metrics.perFile.fanIn`/`fanOut` are
+  contractually "files that directly import this one", so folding call edges into `graph.edges` would
+  silently redefine every existing metric and every UI reading them. `edges` keeps its exact old
+  meaning; callers that want the richer graph opt in via the new `buildCodePropertyGraph`
+  (`buildImportGraph` is the dependency-only view Analyze still uses). `apps/web` needed **no change**.
+- **Honest limits, written into the types.** A `cpgEdge` resolves its target through the file's OWN
+  imports, so it always *refines* a relationship the import graph already has — it never invents a
+  dependency between two files with no import between them; what it adds is **strength and kind**,
+  which is what clustering consumes. Routes are recorded only for a string-literal path starting with
+  `/`, and labelled `express` only when the receiver is route-shaped, so `cache.get('/tmp/x')` is
+  recorded as `unknown` rather than claimed as a route. A file with no grammar still yields its imports;
+  `graph.cpg` counts it as un-enriched instead of letting it look call-free.
+- **Community detection (Louvain) — `metrics.clusters`, the ONE canonical field.**
+  `@codeflow/graph/communities.ts` (local moving + aggregation, weighted, undirected projection);
+  `RepoClusters` carries algorithm, seed, resolution, **modularity**, count, per-node assignments and
+  per-cluster files/size/internal+external weight. Absent (not a faked empty partition) for a
+  node-less graph.
+- **DETERMINISTIC by construction — no randomness at all.** Classic Louvain shuffles the visit order
+  with an RNG, which would poison the SHA-keyed cache. Instead: a **seeded** xorshift32 Fisher–Yates
+  over the **sorted** node ids (default seed 1); gain ties break to the lowest community index, never
+  to hash-map order; communities are relabelled **canonically** (size desc, then lowest member fileId);
+  weights rounded at 1e-10. Verified byte-identical on re-run, on reversed node/edge input order, and
+  on a rebuilt graph with different insertion order — mirroring the existing Analyze determinism test.
+- **Clusters partition the CPG UNION** (imports + weighted calls/inheritance) because coupling for
+  clustering genuinely includes calls, while `fanIn`/`fanOut` stay import-only. That asymmetry is
+  deliberate, documented on both types, and directly tested. Modularity is reported as **standard,
+  unscaled** Newman–Girvan Q so it stays comparable across resolution settings.
+- **Every existing graph algorithm still works on the richer graph** — centrality, cycles, isolation,
+  coupling, blast radius, traversal, serialization; and `TraversalOptions.includeTypes` can still
+  restrict traversal to dependency edges only. Asserted directly.
+- **SCIP: deliberately NOT built** (the phase spec marks it optional and non-blocking).
+  `scip-typescript`/`scip-python` need a real compile of the *target* repo — i.e. installing an
+  untrusted repo's dependencies — plus a protobuf decoder, and cannot be tested hermetically. A flag
+  over an unimplemented interface would be dead code. Tree-sitter heuristics are the default and the
+  only implementation. Ledger #18.
+- **Docker is PROVEN this time** (P6's honest boundary is now closed for these images). All three
+  images build. `pnpm deploy --prod` puts `@vscode/tree-sitter-wasm` in the `.pnpm` store rather than
+  top-level `node_modules`, so the check was run **inside** the pruned `node:20-slim` runtime image:
+  `READY: true`, `LOADED: javascript,jsx,typescript,tsx,python`, `FAILED: []`,
+  `parserVersion: treesitter-v1`, class + method + import extracted correctly — **with no native
+  toolchain in the image**.
+- **New contract surface:** `CpgEdge`, `HttpRoute`, `HttpRouteMethod`, `CpgProvenance`, `RepoCluster`,
+  `RepoClusters`; `RepoMetrics.clusters?`; `RepoGraph.cpgEdges?`/`routes?`/`cpg?`;
+  `GraphEdge.weight?`; `GraphEdgeType` and `DependencyEdge.dependencyType` gain
+  `call`/`extends`/`implements`. All additive.
+
 ## Verification
 
-`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm -r test` all pass: shared-types 3,
-analyzers 160 (+14: retrieve hoisted + answerQuestion isolation/grounding/no-answer/homogeneity/
-cache-before-budget/embed-key), eval 18 (retrieve tests moved to analyzers; still green on the
-hoisted primitive), graph 16, parsers 10, api 26 (+5 Ask endpoint), web 47 (+6 AskRepo), worker
-14 — confirmed **hermetic** (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
+`pnpm -r typecheck`, `pnpm -r lint`, and `pnpm test` all pass — **955 tests** (V3-P4: 881 -> 955,
++74; V3-P3 before it: 742 -> 881; V3-P2: 526 -> 742): shared-types 3, graph 33, parsers 28,
+**memory 45**, **agents 164** (+73 fan-out, routing, blackboard, supervisor, stage contract),
+**retrieval 155**, **analyzers 234**, **arena 68**, **eval 109**, **api 42**, **web 60**,
+**worker 14** (+1 fan-out opt-in) — confirmed **hermetic** (the agent suites inject a SCRIPTED
+LlmClient whose entries can assert on the prompt they received, which is what stops those tests
+being tautological) (green with NO Mongo/Redis; in-memory stores + mock channel + mocked
 LLM/embedding + stubbed `fetch`/`EventSource` + **mocked `react-force-graph-2d`** (canvas never
 rendered in jsdom) throughout — zero real API/network calls/spend). NOTE: `pnpm -r test` (parallel)
 can OOM running all suites back-to-back with the heavier web env; run serially
@@ -540,6 +1088,34 @@ can OOM running all suites back-to-back with the heavier web env; run serially
 Legacy root tests
 (`node --test tests/*.mjs`): **25/25 green** — `codeflow-repo-smoke.mjs` (a CLI utility, not a test)
 now skips-with-reason + exits 0 instead of failing the default suite.
+
+V3-P1 additions to the gate: `pnpm --filter @codeflow/eval run parity` (the hermetic parser-parity
+report — **no keys**, now a CI step) is green with "tree-sitter is parity-or-better on every gated
+metric"; `docker compose -f docker-compose.app.yml config --quiet` is clean; and — unlike P6 — the
+Docker daemon WAS available, so all three images were actually built and the worker image was run to
+confirm all five tree-sitter grammars load inside the pruned `node:20-slim` runtime with no native
+toolchain. Still out of the hermetic gate (both need real keys, out-of-band): the **scored** `pnpm eval`
+run and the cross-process SSE/BullMQ wire smoke.
+
+V3-P0 additions to the gate: `pnpm --filter @codeflow/eval run check` — the keyless golden-set check
+(validation + byte-identical determinism + coverage of both parser families) — is a CI step beside the
+parity report. The worker + api images were rebuilt to confirm the new `ioredis` dependency did not
+break the `node:20-slim` runtime. The **scored** eval now has its own manual-dispatch workflow
+(`.github/workflows/eval-scored.yml`) with an approval environment and a concurrency lock; it stays out
+of the per-push gate because it needs real keys and spends money.
+
+V3-CLEANUP ran the FULL gate after every single removal commit (typecheck, lint, serial test, build,
+legacy `node --test`), so a reddened tree would have been caught and reverted at that commit rather
+than at the end — none was. At phase end all three Docker images (worker, api, web) were rebuilt, and
+the keyless `parity` + `check` CI steps and `docker compose config --quiet` are green.
+
+V3-P2 kept the same discipline: the full gate after each of the four task commits. `tsc
+--noUnusedLocals --noUnusedParameters` still reports **zero** unused locals/params repo-wide (one
+appeared mid-phase — `scoreQuestion`'s `k` became unused when retrieval moved out of the scorer — and
+was fixed by ENFORCING it, because a metric called recall@k must not depend on how many results the
+caller happens to pass). The hermetic guarantee needed defending once during this phase: a
+`createRetrievalStores` degradation test was attempting a REAL TCP connection (3.6 s per run), so the
+factory gained a documented `createClient` test seam and a test that asserts the seam is used.
 
 ## Not done here (by design)
 
@@ -612,12 +1188,20 @@ former blocker — is **DONE** this session).
 2. **Entry-point manifest source (Inventory + Orient).** Inventory re-reads `package.json` because
    `orientation.manifests` carries only `{ path, ecosystem }`. Fix = extend Orient's manifest capture
    to expose bin/main/exports, then point Inventory at the owned fact. Its own session.
-3. **`clusters`/modules metric.** `@codeflow/graph` has no clustering/community/connected-component
-   algorithm. Adding the algorithm there + the `RepoMetrics.clusters` field is its own session.
-4. **Delete the unwired `analysisProcessor.ts` reference.** Production-dead (worker runs
-   `runAnalysisJob`; nothing imports `processAnalysisJob` except its own test), superseded by Connect
-   + Analyze. 415 lines + a 207-line test — flagged in the cleanup audit as too big to fold into an
-   unrelated session; delete it (and its test) as its own small change.
+3. **`clusters`/modules metric. RESOLVED (V3-P1).** `@codeflow/graph/communities.ts` implements
+   **Louvain** (local moving + aggregation, weighted, undirected projection) and Analyze surfaces the
+   partition on the single canonical field `RepoMetrics.clusters` (`RepoClusters`: algorithm, seed,
+   resolution, standard Newman-Girvan modularity, count, per-node assignments, per-cluster
+   files/size/internal+external weight). **Deterministic by construction** - no RNG anywhere: seeded
+   xorshift32 permutation of the SORTED node ids, ties to the lowest community index, canonical
+   relabelling by (size desc, lowest member fileId), weights rounded at 1e-10; verified byte-identical
+   across re-runs and input orderings. Partitions the CPG **union** (imports + weighted
+   call/inheritance edges) while `fanIn`/`fanOut` stay import-only - a documented, tested asymmetry.
+4. **Delete the unwired `analysisProcessor.ts` reference. RESOLVED — it was already gone
+   (confirmed V3-CLEANUP).** The file and its test do NOT exist in this tree; `apps/worker/src/
+   processors/` holds only `pipelineJobProcessor.ts` + its test, and `git log --all` shows
+   `e46f859 chore: remove unwired analysisProcessor reference (ledger #4)`. This entry had simply
+   gone stale — the work happened, the ledger was never updated. Nothing to delete.
 5. **Real Anthropic adapter is integration-only.** `createAnthropicClient` (fetch-based, no SDK) is
    not unit-tested (tests mock the `LlmClient`); needs a manual/integration check with a real key.
    Token streaming to the UI is a separate P5 question. An **end-to-end smoke run** (real repo →
@@ -630,11 +1214,15 @@ former blocker — is **DONE** this session).
 7. **Synthesis prompt-selection sizes are fixed constants (P4 tuning).** The bounded prompt view uses
    top-30 keyFiles / top-10 impact / top-15 cycles / 1200-char README head. Revisit these against
    real large repos for cost/quality in P4 (they cap the LLM INPUT only; stored slices stay uncapped).
-8. **Result-slice vector size vs Mongo 16MB BSON limit (P4).** Vectors are stored inline in
-   `result.ai.rag.chunks[]`; on a large repo (many chunks × dim-1024 floats) this risks the 16MB
-   document limit. Fix: externalize vectors to a dedicated SHA-keyed collection (and/or quantize).
-   Deferred — flag, don't build now.
-9. **Ask-the-repo query path. ✅ RESOLVED (P18).** `answerQuestion` (retrieve → answer → cite,
+8. **Result-slice vector size vs Mongo 16MB BSON limit. ✅ RESOLVED (V3-P2).** Vectors and chunk
+   text are OUT of `result.ai.rag.chunks[]` and in `@codeflow/retrieval`'s stores (pgvector for
+   vectors, a keyed Postgres table for text), joined back by the unchanged chunk id. `Rag` keeps only
+   the metadata a citation needs, so the slice now grows with the chunk COUNT and no longer with the
+   embedding dimension. Asserted structurally, not assumed: a test walks every persisted chunk and
+   also `JSON.stringify`s the slice, because a round trip through JSON is what persistence does.
+9. **Ask-the-repo query path. ✅ RESOLVED (P18); the budget split RESOLVED in V3-P0.** The Q&A
+   path's daily budget now shares ONE Redis counter with the worker (it was per-API-process), so the
+   global ceiling is finally global. The answer CACHE is still per-API-process — see ledger #21. `answerQuestion` (retrieve → answer → cite,
    `input_type:"query"`) + `POST /api/result/:id/ask` + the Ask-the-repo UI. Grounded, honest
    no-answer, embedding-space homogeneity + cache-before-budget + per-IP rate limit. `retrieve`
    hoisted to one shared primitive; embed cache key now `input_type`-scoped. Remaining sub-items:
@@ -658,7 +1246,12 @@ former blocker — is **DONE** this session).
     with real keys, then TUNE the placeholder thresholds (`EVAL_THRESHOLDS`) from the measured scores.
     Only after that should a gating decision be made — and even then CI must stay hermetic (the
     scored run needs keys + costs money), so any gate runs out-of-band, not in the per-push CI.
-14. **P4 guardrails: real values + measured run + prod stores are P7.** (a) All `@codeflow/config`
+14. **P4 guardrails: (b) and (c) RESOLVED (V3-P0); (a), (d), (e) still open.** (b) **RESOLVED** —
+    `LlmClient.complete` / `EmbeddingClient.embed` now return provider `usage`, and the budget records
+    the REAL token count (with `measured: false` flagging the one path — Gemini batch-embed — that
+    reports nothing). (c) **RESOLVED** — `createRedisRateLimitStore` is wired as the prod store in
+    `apps/api/src/index.ts`; in-memory stays the hermetic default. The rest of the original item
+    stands: (a) All `@codeflow/config`
     limits (`MAX_FILES`/`MAX_BYTES`/`PARSE_CONCURRENCY`/`FILE_TIMEOUT_MS`/`RATE_*`/`DAILY_LLM_BUDGET`)
     are placeholders — tune them from the measured large-repo run ("tested to N files in Y sec;
     degrades by Z"). (b) Guard 5 records the deterministic ESTIMATE; wiring the provider's real
@@ -667,9 +1260,175 @@ former blocker — is **DONE** this session).
     across API instances); only the in-memory store is wired/tested. (d) Guard 3 bounds async stalls
     only; CPU-bound sync parse hangs need worker-thread isolation. (e) `measureRepoSize` (fs walk) +
     `createMongoBudgetHandle` are integration-only (not in the hermetic suite).
-15. **Legacy P5-era mock panels are dead code (cleanup).** The dashboard (P16) replaced the old
-    `dashboard-layout` in `AppShell`; `RepositorySummary`, `ActionGrid`, `HealthPanel`,
-    `SecurityPanel`, `ArchitectureRulesPanel`, `PRRiskPanel`, `AIContextPanel`, `ExportPanel`,
-    `SettingsPanel`, `GraphPlaceholder`, `FileDetailDrawer` (+ the `selectedPanel`/`panelComponents`
-    machinery and `SelectedPanel`/`FileDetailTab` types) are no longer imported. They still compile
-    but are superseded — delete in a focused cleanup commit.
+15. **Legacy P5-era mock panels. ✅ RESOLVED (V3-CLEANUP).** All 11 components and the
+    `selectedPanel`/`panelComponents` machinery plus the `SelectedPanel`/`FileDetailTab` types were
+    already absent from this tree (grep for every name returns zero hits). What genuinely survived was
+    their orphaned CSS — `.dashboard-layout` (+ `.dashboard-main`/`.dashboard-side` and the 1100px
+    media-query override) and the `.file-drawer`/`.health-panel` sticky rules — removed in
+    V3-CLEANUP. Two superseded *graph* placeholders the entry did not name (`GraphLegend`,
+    `GraphToolbar`) were found by the orphan sweep and removed in the same pass.
+16. **Tree-sitter grammar coverage is JS/TS/JSX/TSX/Python only (V3-P1).** Every other language (Go,
+    Rust, Java, Ruby, PHP, C#, C/C++, …) falls through to the regex/generic engine, so those files get
+    no symbols and **no CPG enrichment** — they contribute graph nodes and (for the regex-covered
+    syntaxes) imports, nothing more. `graph.cpg.fallbackFiles` counts them honestly rather than letting
+    them look call-free. `@vscode/tree-sitter-wasm` already ships bash/c-sharp/cpp/css/go/java/php/
+    powershell/ruby/rust grammars, so widening is mostly a mapping table plus per-language extractors —
+    the extractors are the real work, not the wasm.
+17. **The scored-eval comparison is still OWED (V3-P1) — but the dataset now EXISTS (V3-P0).**
+    Phase 1's stated acceptance was a retrieval-metric comparison against a golden set that did not
+    exist. V3-P0 authored it: `packages/eval/datasets/chalk.json` + `requests.json`, cloned and read at
+    pinned SHAs, CI-validated for shape/pinning/determinism. What remains is the SCORED RUN itself,
+    which needs the owner's key and spends money — run
+    `.github/workflows/eval-scored.yml` (or `pnpm --filter @codeflow/eval run eval:scored` locally)
+    after producing an `AnalysisResult` per dataset. Note the datasets measure the V3-P1 tree-sitter
+    pipeline, so a true before/after against the regex parser would need a pinned re-run of the old
+    analyzer — the parser-parity harness already covers that comparison directly. What WAS measured instead is parser accuracy against 6 authored
+    ground-truth cases (hermetic, keyless, in CI) — a direct measurement of the thing that changed, but
+    NOT the retrieval claim. To close: do V3 §0.4 (author real datasets against pinned SHAs), then run
+    the scored eval with a real key on the same SHA before and after V3-P1. Blocked on Phase 0 + a key.
+18. **SCIP indexer deferred (V3-P1, task explicitly optional/non-blocking).** Compiler-accurate
+    cross-file references would remove the CPG's main limitation (call/inheritance targets currently
+    resolve through the file's own imports, so a cpgEdge can only refine an existing import edge, never
+    discover an unimported dependency). Not built because: `scip-typescript`/`scip-python` require a
+    real compile of the TARGET repo — i.e. installing an arbitrary public repo's dependencies, a
+    security and wall-clock problem for a hosted analyzer; consuming the index needs a protobuf decoder
+    (new heavy dep); and it cannot be tested hermetically without large binary fixtures. A flag over an
+    unimplemented interface would be dead code, so none was added. Tree-sitter heuristics remain the
+    default and only implementation.
+19. **The zod invariant. ✅ RESOLVED (V3-P0) — by AMENDING it, not by adopting zod.** The rule is now:
+    typed interfaces + contract tests are the convention, and RUNTIME validation is added only at
+    untrusted external boundaries (API request bodies, parsed LLM JSON, loaded dataset files). V3-P0
+    followed it: `assertDatasetShape` became real runtime validation at the dataset-file boundary, while
+    `@codeflow/arena` ships typed interfaces plus a contract test and no zod.
+20. **`cpgEdges` + `routes` add to the stored analysis document (V3-P1) — same 16MB BSON pressure as
+    ledger #8.** Aggregating CPG edges per `(from, to, kind, symbol)` instead of per call site bounds
+    the growth by distinct symbols rather than call sites, which is the difference between thousands
+    and tens of thousands of edges on a big file — but it is still growth in the same document that
+    ledger #8 already flags for the inline RAG vectors. Measure both together on a genuinely large
+    repo; the Phase 2 move of embeddings out of `analyses` is the natural time to decide whether the
+    graph slice needs externalizing too.
+    **✅ RESOLVED (V3-P5, `4abd45f`).** The analysis document now MEASURES itself and externalises the
+    heavy optional fields only when it would otherwise approach the 16MB ceiling — a normal analysis
+    takes the original path exactly, same document, no second collection, no manifest. When it cannot
+    fit even fully shed, it fails LOUDLY with the sizes and the three largest remaining slices, which
+    is the difference between a diagnosable limit and a driver error that names no field. V3-FINAL
+    added two fields to the document (`cost`, six numbers; `ai.domains`, a bounded projection) and both
+    were sized against this ceiling before being added.
+    *Prior status, kept for the record —* **STATUS REPORTED, deliberately NOT resolved (V3-P2).** P2 removed the LARGE contributor —
+    the inline vectors (ledger #8) — which changes the arithmetic substantially: the document no
+    longer grows with the embedding dimension at all. What remains is the graph slice's own growth,
+    which is still UNMEASURED on a genuinely large repo, and externalising it on a guess would be
+    building without evidence. The decision point is the first big-repo end-to-end run (see the
+    deferred-manual list in PHASE_LOG).
+21. **The Q&A ANSWER CACHE is still per-API-process (V3-P0). ✅ RESOLVED (V3-P5, `4abd45f`).** Both
+    halves are now Redis-backed when Redis is available: the answer cache (`redisAnalysisCache.ts`) and
+    the repo memory whose per-commit snapshots `what_changed` diffs — the sibling this entry named. Both
+    fall back to in-memory and both ANNOUNCE it, and the answer cache announces at INFO rather than WARN
+    on purpose: an unshared answer cache costs money, not correctness, and a warning that fires on every
+    boot of a keyless local deployment trains operators to ignore warnings.
+    *Prior status, kept for the record —* V3-P0 fixed the wallet half of the old
+    #9/14 split — the daily budget is now one shared Redis counter — but `ragQaService` still keeps its
+    answer cache in a process-local Map. Consequence: two API replicas each pay for the same repeated
+    question once, and a restart forgets every answer. Not a correctness or spend-ceiling problem
+    (cache-before-budget still holds, and the ceiling is shared), just wasted spend. Natural fix: move
+    the answer cache onto the same Redis connection `redisClient.ts` already provides.
+    **V3-P3 gave this a sibling worth naming in the same breath:** repo memory (the per-commit
+    snapshots `what_changed` diffs) is per-process too, so after a restart it reports "only one commit
+    analysed". Session memory is already Redis-backed when Redis is available; the answer cache and
+    the repo snapshots are the two that are not, and they are the same P5 wiring task.
+22. **Gemini's batch-embed endpoint reports no usage, so that path is an honest ESTIMATE (V3-P0).**
+    `createGeminiEmbeddingClient` returns `TokenUsage.measured: false` and the RAG stage logs it. Every
+    other paid path (Anthropic chat, Gemini chat, Voyage embeddings) is genuinely measured. The client
+    already reads `usageMetadata` opportunistically, so this becomes measured for free the day Google
+    starts sending it — until then the "cost is measured" claim has exactly one documented exception,
+    which is visible in the budget ledger rather than hidden.
+23. **No human judge labels exist, so faithfulness CANNOT gate (V3-P0).** `judgeIsGateable` requires
+    >= 20 labels, kappa >= 0.6, and an agreement CI lower bound >= 0.7. Nothing ships those labels, so
+    the judge is advisory by construction: `runEval` reports faithfulness and refuses to fail a
+    threshold on it. To promote it: hand-label >= 20 (answer, chunks) pairs as faithful/not, pass them
+    as `judgeLabels`, and read the reported kappa before trusting the gate. Deliberately NOT a
+    placeholder-labels shortcut — a judge calibrated against invented labels is worse than an
+    uncalibrated one, because it looks trustworthy.
+24. **`EVAL_THRESHOLDS` are PLACEHOLDERS pending the scored run (V3-P0).** Every value — including the
+    three new answer-path thresholds (`minCitationValidity`, `maxUnjustifiedRefusals`,
+    `minJudgeFaithfulness`) — is plausible, not measured. `eval-scored.yml` therefore defaults
+    `fail-on-threshold` to FALSE: it publishes the numbers so the thresholds can be calibrated FROM
+    them. Flip it once they are real. (`minCitationValidity` is the one that could defensibly go to
+    1.0 after measurement: a citation that does not resolve to a retrieved chunk is a fabricated
+    reference, not a near miss.)
+25. **The Redis-backed stores are integration-only (V3-P0).** `createRedisBudgetHandle`,
+    `createRedisRateLimitStore` and `apps/api/src/queues/redisClient.ts` are unit-tested against
+    INJECTED FAKES (which is what keeps the suite hermetic) and have never run against a real Redis.
+    The fakes cover the semantics that matter — shared counters, per-day/per-unit keys, TTLs, atomic
+    INCR, fail-open on error, corrupt values — but not connection handling, `enableOfflineQueue: false`
+    behaviour, or ioredis's reconnect story. Same status as the Anthropic/Gemini/Voyage adapters
+    (ledger #5, #12): a real-service smoke run is the proof. Related: the worker now REQUIRES Redis for
+    the budget (it already required it for BullMQ), so there is no fallback path there to test.
+26. **Local vector store is a JSON file, not LanceDB (V3-P5) — OWNER-DEFERRED.** `createFileVectorStore`
+    writes one JSON document per namespace and does an exact cosine scan; the ordering matches pgvector's,
+    and the file is inspectable with `cat`, which is what makes "zero code egress" checkable rather than
+    asserted. It is O(n) and wrong for a million chunks; it is correct for one repository. LanceDB was
+    PROBED and rejected on evidence: `@lancedb/lancedb@0.37.1` is **656 MB installed**, a
+    platform-specific Rust NAPI binary, and it drags back `onnxruntime-node` (211 MB, already rejected in
+    V3-P2) plus `sharp`, with three install scripts between them — the opposite of the feature for a CLI
+    whose selling point is a laptop with no toolchain. Adopting it would also make the suite
+    non-hermetic. **Re-confirmed honestly documented by the V3-FINAL audit** (`localVectorStore.ts`, the
+    local-cli module note, and PHASE_LOG all say what it is). Owner will revisit.
+27. **Local embeddings are feature-hashed bag-of-words, not int8 MiniLM (V3-P5) — OWNER-DEFERRED.**
+    `createLocalEmbeddingClient` hashes token features into a fixed-dimension vector: lexical, not
+    semantic, so it finds a chunk that shares WORDS with the query and not one that shares MEANING. The
+    local-cli's similarity floor is set higher than the hosted one for exactly that reason, and the
+    module says so. int8 MiniLM was probed: `onnxruntime-web` is WASM-clean and would have been right,
+    but the tokenizer it needs is itself NAPI, and the model download makes the suite non-hermetic.
+    **Re-confirmed honestly documented by the V3-FINAL audit.** Owner will revisit.
+28. **`Span.recordUsage` had no call site, so every trace reported $0.00 (V3-P5). ✅ RESOLVED
+    (V3-FINAL).** The recording tracer's headline claim — "cost is MEASURED, not estimated" — was
+    structurally false in production: the AI stages held the provider's real read-back and dropped it,
+    and `RecordingTracerOptions.pricing` was an accepted option no composition root supplied.
+    `ProgressEvent.usage` now carries it (a first-class field, not three numbers through `preview`,
+    because it carries the `measured` flag), the orchestrator forwards it, the worker records it from
+    EVERY event — not just terminal ones, since an AI stage's terminal event only exists on the success
+    path — and `AnalysisResult.cost` persists the total. `pricingFromEnv(LLM_PRICING)` returns an EMPTY
+    table when unconfigured, so `usd` stays NULL and the unpriced models are named. **Setting
+    `LLM_PRICING` is an owner step — see GO_LIVE.md.**
+29. **A rejected completion was charged by the provider and never by the budget (V3-P5 and earlier).
+    ✅ RESOLVED (V3-FINAL).** `budget.record` sat AFTER the schema/grounding check in `synthesize` and
+    AFTER the whole batch loop in `rag`, so a completion the grounding check rejected was never recorded,
+    and a throw on embedding batch 7 discarded the usage of batches 1–6. Three rejected synthesis
+    attempts spent real money against a daily ceiling that never saw a token of it — the wallet guard was
+    blind to exactly the failure mode that retries most, and the retry loop makes it a multiple rather
+    than a rounding error. Both now charge at the point the provider call SUCCEEDS, before the output is
+    judged. Asserted: 3 paid attempts ⇒ 3 records ⇒ $31.50 measured.
+30. **The Q&A answer-latency p50 is PER-PROCESS (V3-FINAL).** `answerLatency.ts` keeps a bounded
+    in-memory ring of recent answered-request wall-clocks. It does not survive a restart and two API
+    replicas report two different numbers. The limitation travels WITH the figure — the payload carries
+    `scope: "process"` and `sampleCount`, and the UI renders both — so nothing reads it as a fleet
+    percentile. Making it global means putting the samples in the Redis this process already has, which
+    is the same wiring task ledger #21 tracked for the answer cache; deliberately NOT done on a guess
+    about whether anyone needs it.
+31. **The MCP server has never been called by a real external agent (V3-P5).** `apps/mcp` is unit-tested
+    against its own tool objects, its scope allowlist and its refusal paths — 33 tests, all hermetic. A
+    real Cursor / Claude Code / Windsurf session is the proof that the transport, the handshake and the
+    tool schemas work end to end, and it is manual. In `GO_LIVE.md`.
+32. **The retrieval backend is invisible from `/health` — log-only (V3-SECURITY+DEPLOY).** When
+    `POSTGRES_URL` is set but Postgres cannot be reached, `createRetrievalStores` returns the
+    in-memory pair and the degradation is announced ONCE, at boot, on stdout:
+    `[codeflow] Q&A retrieval DEGRADED — …` in the api and `[worker] RETRIEVAL DEGRADED — …` in the
+    worker. `/health` reports Mongo and warm-up and says nothing about it. So "the API is up" and
+    "the API can answer anything the worker indexed" are not distinguishable from any endpoint, and
+    the honest degradation this codebase is careful to produce is only visible to whoever reads the
+    logs at the right moment. Found while writing `DEPLOY.md` §7, which now gives the log lines and
+    makes the cross-process `/ask` the definitive check instead. **Deliberately not fixed in that
+    pass** — adding a field to `/health` is a product change, not deploy config, and `/health` is
+    kept deliberately small (see its module note on why `warmedUp` is its own field). The fix is
+    small and worth doing: surface `retrieval: { mode, degradation }` the way warm-up surfaces its
+    per-task list.
+33. **A Render static site bakes the API URL at BUILD time (V3-SECURITY+DEPLOY).** The web
+    Dockerfile's entrypoint rewrites `/config.js` from `API_BASE_URL` at container start, so ONE
+    image works across environments. A static site has no entrypoint, so `render.yaml` passes
+    `VITE_API_BASE_URL` to the build instead — which means pointing the SPA at a different API is a
+    REBUILD, not a restart. Accepted knowingly as the price of not paying for a container, and it
+    costs nothing structurally: `apiClient.ts` already prefers the runtime value and falls back to
+    the built one, so deploying `apps/web/Dockerfile` instead (Railway, or a Render web service)
+    restores runtime injection with no code change. Recorded so nobody later reads the baked URL as
+    the intended design.

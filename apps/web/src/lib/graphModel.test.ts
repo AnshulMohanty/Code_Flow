@@ -1,7 +1,7 @@
 import type { AnalysisResult } from "@codeflow/shared-types";
 import { describe, expect, it } from "vitest";
 import { buildGraphModel } from "./graphModel";
-import { mockAnalysisResult } from "./mockAnalysis";
+import { mockAnalysisResult } from "../test/fixture";
 
 function node(id: string) {
   return { id, path: id, name: id.split("/").pop()!, layer: "source", language: "TypeScript", lines: 10, symbolCount: 1 };

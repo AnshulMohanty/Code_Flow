@@ -1,6 +1,5 @@
-import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, BudgetHandle, EventLogStore, JobStatus, PipelineRunStatus, PipelineStatusReason, ProgressMessage } from "@codeflow/shared-types";
+import type { AnalysisCacheHandle, AnalysisJobPayload, AnalysisResult, DegradationNotice, EventLogStore, JobStatus, PipelineRunStatus, PipelineStageId, PipelineStatusReason, ProgressMessage, RunMode } from "@codeflow/shared-types";
 import path from "node:path";
-import { DAILY_LLM_BUDGET } from "@codeflow/config";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 
@@ -18,6 +17,29 @@ export const ANALYSIS_QUEUE_NAME = "codeflow-analysis";
 export const env = {
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017/codeflow",
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
+  /**
+   * Postgres for the V3-P2 retrieval stores (pgvector + chunk text). NO DEFAULT, unlike the
+   * two above: an absent value means "run the index in-process", which is a real supported
+   * mode for a single-container demo, whereas defaulting to localhost would make every
+   * developer machine without Postgres log a connection failure at boot instead.
+   */
+  postgresUrl: process.env.POSTGRES_URL || "",
+  /**
+   * V3-P4: opt in to the bounded agent fan-out for stage 7. Default OFF because of cost SHAPE, not
+   * doubt — a fan-out is 5N+1 provider calls where the single-shot stage is 1, which is right for a
+   * real onboarding guide and wrong for a demo on a free tier.
+   */
+  fanOutSynthesis: (process.env.FANOUT_SYNTHESIS || "").toLowerCase() === "true",
+  /**
+   * V3-P5: run independent stages concurrently (readiness-based, see `computeLayers`).
+   *
+   * Opt-in because it touches the DETERMINISTIC SPINE. A test asserts the slices are byte-identical
+   * to the sequential run, but "proven identical" and "the default" are different bars, and the
+   * escape hatch costs one env var.
+   */
+  parallelStages: (process.env.PARALLEL_STAGES || "").toLowerCase() === "true",
+  /** V3-P5 model routing: the cheap/fast model. Falls back to the single configured model. */
+  fastModel: process.env.FAST_MODEL || "",
 };
 
 export interface WorkerJobPatch {
@@ -32,6 +54,10 @@ export interface WorkerJobPatch {
   commitSha?: string;
   runStatus?: PipelineRunStatus;
   runStatusReason?: PipelineStatusReason;
+  skippedStages?: PipelineStageId[];
+  /** V3-P0: how much of the pipeline the run delivered, and why (see RunMode). */
+  runMode?: RunMode;
+  degradations?: DegradationNotice[];
 }
 
 export interface SavedWorkerAnalysis {
@@ -104,13 +130,21 @@ const jobSchema = new Schema(
     progress: { type: Number, required: true, default: 0 },
     currentStep: { type: String, required: true, default: "Analysis job queued." },
     parsedFiles: { type: Number, required: true, default: 0 },
-    totalFiles: { type: Number, required: true, default: 42 },
+    totalFiles: { type: Number, required: true, default: 0 },
     repoFullName: { type: String, required: true },
     analysisId: { type: String },
     cached: { type: Boolean, default: false },
     error: { type: String },
     runStatus: { type: String, enum: ["completed", "partial", "failed", "aborted"] },
     runStatusReason: { type: String, enum: ["repo-too-large", "budget-exhausted"] },
+    // Stages that produced no output because they were never configured (unconfigured AI
+    // providers). Lets the UI render an honest terminal state instead of eternal "pending".
+    skippedStages: { type: [String], default: undefined },
+    runMode: { type: String, default: undefined },
+    degradations: {
+      type: [{ _id: false, reason: { type: String, required: true }, detail: { type: String, required: true } }],
+      default: undefined,
+    },
     repositoryRef: { type: Schema.Types.Mixed, required: true },
     mode: { type: String, enum: ["public_hosted"], required: true },
     commitSha: { type: String, required: true },
@@ -130,16 +164,6 @@ const llmCacheSchema = new Schema(
   { strict: true, timestamps: { createdAt: true, updatedAt: false } },
 );
 
-// Global daily LLM budget (Guard 5, the wallet ceiling). One doc per UTC day; a new day
-// gets a fresh doc (spent 0) — that IS the reset. Shared across worker instances.
-const llmBudgetSchema = new Schema(
-  {
-    day: { type: String, required: true, unique: true, index: true }, // UTC YYYY-MM-DD
-    spent: { type: Number, required: true, default: 0 },
-  },
-  { strict: true, timestamps: true },
-);
-
 // SSE replay buffer (#20): one doc per emitted ProgressMessage; `seq` preserves emit order.
 // The API reads this same "jobevents" collection to replay a job from Ingest.
 const eventLogSchema = new Schema(
@@ -156,7 +180,6 @@ const RepoModel = models.Repo || model("Repo", repoSchema, "repos");
 const AnalysisModel = models.Analysis || model("Analysis", analysisSchema, "analyses");
 const JobModel = models.Job || model("Job", jobSchema, "jobs");
 const LlmCacheModel = models.LlmCache || model("LlmCache", llmCacheSchema, "llmcache");
-const LlmBudgetModel = models.LlmBudget || model("LlmBudget", llmBudgetSchema, "llmbudget");
 const EventLogModel = models.JobEvent || model("JobEvent", eventLogSchema, "jobevents");
 
 /**
@@ -217,30 +240,12 @@ export function createMongoCacheHandle(): AnalysisCacheHandle {
   };
 }
 
-/**
- * Mongo-backed `BudgetHandle` for the global daily LLM-spend ceiling (Guard 5). Persists
- * across worker instances/restarts; the per-UTC-day document IS the reset boundary. Mirrors
- * the in-memory handle's mechanics (check estimate ≤ remaining; record adds to the day's
- * total). Integration-only — exercised against real Mongo, not the hermetic suite.
- */
-export function createMongoBudgetHandle(limitTokens: number = DAILY_LLM_BUDGET): BudgetHandle {
-  const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
-  return {
-    async check(estimatedTokens: number): Promise<boolean> {
-      const doc = await LlmBudgetModel.findOne({ day: utcDay(Date.now()) }).lean();
-      const spent = doc ? (doc.spent as number) : 0;
-      return spent + estimatedTokens <= limitTokens;
-    },
-    async record(actualTokens: number): Promise<void> {
-      const day = utcDay(Date.now());
-      await LlmBudgetModel.findOneAndUpdate(
-        { day },
-        { $inc: { spent: actualTokens }, $setOnInsert: { day } },
-        { upsert: true },
-      );
-    },
-  };
-}
+// NOTE (V3-P0): the Mongo-backed `createMongoBudgetHandle` was REMOVED here. Guard 5's
+// ledger now lives in Redis (`createRedisBudgetHandle` in @codeflow/analyzers), shared with
+// the API's Q&A path — previously the worker counted in Mongo and the API counted in process
+// memory, so the "global daily ceiling" was two ceilings that could not see each other.
+// Keeping a second persistent implementation of one counter would only invite drift.
+// The `llmbudget` collection is left in place for historical data; nothing writes it now.
 
 export function createMongoWorkerAnalysisService(): WorkerAnalysisService {
   return {

@@ -12,17 +12,29 @@
     }
   },
   "scripts": {
-    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
     "build": "tsc -p tsconfig.json",
     "eval": "tsx src/cli.ts",
-    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/analyzers build",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
     "test": "vitest run --passWithNoTests",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "preparity": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
+    "parity": "tsx src/parity/cli.ts",
+    "presynthetic": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
+    "synthetic": "tsx src/syntheticCli.ts",
+    "precheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
+    "check": "tsx src/checkCli.ts",
+    "preeval:scored": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build",
+    "eval:scored": "tsx src/scoredCli.ts"
   },
   "dependencies": {
     "@codeflow/analyzers": "workspace:*",
+    "@codeflow/arena": "workspace:*",
+    "@codeflow/config": "workspace:*",
+    "@codeflow/parsers": "workspace:*",
+    "@codeflow/retrieval": "workspace:*",
     "@codeflow/shared-types": "workspace:*"
   },
   "devDependencies": {

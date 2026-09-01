@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { RagChunk, Synthesis } from "@codeflow/shared-types";
+import type { Synthesis } from "@codeflow/shared-types";
 import type { RagEvalQuestion } from "../dataset.js";
-import { aggregateRag, scoreQuestion, scoreSynthesis } from "../score.js";
+import { aggregateRag, scoreQuestion, scoreSynthesis, type ScoredCoords } from "../score.js";
 
 const synthesis: Synthesis = {
   summary: "x",
@@ -44,15 +44,19 @@ describe("scoreSynthesis", () => {
   });
 });
 
-const chunks: RagChunk[] = [
-  { id: "src/auth.ts#1-10", fileId: "src/auth.ts", startLine: 1, endLine: 10, text: "", embedding: [1, 0, 0], tokenCount: 1 },
-  { id: "src/db.ts#1-10", fileId: "src/db.ts", startLine: 1, endLine: 10, text: "", embedding: [0, 1, 0], tokenCount: 1 },
-];
+// V3-P2: `scoreQuestion` takes the RANKING production actually returned, not an index plus a
+// query vector — retrieval moved out of the scorer (see score.ts). The ordering below is
+// therefore stated explicitly instead of being a consequence of cosine over fixture vectors,
+// which also makes each expectation's "rank 1 vs rank 2" readable at the call site.
+const AUTH: ScoredCoords = { id: "src/auth.ts#1-10", fileId: "src/auth.ts", startLine: 1, endLine: 10 };
+const DB: ScoredCoords = { id: "src/db.ts#1-10", fileId: "src/db.ts", startLine: 1, endLine: 10 };
+/** auth at rank 1, db at rank 2. */
+const ranking: ScoredCoords[] = [AUTH, DB];
 
 describe("scoreQuestion", () => {
   it("file-level hit at rank 1 → recall 1, reciprocalRank 1", () => {
     const q: RagEvalQuestion = { id: "q", question: "auth?", expectedFiles: ["src/auth.ts"] };
-    const r = scoreQuestion(q, chunks, [1, 0, 0], 5);
+    const r = scoreQuestion(q, ranking, 5);
     expect(r.recallAtK).toBe(1);
     expect(r.reciprocalRank).toBe(1);
     expect(r.hit).toBe(true);
@@ -61,14 +65,14 @@ describe("scoreQuestion", () => {
 
   it("hit at rank 2 → reciprocalRank 1/2", () => {
     const q: RagEvalQuestion = { id: "q", question: "db?", expectedFiles: ["src/db.ts"] };
-    const r = scoreQuestion(q, chunks, [0.6, 0.5, 0], 5); // auth ranks first, db second
+    const r = scoreQuestion(q, ranking, 5); // auth ranks first, db second
     expect(r.retrieved[0].fileId).toBe("src/auth.ts");
     expect(r.reciprocalRank).toBe(0.5);
   });
 
   it("miss → recall 0, reciprocalRank 0, target listed in missed", () => {
     const q: RagEvalQuestion = { id: "q", question: "x?", expectedFiles: ["src/notindexed.ts"] };
-    const r = scoreQuestion(q, chunks, [1, 0, 0], 5);
+    const r = scoreQuestion(q, ranking, 5);
     expect(r.recallAtK).toBe(0);
     expect(r.reciprocalRank).toBe(0);
     expect(r.missed).toEqual(["src/notindexed.ts"]);
@@ -76,10 +80,10 @@ describe("scoreQuestion", () => {
 
   it("expectedLines: overlap is a hit, disjoint range is a miss", () => {
     const hitQ: RagEvalQuestion = { id: "q", question: "auth?", expectedFiles: [], expectedLines: [{ fileId: "src/auth.ts", startLine: 3, endLine: 6 }] };
-    expect(scoreQuestion(hitQ, chunks, [1, 0, 0], 5).recallAtK).toBe(1); // [3,6] overlaps chunk [1,10]
+    expect(scoreQuestion(hitQ, ranking, 5).recallAtK).toBe(1); // [3,6] overlaps chunk [1,10]
 
     const missQ: RagEvalQuestion = { id: "q", question: "auth?", expectedFiles: [], expectedLines: [{ fileId: "src/auth.ts", startLine: 100, endLine: 110 }] };
-    const r = scoreQuestion(missQ, chunks, [1, 0, 0], 5);
+    const r = scoreQuestion(missQ, ranking, 5);
     expect(r.recallAtK).toBe(0); // disjoint from the only auth chunk
     expect(r.missed).toEqual(["src/auth.ts#100-110"]);
   });
@@ -89,9 +93,9 @@ describe("aggregateRag", () => {
   it("means recall and reciprocal rank across questions", () => {
     const agg = aggregateRag(
       [
-        { id: "a", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 1, hit: true, missed: [] },
-        { id: "b", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 0.5, hit: true, missed: [] },
-        { id: "c", question: "", retrieved: [], recallAtK: 0, reciprocalRank: 0, hit: false, missed: ["x"] },
+        { id: "a", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 1, hit: true, missed: [], negativeControl: false },
+        { id: "b", question: "", retrieved: [], recallAtK: 1, reciprocalRank: 0.5, hit: true, missed: [], negativeControl: false },
+        { id: "c", question: "", retrieved: [], recallAtK: 0, reciprocalRank: 0, hit: false, missed: ["x"], negativeControl: false },
       ],
       5,
     );

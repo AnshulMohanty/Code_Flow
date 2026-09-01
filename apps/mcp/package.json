@@ -1,0 +1,34 @@
+{
+  "name": "@codeflow/mcp",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "codeflow-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build && pnpm --filter @codeflow/agents build",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build && pnpm --filter @codeflow/agents build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/arena build && pnpm --filter @codeflow/agents build",
+    "test": "vitest run --passWithNoTests",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codeflow/agents": "workspace:*",
+    "@codeflow/analyzers": "workspace:*",
+    "@codeflow/arena": "workspace:*",
+    "@codeflow/config": "workspace:*",
+    "@codeflow/graph": "workspace:*",
+    "@codeflow/memory": "workspace:*",
+    "@codeflow/retrieval": "workspace:*",
+    "@codeflow/shared-types": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0"
+  }
+}

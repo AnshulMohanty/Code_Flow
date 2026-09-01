@@ -7,6 +7,7 @@ import type {
   ProgressMessage,
 } from "@codeflow/shared-types";
 import type { RepoCloner } from "@codeflow/analyzers";
+import type { TraceReport } from "@codeflow/observability";
 import { runAnalysisJob } from "./pipelineJobProcessor.js";
 import type { SavedWorkerAnalysis, WorkerAnalysisService, WorkerJobPatch } from "../services/workerAnalysisService.js";
 
@@ -110,6 +111,186 @@ describe("runAnalysisJob", () => {
     expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "completed" });
   });
 
+  it("no AI providers: reports the skipped stages on the job + result warnings", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+
+    // No synthesisClient / embeddingClient — exactly the deterministic-only deployment.
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: channel,
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+    });
+
+    // The run is genuinely fine — it just did not include the AI stages.
+    expect(outcome.status).toBe("completed");
+    expect(outcome.skippedStages).toEqual(["synthesize", "rag"]);
+
+    // Surfaced on the job record, so REST (and therefore the UI) can settle those rows.
+    expect(updates.at(-1)).toMatchObject({ runStatus: "completed", skippedStages: ["synthesize", "rag"] });
+
+    // ...and persisted onto the result itself, so the omission survives a reload.
+    const saved = vi.mocked(service.saveAnalysis).mock.calls[0][0];
+    expect(saved.result.warnings).toEqual([
+      expect.stringContaining('AI stage "synthesize" was skipped'),
+      expect.stringContaining('AI stage "rag" was skipped'),
+    ]);
+    expect(saved.result.warnings.join(" ")).toContain("GEMINI_API_KEY");
+
+    // V3-P0: the delivered SCOPE, as a machine-readable field. `runStatus: "completed"` is
+    // true and useless here on its own — every stage that existed did run. `runMode` is what
+    // says this was not a full analysis, and `degradations` says why, in typed form.
+    expect(outcome.runMode).toBe("deterministic-only");
+    expect(outcome.degradations.map((notice) => notice.reason)).toEqual([
+      "no-chat-provider",
+      "no-embedding-provider",
+    ]);
+    expect(updates.at(-1)).toMatchObject({ runMode: "deterministic-only" });
+    // Persisted on the RESULT too, so it survives a reload and a later cache hit.
+    expect(saved.result.runMode).toBe("deterministic-only");
+    expect(saved.result.degradations?.map((notice) => notice.reason)).toEqual([
+      "no-chat-provider",
+      "no-embedding-provider",
+    ]);
+  });
+
+  it("configured AI providers: nothing is reported as skipped", async () => {
+    const { service, updates } = fakeService(null);
+    const channel = createChannel();
+
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: channel,
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      // Stage factories only need these to register; the stages themselves are unit-tested
+      // elsewhere and fail softly (AI failure => "partial"), which is not what we assert here.
+      synthesisClient: { provider: "anthropic", model: "test", complete: vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } })) },
+      embeddingClient: { provider: "voyage", model: "test", dimension: 3, embed: vi.fn(async () => ({ vectors: [[0, 0, 0]], usage: { inputTokens: 1, outputTokens: 0, measured: true } })) },
+    });
+
+    expect(outcome.skippedStages).toEqual([]);
+    expect(updates.at(-1)).not.toHaveProperty("skippedStages");
+
+    // A fully-configured run is "full" and carries no degradations (absent, not empty).
+    expect(outcome.runMode).toBe("full");
+    expect(outcome.degradations).toEqual([]);
+    expect(updates.at(-1)).toMatchObject({ runMode: "full" });
+    expect(updates.at(-1)).not.toHaveProperty("degradations");
+  });
+
+  it("fanOutSynthesis is OPT-IN: default off, and enabling it keeps stage 7 registered as `synthesize`", async () => {
+    // V3-P4. Opt-in because of cost SHAPE, not doubt: a fan-out is 5N+1 provider calls where the
+    // single-shot stage is 1 — right for a real onboarding guide, wrong for a demo on a free tier.
+    // What must NOT change is the stage's identity: the orchestrator's coverage partition, its cache
+    // lookup and its "AI failure => partial" handling all key off the id, so a different one would
+    // silently take stage 7 out of that machinery.
+    const chat = {
+      provider: "anthropic" as const,
+      model: "test",
+      complete: vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } })),
+    };
+
+    for (const fanOutSynthesis of [false, true]) {
+      const { service } = fakeService(null);
+      const outcome = await runAnalysisJob(payload, {
+        service,
+        cloner: fakeCloner(),
+        publisher: createChannel(),
+        readFile: noFiles,
+        readDir: emptyDir,
+        now: makeClock(),
+        synthesisClient: chat,
+        fanOutSynthesis,
+      });
+      // Either way Synthesize is REGISTERED (so it is never reported as skipped), and either way an
+      // AI failure on this empty fixture degrades to "partial" rather than failing the run.
+      expect(outcome.skippedStages).not.toContain("synthesize");
+      expect(outcome.status).not.toBe("failed");
+    }
+  });
+
+  it("produces a COMPLETE trace with per-span tokens and cost for a run (V3-P5 acceptance)", async () => {
+    // The task-2 acceptance criterion, asserted on a real run rather than on a unit fixture. Spans
+    // are derived from the EXISTING progress events, so a stage that forgot to instrument itself
+    // cannot go missing from the trace.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      pricing: { "mock-model": { inputPerMillion: 1, outputPerMillion: 2 } },
+      onTrace: (report) => traces.push(report),
+    });
+
+    expect(traces).toHaveLength(1);
+    const trace = traces[0];
+    // COMPLETE: every span was ended, including on the paths that skip stages — so its durations
+    // are facts rather than lower bounds.
+    expect(trace.complete).toBe(true);
+    expect(trace.traceId).toBe(payload.jobId);
+    // The root run span plus one span per deterministic stage.
+    expect(trace.spans[0].kind).toBe("run");
+    expect(trace.spans.map((span) => span.name)).toContain("stage:ingest");
+    expect(trace.spans.map((span) => span.name)).toContain("stage:connect");
+    // Cost is reported from real usage; with no paid calls in this fixture there is no spend, and
+    // the token counts are still present rather than absent.
+    expect(trace.cost.inputTokens).toBe(0);
+    expect(trace.cost.measured).toBe(true);
+    // And the interaction graph shows the run → stage shape.
+    expect(trace.interactions.edges.every((edge) => edge.from === "run")).toBe(true);
+  });
+
+  it("finishes the trace on the FAILURE path too", async () => {
+    // A tracer that only reported successful runs would be blind to exactly the runs anyone wants
+    // to look at.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    const cloner = fakeCloner({ clone: vi.fn(async () => { throw new Error("invalid repo url"); }) });
+    await runAnalysisJob(payload, {
+      service,
+      cloner,
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      onTrace: (report) => traces.push(report),
+    });
+    expect(traces).toHaveLength(1);
+    expect(traces[0].complete).toBe(true);
+    expect(traces[0].spans[0].status).toBe("error");
+  });
+
+  it("an EXPORTER that throws cannot fail the run it observes", async () => {
+    // An observability layer that can fail the thing it observes is worse than none, and it fails in
+    // exactly the situation you most need the trace.
+    const { service } = fakeService(null);
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      traceExporter: {
+        id: "explodes",
+        async export() {
+          throw new Error("collector unreachable");
+        },
+      },
+    });
+    expect(outcome.status).not.toBe("failed");
+  });
+
   it("clone failure: run 'failed', nothing persisted, done(failed) streamed", async () => {
     const { service, updates } = fakeService(null);
     const channel = createChannel();
@@ -135,3 +316,160 @@ function makeClock() {
   let t = 0;
   return () => ++t;
 }
+
+describe("runAnalysisJob — MEASURED cost reaches the trace AND the result (V3-FINAL)", () => {
+  /** A synthesis client that reports a real, non-zero, provider-read-back usage. */
+  const paidChat = () => ({
+    provider: "anthropic" as const,
+    model: "priced-model",
+    complete: vi.fn(async () => ({
+      text: JSON.stringify({ summary: "s", readingOrder: [] }),
+      usage: { inputTokens: 1_000_000, outputTokens: 500_000, measured: true },
+    })),
+  });
+
+  // This fixture has an EMPTY graph (no files), so the synthesis grounding check rejects every
+  // completion and the stage exhausts its three attempts. That is not a limitation here, it is the
+  // exact case that mattered: three provider calls were paid for and the run then failed, and BOTH
+  // the daily budget and the trace used to see nothing at all.
+  const PAID_ATTEMPTS = 3;
+
+  it("RECORDS usage onto the stage span — the call site `recordUsage` never had", async () => {
+    // The bug: `Span.recordUsage` existed with NO production caller, so the recording tracer's
+    // headline claim ("cost is MEASURED, not estimated") reported $0.00 for every run. The AI stages
+    // had the provider's real usage in hand and dropped it.
+    const traces: TraceReport[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+      onTrace: (report) => traces.push(report),
+    });
+
+    const synthesizeSpan = traces[0].spans.find((span) => span.name === "stage:synthesize");
+    expect(synthesizeSpan?.usage).toEqual({
+      inputTokens: 1_000_000 * PAID_ATTEMPTS,
+      outputTokens: 500_000 * PAID_ATTEMPTS,
+      measured: true,
+    });
+    // 3M in at $3/M + 1.5M out at $15/M = $9 + $22.50.
+    expect(traces[0].cost.usd).toBeCloseTo(31.5, 6);
+    expect(traces[0].cost.measured).toBe(true);
+  });
+
+  it("CHARGES a rejected completion — the retry loop used to spend for free", async () => {
+    // The wallet half of the same bug: `budget.record` sat AFTER the schema/grounding check, so a
+    // rejected completion was never recorded. The provider charged either way, which made the daily
+    // ceiling blind to exactly the failure mode that retries most.
+    const recorded: number[] = [];
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      budget: {
+        async check() {
+          return true;
+        },
+        async record(actual) {
+          // `record` accepts a raw token count OR a full usage read-back; the AI stages pass the
+          // latter, which is the whole point of V3-P0's provider read-back.
+          recorded.push(typeof actual === "number" ? actual : actual.inputTokens + actual.outputTokens);
+        },
+      },
+    });
+    // One record per provider call, not one per successful stage.
+    expect(recorded).toHaveLength(PAID_ATTEMPTS);
+    expect(recorded.every((tokens) => tokens === 1_500_000)).toBe(true);
+  });
+
+  it("PERSISTS the cost on the result, so a reader can see a real figure", async () => {
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost).toMatchObject({ inputTokens: 1_000_000 * PAID_ATTEMPTS, measured: true });
+    expect(saved.cost?.usd).toBeCloseTo(31.5, 6);
+  });
+
+  it("reports usd NULL and NAMES the model when no price is configured — never a silent zero", async () => {
+    // The unconfigured-price case, which is the DEFAULT. Tokens stay measured; the dollar figure
+    // says "we do not know" rather than "it was free".
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: paidChat(),
+      // No `pricing` at all — exactly what a deployment without LLM_PRICING gets.
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost?.usd).toBeNull();
+    expect(saved.cost?.unpricedModels).toEqual(["priced-model"]);
+    expect(saved.cost?.inputTokens).toBe(1_000_000 * PAID_ATTEMPTS);
+  });
+
+  it("OMITS cost entirely on a run that spent nothing — absent means unknown, never free", async () => {
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      // Deterministic-only: no provider, so no paid call.
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved).not.toHaveProperty("cost");
+  });
+
+  it("propagates measured:false rather than smoothing an estimate into a measurement", async () => {
+    const estimating = {
+      provider: "gemini" as const,
+      model: "priced-model",
+      complete: vi.fn(async () => ({
+        text: JSON.stringify({ summary: "s", readingOrder: [] }),
+        usage: { inputTokens: 100, outputTokens: 10, measured: false },
+      })),
+    };
+    const { service } = fakeService(null);
+    await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+      synthesisClient: estimating,
+      pricing: { "priced-model": { inputPerMillion: 3, outputPerMillion: 15 } },
+    });
+    const saved = (service.saveAnalysis as unknown as { mock: { calls: Array<[{ result: AnalysisResult }]> } }).mock
+      .calls[0][0].result;
+    expect(saved.cost?.measured).toBe(false);
+  });
+});

@@ -18,7 +18,9 @@
     "test": "pnpm -r --workspace-concurrency=1 test",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "keepalive": "node scripts/keepalive.mjs",
+    "bench:live": "node scripts/live-benchmark.mjs"
   },
   "devDependencies": {
     "prettier": "^3.3.3",

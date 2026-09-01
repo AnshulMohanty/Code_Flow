@@ -211,13 +211,16 @@ describe("connect — fileId consistency & boundary", () => {
     }
   });
 
-  it("the stored graph slice carries NO metrics field (structure only)", async () => {
+  it("the stored graph slice carries NO metrics field (structure + properties only)", async () => {
     const graph = await connect([{ path: "src/a.ts", content: "export const a = 1;" }]);
-    expect(Object.keys(graph).sort()).toEqual(["edges", "nodes", "resolution"]);
+    // V3-P1 added the code-property-graph slices (cpgEdges / routes / cpg provenance).
+    // They are STRUCTURE and PROPERTIES, not metrics — the boundary this test guards.
+    expect(Object.keys(graph).sort()).toEqual(["cpg", "cpgEdges", "edges", "nodes", "resolution", "routes"]);
     // no summary / centrality / degree on the slice or its nodes
     expect("summary" in graph).toBe(false);
     expect("degree" in graph.nodes[0]).toBe(false);
     expect("centrality" in graph.nodes[0]).toBe(false);
+    expect("clusters" in graph).toBe(false); // communities are a metric (Analyze owns them)
   });
 });
 

@@ -9,7 +9,7 @@ const jobSchema = new Schema(
     progress: { type: Number, required: true, default: 0 },
     currentStep: { type: String, required: true, default: "Analysis job queued." },
     parsedFiles: { type: Number, required: true, default: 0 },
-    totalFiles: { type: Number, required: true, default: 42 },
+    totalFiles: { type: Number, required: true, default: 0 },
     repoFullName: { type: String, required: true },
     analysisId: { type: String },
     cached: { type: Boolean, default: false },
@@ -18,6 +18,14 @@ const jobSchema = new Schema(
     // REST answers "what happened" on a reconnect after completion.
     runStatus: { type: String, enum: ["completed", "partial", "failed", "aborted"] },
     runStatusReason: { type: String, enum: ["repo-too-large", "budget-exhausted"] },
+    // Stages that produced no output because they were never configured (unconfigured AI
+    // providers) — the UI renders these as an honest terminal "skipped", not "pending".
+    skippedStages: { type: [String], default: undefined },
+    runMode: { type: String, default: undefined },
+    degradations: {
+      type: [{ _id: false, reason: { type: String, required: true }, detail: { type: String, required: true } }],
+      default: undefined,
+    },
     repositoryRef: { type: Schema.Types.Mixed, required: true },
     mode: { type: String, enum: ["public_hosted"], required: true },
     commitSha: { type: String, required: true },

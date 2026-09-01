@@ -1,5 +1,19 @@
 export { buildDependencyGraph } from "./buildGraph.js";
 export {
+  buildCodePropertyGraph,
+  buildImportGraph,
+  toCpgDependencyEdge,
+  toDependencyEdge,
+  type CodePropertyGraphInput,
+} from "./codePropertyGraph.js";
+export {
+  DEFAULT_COMMUNITY_RESOLUTION,
+  DEFAULT_COMMUNITY_SEED,
+  detectCommunities,
+  seededOrder,
+  type CommunityOptions,
+} from "./communities.js";
+export {
   getDirectDependencies,
   getDirectDependents,
   getTransitiveDependencies,

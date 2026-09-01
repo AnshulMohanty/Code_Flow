@@ -3,7 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CodeFlow MERN Shell</title>
+    <title>CodeFlow — engine Cartograph</title>
+    <meta
+      name="description"
+      content="Cartograph resolves a repository into a real dependency map, then answers questions with the file and line it read."
+    />
+    <!-- The design's three voices: a heavy grotesque for display, a transitional serif italic for
+         asides, a monospace for data. Preconnected because a FOUT on 10rem display type is the most
+         visible layout shift on the page; every stack has a real system fallback in styles.css, so a
+         blocked font request degrades rather than breaks. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700;900&family=Newsreader:ital,wght@0,400;1,400;1,500&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
     <!-- Runtime config (API base URL) — overwritten by the container entrypoint at start.
          Loaded BEFORE the app bundle so window.__CODEFLOW_CONFIG__ is available. -->
     <script src="/config.js"></script>

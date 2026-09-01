@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import type {
-  Inventory,
   PipelineContext,
   PipelineInput,
   PipelineStage,
@@ -98,7 +97,7 @@ function structureOf(paths: string[]): RepoStructure {
   };
 }
 
-function inventoryCtx(structure: RepoStructure, readFile: (repoPath: string, p: string) => Promise<string | null>): PipelineContext {
+function inventoryCtx(structure: RepoStructure): PipelineContext {
   return {
     repoPath: "/repo",
     commitSha: "sha-1",
@@ -125,7 +124,7 @@ describe("Guard 2 — parsing concurrency (Inventory)", () => {
     };
 
     const stage = createInventoryStage({ readFile, concurrency: 4, now: () => 1 });
-    await stage.run(input, inventoryCtx(structure, readFile));
+    await stage.run(input, inventoryCtx(structure));
 
     expect(maxInFlight).toBeLessThanOrEqual(4);
     expect(maxInFlight).toBeGreaterThan(1); // actually overlapped (guard is doing work)
@@ -143,7 +142,7 @@ describe("Guard 3 — per-file parse timeout (Inventory)", () => {
     };
 
     const stage = createInventoryStage({ readFile, fileTimeoutMs: 20, concurrency: 4, now: () => 1 });
-    const { partial } = await stage.run(input, inventoryCtx(structure, readFile));
+    const { partial } = await stage.run(input, inventoryCtx(structure));
 
     expect(partial.inventory!.unparsedFiles).toContain("src/slow.ts");
     expect(partial.inventory!.loc["src/fast.ts"]).toBeGreaterThanOrEqual(1); // fast file parsed

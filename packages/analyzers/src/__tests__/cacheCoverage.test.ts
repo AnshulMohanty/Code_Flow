@@ -79,7 +79,7 @@ function mockClient(): MockClient {
     calls,
     async complete(request) {
       calls.push(request);
-      return goodResponse();
+      return { text: goodResponse(), usage: { inputTokens: 120, outputTokens: 30, measured: true } };
     },
   };
 }
