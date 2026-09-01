@@ -1410,3 +1410,25 @@ former blocker — is **DONE** this session).
     against its own tool objects, its scope allowlist and its refusal paths — 33 tests, all hermetic. A
     real Cursor / Claude Code / Windsurf session is the proof that the transport, the handshake and the
     tool schemas work end to end, and it is manual. In `GO_LIVE.md`.
+32. **The retrieval backend is invisible from `/health` — log-only (V3-SECURITY+DEPLOY).** When
+    `POSTGRES_URL` is set but Postgres cannot be reached, `createRetrievalStores` returns the
+    in-memory pair and the degradation is announced ONCE, at boot, on stdout:
+    `[codeflow] Q&A retrieval DEGRADED — …` in the api and `[worker] RETRIEVAL DEGRADED — …` in the
+    worker. `/health` reports Mongo and warm-up and says nothing about it. So "the API is up" and
+    "the API can answer anything the worker indexed" are not distinguishable from any endpoint, and
+    the honest degradation this codebase is careful to produce is only visible to whoever reads the
+    logs at the right moment. Found while writing `DEPLOY.md` §7, which now gives the log lines and
+    makes the cross-process `/ask` the definitive check instead. **Deliberately not fixed in that
+    pass** — adding a field to `/health` is a product change, not deploy config, and `/health` is
+    kept deliberately small (see its module note on why `warmedUp` is its own field). The fix is
+    small and worth doing: surface `retrieval: { mode, degradation }` the way warm-up surfaces its
+    per-task list.
+33. **A Render static site bakes the API URL at BUILD time (V3-SECURITY+DEPLOY).** The web
+    Dockerfile's entrypoint rewrites `/config.js` from `API_BASE_URL` at container start, so ONE
+    image works across environments. A static site has no entrypoint, so `render.yaml` passes
+    `VITE_API_BASE_URL` to the build instead — which means pointing the SPA at a different API is a
+    REBUILD, not a restart. Accepted knowingly as the price of not paying for a container, and it
+    costs nothing structurally: `apiClient.ts` already prefers the runtime value and falls back to
+    the built one, so deploying `apps/web/Dockerfile` instead (Railway, or a Render web service)
+    restores runtime injection with no code change. Recorded so nobody later reads the baked URL as
+    the intended design.

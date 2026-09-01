@@ -114,6 +114,11 @@ jobsRouter.get(
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    // Managed hosts front the app with an nginx-family proxy that BUFFERS a response body by
+    // default, which turns a progress stream into one delivery at the end -- the stream still
+    // "works" in tests and is useless in production. Honoured by Render and Railway, ignored
+    // elsewhere, harmless either way.
+    res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
     const close = streamProgress(res, jobId, getProgressSubscriber(), getEventLogStore());

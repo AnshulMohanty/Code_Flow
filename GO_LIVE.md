@@ -12,7 +12,8 @@ verification command, run that command — a step you cannot check is a step you
 ## 0. Before anything
 
 ```bash
-git push -u origin v3/final-build-verify        # NOT done by the agent, by request
+# DONE (2026-09-01): pushed as `V2-codeflow`, and PR #1 is open against main.
+# `git push -u origin V2-codeflow`
 ```
 
 Then run the gate on a clean checkout, because a green gate on the machine that wrote the code proves
@@ -46,7 +47,7 @@ Nothing here is committed and nothing is baked into an image. Every value is rea
 | `MONGO_URI` | The API falls back to per-process in-memory maps and reports `mongo-unavailable` as a visible degradation. The worker refuses to boot. |
 | `REDIS_URL` | The worker refuses to boot (BullMQ needs it). The API degrades and ANNOUNCES it: the rate limit becomes per-process, the daily budget stops being shared with the worker, and sessions/repo memory/answer cache become per-process. |
 | `POSTGRES_URL` | Retrieval degrades to an in-memory index, which is invisible to the other process — so the API can answer only for indexes it built itself, which for the API is none. Logged loudly at boot. |
-| `DAILY_LLM_BUDGET` | Defaults apply. This is the wallet ceiling; set it deliberately. |
+| ~~`DAILY_LLM_BUDGET`~~ | **NOT an env var** — corrected 2026-09-01. It is a compile-time constant in `@codeflow/config` (`5_000_000` tokens) and setting it in the environment does nothing. Changing the wallet ceiling is a code change. |
 
 ### Optional, and each one turns a `—` in the UI into a number
 
@@ -61,7 +62,7 @@ Nothing here is committed and nothing is baked into an image. Every value is rea
 | `FAST_MODEL` | Model routing (needs `GEMINI_API_KEY`). Unset ⇒ the single client is used UNWRAPPED, so cache keys are byte-identical to a non-routed deployment. |
 | `WORKER_CONCURRENCY` | Jobs per worker instance. Default 2 — the previous hardcoded value, so an existing deployment is unchanged. Out-of-range values are clamped and announced. |
 | `WORKER_HEALTH_PORT` | Binds the worker's `/health` `/ready` `/metrics`. **Unset ⇒ no socket is opened**, which is the default; set it before relying on a healthcheck or an autoscaler. |
-| `MCP_SCOPES` | Comma-separated from `graph,retrieval,verify`. **Unset ⇒ the MCP server exposes NOTHING.** An unknown scope name refuses to start. |
+| `CODEFLOW_MCP_SCOPES` | Comma-separated from `graph,retrieval,verify` (or `all`). **Unset ⇒ the MCP server exposes NOTHING.** An unknown scope name refuses to start. |
 
 ---
 
@@ -150,7 +151,23 @@ against those is worse than an uncalibrated one, because it looks trustworthy.
 
 ## 6. Deploy and scale
 
-Nothing here was executed, and the config was written without a target platform in mind.
+**Nothing here has been executed.** As of 2026-09-01 there IS a target platform and the config
+for it is in the repository: **`render.yaml`** (Render Blueprint, with a Railway appendix) and
+**`DEPLOY.md`** (the ordered, copy-pasteable walkthrough — Atlas, Blueprint, secrets, first
+deploy, pgvector, first analysis, the live benchmark). Read `DEPLOY.md` for the sequence; the
+points below are the ones that outlive any particular host.
+
+Three things `DEPLOY.md` adds that are easy to get wrong and silent when wrong:
+
+- **`PORT`, not `API_PORT`.** A managed host assigns the port at boot. The API now binds
+  `0.0.0.0` on `API_PORT` if set, else `PORT`, else 4000, and logs which one it chose — setting
+  `API_PORT` on Render binds a port the proxy is not routing to.
+- **Redis must be `noeviction`.** BullMQ keeps job state in Redis; under any `allkeys-*`
+  policy jobs are evicted mid-flight with no error anywhere. Managed Redis often defaults to
+  an eviction policy.
+- **`CORS_ORIGINS` cannot be derived** from the blueprint (it needs the web URL, and the web
+  build needs the API URL). Until it is set, the browser gets CORS errors against a perfectly
+  healthy API.
 
 - **CDN:** serve `apps/web/dist` from a CDN. `config.js` is injected at container start, so ONE built
   image works across environments — do not cache it with the hashed assets.

@@ -1,5 +1,5 @@
 import { createApp } from "./app.js";
-import { env } from "./config/env.js";
+import { apiPortResolution, env } from "./config/env.js";
 import { connectMongo, isMongoConnected } from "./db/connectMongo.js";
 import { warmUpApi } from "./health/warmup.js";
 import { createRedisRateLimitStore } from "./middleware/rateLimit.js";
@@ -43,9 +43,15 @@ try {
     warmQa: () => warmQaDependencies(),
   });
 
-  app.listen(env.apiPort, () => {
+  // A managed host routes to the port it assigned; binding elsewhere is reported as unhealthy
+  // with no useful error, so say which variable chose this one.
+  for (const warning of apiPortResolution.warnings) console.warn(`[port] ${warning}`);
+
+  // 0.0.0.0 explicitly: a container that binds the loopback interface is unreachable from the
+  // platform proxy, and the default is host-dependent.
+  app.listen(env.apiPort, "0.0.0.0", () => {
     console.log(
-      `codeflow-api listening on port ${env.apiPort} ` +
+      `codeflow-api listening on 0.0.0.0:${env.apiPort} (port from ${apiPortResolution.source}) ` +
         `(rate limit: ${redis ? "redis" : "in-memory"}, budget: ${redis ? "redis (shared)" : "in-memory"}, ` +
         `warmedUp: ${warm.warmedUp})`,
     );

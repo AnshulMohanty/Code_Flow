@@ -89,6 +89,20 @@ describe("createPgvectorStore — schema", () => {
     expect(statements.some((s) => s.includes("USING hnsw (embedding vector_cosine_ops)"))).toBe(true);
   });
 
+  // A redeploy re-runs ensureSchema against a database that already has the schema. One
+  // non-idempotent statement there throws, `createRetrievalStores` catches it and degrades the
+  // whole index to per-process memory -- so the API answers nothing the worker built, for a
+  // reason that looks like a connection problem.
+  it("is re-runnable: every statement is guarded with IF NOT EXISTS", async () => {
+    const sql = fakeSql();
+    const store = createPgvectorStore({ sql, space: SPACE });
+    await store.ensureSchema();
+    expect(sql.calls.length).toBeGreaterThan(0);
+    for (const call of sql.calls) {
+      expect(normalize(call.sql), `not idempotent: ${call.sql}`).toContain("IF NOT EXISTS");
+    }
+  });
+
   it("skips the HNSW index above pgvector's 2000-dimension ceiling (exact scan, not a crash)", async () => {
     const sql = fakeSql();
     const store = createPgvectorStore({ sql, space: { embeddingModel: "big", embeddingDim: 3072 } });
