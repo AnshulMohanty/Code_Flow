@@ -28,8 +28,18 @@ export function retrievalNamespace(parts: NamespaceParts): string {
  * namespace — two different repositories answering each other's questions.
  */
 function slug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9._@/-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  // `repoFullName` is user-supplied, and the `-+$` half of `/^-+|-+$/g` started a match attempt
+  // at every position in a run of dashes (20 ms at 4 000 characters, 221 ms at 16 000 -- and a
+  // run of dashes is exactly what the collapse on the line above produces). Two pointers, one
+  // pass, same result.
+  return trimDashes(value.toLowerCase().replace(/[^a-z0-9._@/-]+/g, "-"));
+}
+
+/** Strip leading and trailing `-` runs -- what `.replace(/^-+|-+$/g, "")` did. */
+function trimDashes(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === "-") start += 1;
+  while (end > start && value[end - 1] === "-") end -= 1;
+  return value.slice(start, end);
 }

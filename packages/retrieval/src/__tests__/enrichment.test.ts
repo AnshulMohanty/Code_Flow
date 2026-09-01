@@ -269,3 +269,34 @@ describe("deriveEnrichment — docstring", () => {
     expect(enrichment?.docstring?.endsWith("…")).toBe(true);
   });
 });
+
+// V3-FINAL: `stripCommentMarkers` dropped its trailing block terminator with `/\*+\/$/`, which
+// starts a match attempt at every position in a run of asterisks -- 159 ms at 16 000 characters,
+// on comment text that comes from an untrusted repository. Asserted through `deriveEnrichment`
+// rather than the private helper, so the assertion covers the live path.
+describe("comment markers", () => {
+  const enrich = (comment: string) =>
+    deriveEnrichment({
+      startLine: 2,
+      endLine: 2,
+      symbolName: "f",
+      symbols: [{ name: "f", startLine: 2, endLine: 2 }],
+      lines: [comment, "function f() {}"],
+      maxDocChars: 500,
+    })?.docstring;
+
+  it("strips a one-line block comment from both ends", () => {
+    expect(enrich("/** hello **/")).toBe("hello");
+    expect(enrich("/* hello */")).toBe("hello");
+    expect(enrich("// hello")).toBe("hello");
+    expect(enrich("# hello")).toBe("hello");
+  });
+
+  it("does not stall on a comment that is one long run of asterisks", () => {
+    const hostile = `/**${"*".repeat(200_000)} note **/`;
+    const started = performance.now();
+    const docstring = enrich(hostile);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(docstring).toBe("note");
+  });
+});

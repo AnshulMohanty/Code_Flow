@@ -2,6 +2,12 @@ import type { DependencyEdge, LanguageId, ParsedExport, ParsedImport, ParsedSymb
 import { resolveRelativeImport } from "../resolution/importResolver.js";
 import type { ParseFileInput, ParserAdapter } from "../types.js";
 import { PARSER_VERSION } from "../types.js";
+import {
+  ARROW_ASSIGNMENT_LINE,
+  namedBraceBody,
+  parseStaticImportLine,
+  splitAliasSegments,
+} from "../utils/importScan.js";
 import { countLoc, lineNumber, splitLines } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
 import { isPascalCase, isReactHookName, uniquePush } from "../utils/symbolUtils.js";
@@ -46,12 +52,12 @@ export function parseJavaScriptLike(input: ParseFileInput, language: LanguageId)
 }
 
 function collectImports(line: string, currentLine: number, input: ParseFileInput, imports: ParsedImport[]) {
-  const staticMatch = line.match(/^\s*import\s+(?:type\s+)?(?:(.*?)\s+from\s+)?["']([^"']+)["']/);
+  const staticMatch = parseStaticImportLine(line);
   if (staticMatch) {
-    const source = staticMatch[2];
+    const source = staticMatch.source;
     imports.push({
       source,
-      specifiers: parseImportSpecifiers(staticMatch[1] ?? ""),
+      specifiers: parseImportSpecifiers(staticMatch.specifiers),
       importKind: "static",
       line: currentLine,
       resolvedPath: resolveRelativeImport({ fromFile: input.path, source, repoRoot: input.repoRoot }),
@@ -100,7 +106,7 @@ function collectExports(line: string, currentLine: number, exports: ParsedExport
   const namedExportMatch = line.match(/^\s*export\s*\{([^}]+)\}/);
   if (namedExportMatch) {
     for (const name of namedExportMatch[1].split(",")) {
-      const exported = name.trim().split(/\s+as\s+/i).pop()?.trim();
+      const exported = splitAliasSegments(name).pop()?.trim();
       if (exported) {
         exports.push({ name: exported, kind: "unknown", line: currentLine, confidence: 0.8 });
       }
@@ -127,7 +133,7 @@ function collectSymbols(
       nameIndex: 1,
     },
     {
-      match: line.match(/^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(?[^=]*\)?\s*=>/),
+      match: ARROW_ASSIGNMENT_LINE.exec(line),
       kind: "function",
       nameIndex: 1,
     },
@@ -167,12 +173,12 @@ function parseImportSpecifiers(value: string) {
     specifiers.push(namespaceMatch[1]);
   }
 
-  const namedMatch = trimmed.match(/\{([^}]+)\}/);
-  if (namedMatch) {
+  const namedBody = namedBraceBody(trimmed);
+  if (namedBody !== null) {
     specifiers.push(
-      ...namedMatch[1]
+      ...namedBody
         .split(",")
-        .map((part) => part.trim().split(/\s+as\s+/i).pop()?.trim())
+        .map((part) => splitAliasSegments(part).pop()?.trim())
         .filter((part): part is string => Boolean(part)),
     );
   }

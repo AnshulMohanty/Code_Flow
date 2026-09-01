@@ -294,13 +294,25 @@ function pythonDocstring(
 }
 
 function stripCommentMarkers(line: string): string {
-  return line
-    .replace(/^\/\*+/, "")
-    .replace(/\*+\/$/, "")
+  // Every pattern here is `^`-anchored, so it has one start position and cannot backtrack. The
+  // trailing `*/` is the exception: `/\*+\/$/` started an attempt at every position in a run of
+  // asterisks (10 ms at 4 000 characters, 159 ms at 16 000), and comment text comes from an
+  // untrusted repository. `endsWith` decides in one comparison whether there is anything to do.
+  return stripTrailingBlockComment(line.replace(/^\/\*+/, ""))
     .replace(/^\/\/+/, "")
     .replace(/^#+/, "")
     .replace(/^\*+/, "")
     .trim();
+}
+
+// Drop a trailing block-comment terminator and the asterisks in front of it -- what the
+// `/\*+\/$/` replace did. A line comment, because the sequence it looks for would close a
+// block comment.
+function stripTrailingBlockComment(line: string): string {
+  if (!line.endsWith("*/")) return line;
+  let end = line.length - 2;
+  while (end > 0 && line[end - 1] === "*") end -= 1;
+  return line.slice(0, end);
 }
 
 function truncate(text: string, maxChars: number): string {

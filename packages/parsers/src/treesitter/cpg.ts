@@ -2,6 +2,12 @@ import { TREE_SITTER_MAX_BYTES } from "@codeflow/config";
 import type { Node, Tree } from "web-tree-sitter";
 import type { HttpRouteMethod, LanguageId } from "@codeflow/shared-types";
 import { detectLanguage } from "../language.js";
+import {
+  PY_FROM_IMPORT_LINE,
+  PY_IMPORT_LINE,
+  parseStaticImportLine,
+  splitAliasSegments,
+} from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { calleeName, calleeTail, field, namedChildrenOf, startLine, stringValue } from "./ast.js";
@@ -425,18 +431,18 @@ function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFac
   lines.forEach((line, index) => {
     const lineNumber = index + 1;
     if (isPython) {
-      const plain = line.trim().match(/^import\s+(.+)$/);
+      const plain = PY_IMPORT_LINE.exec(line.trim());
       if (plain) {
         for (const part of plain[1].split(",")) {
-          const source = part.trim().split(/\s+as\s+/)[0]?.trim();
+          const source = splitAliasSegments(part)[0]?.trim();
           if (source) facts.imports.push({ source, specifiers: [], kind: "import", line: lineNumber });
         }
       }
-      const from = line.trim().match(/^from\s+([.\w]+)\s+import\s+(.+)$/);
+      const from = PY_FROM_IMPORT_LINE.exec(line.trim());
       if (from) {
         facts.imports.push({
           source: from[1],
-          specifiers: from[2].split(",").map((value) => value.trim().split(/\s+as\s+/)[0] ?? value.trim()),
+          specifiers: from[2].split(",").map((value) => splitAliasSegments(value)[0] ?? value.trim()),
           kind: "import",
           line: lineNumber,
         });
@@ -444,8 +450,8 @@ function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFac
       return;
     }
 
-    const staticImport = line.match(/^\s*import\s+(?:type\s+)?(?:.*?\s+from\s+)?["']([^"']+)["']/);
-    if (staticImport) facts.imports.push({ source: staticImport[1], specifiers: [], kind: "import", line: lineNumber });
+    const staticImport = parseStaticImportLine(line);
+    if (staticImport) facts.imports.push({ source: staticImport.source, specifiers: [], kind: "import", line: lineNumber });
 
     const requireImport = line.match(/\b(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*require\(\s*["']([^"']+)["']\s*\)/);
     if (requireImport) facts.imports.push({ source: requireImport[1], specifiers: [], kind: "require", line: lineNumber });

@@ -162,6 +162,22 @@ describe("retrievalNamespace", () => {
     expect(a).not.toBe(b);
   });
 
+  // V3-FINAL: the `-+$` half of `/^-+|-+$/g` started a match attempt at every position in a run of
+  // dashes -- 221 ms at 16 000 -- and `repoFullName` is user-supplied, so a name of punctuation
+  // collapses to exactly that run.
+  it("does not stall on a repo name that collapses to one long run of dashes", () => {
+    const started = performance.now();
+    const ns = retrievalNamespace({
+      repoFullName: "!".repeat(200_000),
+      commitSha: "sha",
+      embeddingModel: "m",
+      embeddingDim: 8,
+    });
+    expect(performance.now() - started).toBeLessThan(2_000);
+    // Every character collapses to `-`, and the whole run is leading AND trailing, so it is gone.
+    expect(ns).toBe("@sha/m/8");
+  });
+
   it("is deterministic and safe as a plain key (no whitespace or odd characters)", async () => {
     const ns = retrievalNamespace({
       repoFullName: "some org/weird repo!",

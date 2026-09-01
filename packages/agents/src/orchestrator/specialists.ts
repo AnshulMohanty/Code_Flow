@@ -3,6 +3,7 @@ import {
   SPECIALIST_MAX_FILES,
   SPECIALIST_MAX_FINDINGS,
 } from "@codeflow/config";
+import { stripCodeFence } from "@codeflow/analyzers";
 import type { AnalysisResult, RepoCluster } from "@codeflow/shared-types";
 import type { FindingImportance, SpecialistFinding, SpecialistId, SpecialistTask } from "./contracts.js";
 
@@ -192,7 +193,7 @@ export interface ParsedSpecialistOutput {
  * Never throws — a malformed output is a legitimate outcome the orchestrator records as `failed`.
  */
 export function parseSpecialistOutput(raw: string): ParsedSpecialistOutput | { error: string } {
-  const cleaned = stripFences(raw).trim();
+  const cleaned = stripCodeFence(raw).trim();
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
@@ -289,7 +290,3 @@ function truncate(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 1)}…`;
 }
 
-function stripFences(text: string): string {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fenced ? fenced[1] : text;
-}

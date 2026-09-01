@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stripCodeFence } from "../llm/completionText.js";
 import type {
   FileMetrics,
   PipelineContext,
@@ -218,7 +219,7 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
 /** Parse the raw completion, schema-validate it, then drop ungrounded reading steps.
  *  Throws on malformed JSON, schema miss, or an empty-after-grounding reading order. */
 export function deriveSynthesis(raw: string, nodeIds: Set<string>): Synthesis {
-  const cleaned = stripCodeFences(raw).trim();
+  const cleaned = stripCodeFence(raw).trim();
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
@@ -277,11 +278,6 @@ export function deriveSynthesis(raw: string, nodeIds: Set<string>): Synthesis {
     ...(keyConcepts ? { keyConcepts } : {}),
     ...(droppedCitations > 0 ? { droppedCitations } : {}),
   };
-}
-
-function stripCodeFences(text: string): string {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fence ? fence[1] : text;
 }
 
 function sha256(value: string): string {

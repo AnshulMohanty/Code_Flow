@@ -1,3 +1,4 @@
+import { stripCodeFence } from "@codeflow/analyzers";
 import type { AgentAction, ToolArgs } from "./contracts.js";
 
 /**
@@ -18,8 +19,7 @@ import type { AgentAction, ToolArgs } from "./contracts.js";
 
 /** Strip a ```json fence, and otherwise find the outermost JSON object in the text. */
 export function extractJsonObject(raw: string): string | null {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  const candidate = fenced ? fenced[1] : raw;
+  const candidate = stripCodeFence(raw);
 
   const start = candidate.indexOf("{");
   if (start === -1) return null;

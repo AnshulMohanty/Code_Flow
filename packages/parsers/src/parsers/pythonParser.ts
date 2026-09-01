@@ -2,6 +2,11 @@ import type { DependencyEdge, ParsedExport, ParsedImport, ParsedSymbol } from "@
 import { resolvePythonImport } from "../resolution/importResolver.js";
 import type { ParserAdapter } from "../types.js";
 import { PARSER_VERSION } from "../types.js";
+import {
+  PY_FROM_IMPORT_LINE,
+  PY_IMPORT_LINE,
+  splitAliasSegments,
+} from "../utils/importScan.js";
 import { countLoc, indentationOf, lineNumber, splitLines } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
 
@@ -23,10 +28,10 @@ export const pythonParser: ParserAdapter = {
         activeClassIndent = null;
       }
 
-      const importMatch = trimmed.match(/^import\s+(.+)$/);
+      const importMatch = PY_IMPORT_LINE.exec(trimmed);
       if (importMatch) {
         for (const part of importMatch[1].split(",")) {
-          const source = part.trim().split(/\s+as\s+/)[0]?.trim();
+          const source = splitAliasSegments(part)[0]?.trim();
           if (source) {
             imports.push({
               source,
@@ -39,12 +44,12 @@ export const pythonParser: ParserAdapter = {
         }
       }
 
-      const fromMatch = trimmed.match(/^from\s+([.\w]+)\s+import\s+(.+)$/);
+      const fromMatch = PY_FROM_IMPORT_LINE.exec(trimmed);
       if (fromMatch) {
         const source = fromMatch[1];
         imports.push({
           source,
-          specifiers: fromMatch[2].split(",").map((value) => value.trim().split(/\s+as\s+/)[0] ?? value.trim()),
+          specifiers: fromMatch[2].split(",").map((value) => splitAliasSegments(value)[0] ?? value.trim()),
           importKind: "python",
           line: currentLine,
           resolvedPath: resolvePythonImport({ fromFile: input.path, source, repoRoot: input.repoRoot }),

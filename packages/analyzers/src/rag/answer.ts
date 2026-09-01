@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stripCodeFence } from "../llm/completionText.js";
 import { RAG_MIN_SIMILARITY, RAG_TOP_K } from "@codeflow/config";
 import {
   assertEmbeddingSpace,
@@ -205,7 +206,7 @@ export function deriveAnswer(
   const byId = new Map(retrieved.map((c) => [c.id, c]));
   let parsed: { answer?: unknown; answered?: unknown; citations?: unknown } | null = null;
   try {
-    parsed = JSON.parse(stripCodeFences(raw).trim());
+    parsed = JSON.parse(stripCodeFence(raw).trim());
   } catch {
     parsed = null;
   }
@@ -240,11 +241,6 @@ export function deriveAnswer(
     answered: true,
     ...(dropped.length ? { droppedCitations: { count: dropped.length, ids: dropped } } : {}),
   };
-}
-
-function stripCodeFences(text: string): string {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fence ? fence[1] : text;
 }
 
 

@@ -1,3 +1,5 @@
+import { stripTrailingCodeFence } from "@codeflow/analyzers";
+
 /**
  * What the judge needs to see of a chunk: where it came from and what it said. A narrow local
  * type rather than `RetrievedChunk` — V3-P2 split the persisted metadata from the text, and the
@@ -209,7 +211,10 @@ export function buildJudgePrompt(request: JudgeRequest): string {
 /** Parse a judge completion defensively — a malformed verdict must not be scored as 0
  *  faithfulness (that would silently penalise a good answer for the judge's bad JSON). */
 export function parseJudgeVerdict(completion: string): JudgeVerdict {
-  const stripped = completion.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  // The leading marker is `^`-anchored, so it is linear; the trailing one was not (see
+  // stripTrailingCodeFence). This strips MARKERS, not a matched pair -- an unterminated fence
+  // around a verdict still has to parse.
+  const stripped = stripTrailingCodeFence(completion.trim().replace(/^```(?:json)?\s*/i, ""));
   const parsed: unknown = JSON.parse(stripped);
   if (!parsed || typeof parsed !== "object") throw new Error("Judge returned a non-object verdict.");
   const record = parsed as Record<string, unknown>;

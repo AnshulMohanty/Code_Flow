@@ -91,6 +91,8 @@ export {
   usageNumber,
   TOKEN_ESTIMATE_CHARS_PER_TOKEN,
 } from "./util/tokens.js";
+// V3-FINAL: the ONE linear completion unwrapper (replaces five copies of a cubic fence regex).
+export { stripCodeFence, stripTrailingCodeFence } from "./llm/completionText.js";
 export { createOrientStage, type OrientDependencies } from "./stages/orient.js";
 export {
   createMapStructureStage,

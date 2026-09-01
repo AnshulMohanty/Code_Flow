@@ -1,4 +1,5 @@
 import { SUPERVISOR_MAX_FINDINGS, SUPERVISOR_MAX_READING_STEPS } from "@codeflow/config";
+import { stripCodeFence } from "@codeflow/analyzers";
 import type { AnalysisResult, ReadingStep, Synthesis } from "@codeflow/shared-types";
 import type { ContextBreakdown } from "../contracts.js";
 import { meterContext } from "../contextMeter.js";
@@ -117,7 +118,7 @@ export function deriveSupervisedSynthesis(
   nodeIds: ReadonlySet<string>,
   maxSteps = SUPERVISOR_MAX_READING_STEPS,
 ): Synthesis {
-  const cleaned = stripFences(raw).trim();
+  const cleaned = stripCodeFence(raw).trim();
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
@@ -243,7 +244,3 @@ function rank(importance: SpecialistFinding["importance"]): number {
   return importance === "high" ? 3 : importance === "medium" ? 2 : 1;
 }
 
-function stripFences(text: string): string {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  return fenced ? fenced[1] : text;
-}
