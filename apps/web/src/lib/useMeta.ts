@@ -15,7 +15,14 @@ import type { MetaFacts } from "./siteModel";
  *
  * NOT retried on a timer. A failed meta fetch costs the chrome its version string and nothing else —
  * the analysis views work entirely from the result — and a background poll against a dead API is
- * noise in a console for no benefit. The user's next navigation refetches.
+ * noise in a console for no benefit.
+ *
+ * IT IS RETRIED ON A SIGNAL, which is a different thing and was missing. On a free tier the backend
+ * is usually ASLEEP when the page first loads, so this fetch reliably fails on the first visit after
+ * an idle period — and, retried by nothing, the chrome would show an em-dash version and an OFFLINE
+ * pill for the rest of the session even after the backend woke up thirty seconds later. Passing the
+ * wake status as `refetchOn` re-runs the effect exactly once, when the backend becomes reachable.
+ * A signal, not a timer: it fires when something changed, not on a schedule nobody is watching.
  */
 
 export type MetaState =
@@ -23,7 +30,7 @@ export type MetaState =
   | { status: "ready"; facts: MetaFacts; error: null }
   | { status: "error"; facts: null; error: string };
 
-export function useMeta(): MetaState {
+export function useMeta(refetchOn?: unknown): MetaState {
   const [state, setState] = useState<MetaState>({ status: "loading", facts: null, error: null });
 
   useEffect(() => {
@@ -50,7 +57,9 @@ export function useMeta(): MetaState {
       live = false;
       controller.abort();
     };
-  }, []);
+    // `refetchOn` is a SIGNAL, not a value this effect reads — see the module note. It is in the
+    // dependency list precisely so a change to it re-runs the fetch.
+  }, [refetchOn]);
 
   return state;
 }
