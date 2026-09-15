@@ -41,6 +41,9 @@ importers:
       '@codeflow/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@codeflow/worker':
+        specifier: workspace:*
+        version: link:../worker
       bullmq:
         specifier: ^5.34.5
         version: 5.76.6

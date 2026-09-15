@@ -44,11 +44,56 @@ process.on("uncaughtException", (error) => {
   console.error("[worker] uncaughtException (worker kept alive):", error);
 });
 
-async function main() {
-  await mongoose.connect(env.mongoUri, {
-    serverSelectionTimeoutMS: 5000,
-  });
-  console.log("CodeFlow worker connected to MongoDB.");
+/**
+ * EMBEDDED MODE (B7) — what changes when the worker runs inside the API process.
+ *
+ * The two-process split stays the default and is the right architecture: the worker holds a job for
+ * minutes and scales on queue depth while the API scales on request volume. It is also not
+ * deployable for free, because Render has no free `worker` service type — and an architecture
+ * nobody can run is not better than one they can.
+ *
+ * Everything here is opt-in and defaulted so a normal worker process behaves exactly as before.
+ */
+export interface StartWorkerOptions {
+  /**
+   * The host process already called `mongoose.connect`. Connecting twice on one mongoose singleton
+   * is not idempotent — it replaces the connection the host is using, mid-flight.
+   */
+  mongoAlreadyConnected?: boolean;
+  /**
+   * Use the host's retrieval stores instead of resolving a second pair.
+   *
+   * THIS IS THE ONE THING EMBEDDED MODE IS GENUINELY BETTER AT. With no Postgres, retrieval falls
+   * back to a per-process in-memory index; in split mode that means the worker writes an index the
+   * API cannot read and every question is refused. Sharing one heap means sharing one store, so Q&A
+   * works with no database at all — for the life of the process, which is stated rather than implied.
+   */
+  retrieval?: RetrievalStores | null;
+  /** Override the resolved concurrency. Embedded mode passes 1 — see resolveEmbeddedWorker. */
+  concurrency?: number;
+  /** Bind the worker's own /health /ready /metrics server. False when the host already has one. */
+  healthServer?: boolean;
+  /** Install SIGINT/SIGTERM handlers. False when the host owns the process lifecycle. */
+  handleSignals?: boolean;
+}
+
+/** What a caller needs to shut the consumer down without owning the process. */
+export interface AnalysisWorkerHandle {
+  stop(): Promise<void>;
+  /** The queue this instance consumes. Reported so an embedded host can log what it started. */
+  queueName: string;
+}
+
+export async function startAnalysisWorker(options: StartWorkerOptions = {}): Promise<AnalysisWorkerHandle> {
+  const embedded = options.mongoAlreadyConnected === true;
+  if (options.mongoAlreadyConnected) {
+    console.log("[worker] embedded: reusing the host process's MongoDB connection.");
+  } else {
+    await mongoose.connect(env.mongoUri, {
+      serverSelectionTimeoutMS: 5000,
+    });
+    console.log("CodeFlow worker connected to MongoDB.");
+  }
 
   const service = createMongoWorkerAnalysisService();
   const cloner = createGitRepoCloner();
@@ -117,8 +162,15 @@ async function main() {
   // V3-P2 — the retrieval stores. Resolved ONCE at boot, in the embedding client's space, so
   // the pgvector table is created at the right dimension and every job writes to the same
   // index. Skipped entirely with no embedding client: there would be no vectors to store.
-  let retrieval: RetrievalStores | null = null;
-  if (embeddingClient) {
+  let retrieval: RetrievalStores | null = options.retrieval ?? null;
+  if (retrieval) {
+    console.log(
+      `[worker] embedded: sharing the host's retrieval index (${retrieval.vectorStore.id}, mode ${retrieval.mode}).` +
+        (retrieval.mode === "memory"
+          ? " In ONE process that is enough for Q&A to work; it does not survive a restart."
+          : ""),
+    );
+  } else if (embeddingClient) {
     retrieval = await createRetrievalStores({
       space: { embeddingModel: embeddingClient.model, embeddingDim: embeddingClient.dimension },
       postgresUrl: env.postgresUrl,
@@ -232,7 +284,7 @@ async function main() {
     },
     {
       connection: createRedisConnectionOptions({ forWorker: true }),
-      concurrency: scaling.concurrency,
+      concurrency: options.concurrency ?? scaling.concurrency,
     },
   );
 
@@ -244,14 +296,18 @@ async function main() {
   // A separate `Queue` handle purely to READ counts. BullMQ's Worker knows what it is running but
   // not what is waiting, and the waiting count is the whole point of the metric: an autoscaler
   // needs the backlog, which by definition lives outside this process.
-  const metricsQueue = scaling.healthPort
-    ? new Queue(ANALYSIS_QUEUE_NAME, { connection: createRedisConnectionOptions({ forWorker: true }) })
-    : null;
+  const wantsHealthServer = options.healthServer !== false;
+  const metricsQueue =
+    wantsHealthServer && scaling.healthPort
+      ? new Queue(ANALYSIS_QUEUE_NAME, { connection: createRedisConnectionOptions({ forWorker: true }) })
+      : null;
   metricsQueue?.on("error", (error: Error) => {
     // Reported, not fatal. The metrics queue is observability; losing it must not cost capacity.
     console.error(`[worker] metrics queue error: ${error.message}`);
   });
-  const healthServer = startHealthServer(scaling, {
+  // Skipped in embedded mode: the host process already serves /health, and binding a second socket
+  // in one process is a second port a free platform does not route to.
+  const healthServer = !wantsHealthServer ? null : startHealthServer(scaling, {
     warmup: () => warmupRegistry.state(),
     async queueDepth() {
       if (!metricsQueue) return null;
@@ -275,7 +331,12 @@ async function main() {
     }),
   });
 
-  const shutdown = async () => {
+  /**
+   * Drain and release. Does NOT exit the process, and does NOT tear down anything it did not open —
+   * in embedded mode the host owns the Mongo connection and the retrieval pool, and closing either
+   * on the way out would take the API down with the worker.
+   */
+  const stop = async (): Promise<void> => {
     console.log("Stopping CodeFlow worker.");
     // Flipped BEFORE the close, so /health reports 503 for the whole drain rather than only after
     // the last job finishes. That is what lets a load balancer or scaler stop counting this
@@ -284,19 +345,40 @@ async function main() {
     await worker.close();
     await metricsQueue?.close().catch(() => undefined);
     healthServer?.close();
-    await retrieval?.sql?.end().catch(() => undefined);
-    await mongoose.disconnect();
-    process.exit(0);
+    if (!options.retrieval) await retrieval?.sql?.end().catch(() => undefined);
+    if (!embedded) await mongoose.disconnect();
   };
 
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  if (options.handleSignals !== false) {
+    const shutdown = async () => {
+      await stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", () => void shutdown());
+    process.on("SIGTERM", () => void shutdown());
+  }
 
-  console.log(`CodeFlow worker listening on BullMQ queue "${ANALYSIS_QUEUE_NAME}".`);
+  console.log(
+    `CodeFlow worker listening on BullMQ queue "${ANALYSIS_QUEUE_NAME}"${embedded ? " (embedded in the API process)" : ""}.`,
+  );
+  return { stop, queueName: ANALYSIS_QUEUE_NAME };
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : "Unknown worker startup error.";
-  console.error(`CodeFlow worker failed to start: ${message}`);
-  process.exit(1);
-});
+/**
+ * Run only when INVOKED as the process entrypoint, not when imported.
+ *
+ * The API imports `startAnalysisWorker` from this module in embedded mode; without this guard that
+ * import would ALSO start a second fully-configured worker as a side effect — its own Mongo connect,
+ * its own health-server bind, its own BullMQ consumer. Separator-normalised for the same reason as
+ * apps/local-cli: `process.argv[1]` uses the platform separator, and a guard that is silently false
+ * on Windows is a guard that does nothing.
+ */
+const ENTRY_PATTERN = new RegExp("worker/(?:dist|src)/index[.](?:js|ts)$");
+
+if (ENTRY_PATTERN.test((process.argv[1] ?? "").split(path.sep).join("/"))) {
+  startAnalysisWorker().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "Unknown worker startup error.";
+    console.error(`CodeFlow worker failed to start: ${message}`);
+    process.exit(1);
+  });
+}

@@ -90,6 +90,20 @@ async function resolveBudget(): Promise<BudgetHandle> {
   return sharedBudget;
 }
 
+/**
+ * The retrieval stores this process resolved, or null when none can be (no embedding provider).
+ *
+ * Exists for EMBEDDED-WORKER mode. Without a Postgres both processes fall back to a per-process
+ * in-memory index, and in the normal split deployment that means the worker writes an index the API
+ * cannot read — every question refused. Running in one process only helps if they are handed the
+ * SAME object, which is what this returns. Memoized, so asking for it does not open a second pool.
+ */
+export async function getQaRetrievalStores(): Promise<RetrievalStores | null> {
+  const embeddingClient = createEmbeddingClientFromEnv(process.env);
+  if (!embeddingClient) return null;
+  return resolveRetrieval({ embeddingModel: embeddingClient.model, embeddingDim: embeddingClient.dimension });
+}
+
 /** Test seam: forget the memoized budget so a suite can re-resolve it. */
 export function resetQaBudgetForTests(): void {
   sharedBudget = null;

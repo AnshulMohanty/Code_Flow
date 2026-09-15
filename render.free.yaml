@@ -1,0 +1,163 @@
+# CodeFlow — Render Blueprint, FREE TIER.
+#
+# NOTHING HERE HAS BEEN APPLIED. Same status as render.yaml: this is the deployment described so it
+# can be reviewed. Creating the services and filling the secrets are owner steps; DEPLOY.md
+# Appendix C is the walkthrough.
+#
+# ── Why this file exists separately ───────────────────────────────────────────────────────────
+#
+# render.yaml is the RIGHT architecture: an API that scales on request volume and a worker that
+# scales on queue depth, separated so either can move without the other. It is also not deployable
+# for free — Render has no free `worker` service type — and an architecture nobody can run is not
+# better than one they can.
+#
+# So this is the same system folded into ONE web service, with the tradeoffs stated rather than
+# discovered. It is not a "lite" version: every stage, every guard and every grounding pass is
+# identical. What changes is the process topology.
+#
+# ── What you give up, in order of how much it will bother you ─────────────────────────────────
+#
+#  1. ONE EVENT LOOP for parsing and HTTP. Parsing is CPU-bound, so p99 on every endpoint gets worse
+#     while a job runs. Concurrency is forced to 1 in code (apps/api/src/config/embeddedWorker.ts)
+#     for exactly this reason, and WORKER_CONCURRENCY is ignored with a log line saying so.
+#  2. ALL-OR-NOTHING SCALING. More capacity means more copies of both halves — the coupling the
+#     split exists to remove.
+#  3. A WORKER CRASH TAKES THE API WITH IT. In split mode BullMQ re-delivers to another instance.
+#  4. THE FREE POSTGRES EXPIRES AFTER 30 DAYS. See the note on the database below; this is the one
+#     that arrives without warning.
+#
+# ── What is actually BETTER here, and it is not nothing ───────────────────────────────────────
+#
+# The API and the worker share a heap, so they can be handed the SAME retrieval store object. With
+# no Postgres, retrieval falls back to a per-process in-memory index — which in split mode means the
+# worker writes an index the API cannot read and every question is refused. In one process, Q&A
+# works with no database at all. It does not survive a restart, and /health says so
+# (`retrieval.mode: "memory"` with the reason).
+#
+# ── Cold start, and why there is no pinger ────────────────────────────────────────────────────
+#
+# A free web service sleeps after ~15 minutes idle and wakes in 30-50 seconds. The frontend is a
+# STATIC SITE, so it is always on and paints its whole shell with no API call; a real visitor's
+# first page load fires one `GET /health` that wakes the backend (apps/web/src/lib/useWake.ts).
+#
+# There is deliberately NO scheduled keep-alive. A 10-minute cron ping is ~4,300 requests a month
+# that hold the container RUNNING, which exhausts the free ~750 instance-hours and SUSPENDS the
+# service for the rest of the month — strictly worse than sleeping, because a suspended service does
+# not wake at all.
+
+services:
+  # ── API + the analysis worker, in one process ───────────────────────────────────────────────
+  - type: web
+    name: codeflow-api
+    runtime: docker
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    # /health, not /ready. Render restarts an instance that fails its health check, and /ready is
+    # 503 while warm-up loads the tree-sitter grammars — pointing the check there would restart
+    # every instance for being cold, forever.
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: codeflow-shared
+      - key: NODE_ENV
+        value: production
+      # THE ONE LINE THAT MAKES THIS TOPOLOGY. Read by resolveEmbeddedWorker, which also forces
+      # concurrency to 1 and logs both facts at boot.
+      - key: RUN_WORKER_IN_PROCESS
+        value: "true"
+      # PORT is assigned by Render and read by apps/api/src/config/port.ts. API_PORT is deliberately
+      # NOT set: it takes precedence, so setting it would bind a port the proxy is not routing to.
+      - key: POSTGRES_URL
+        fromDatabase:
+          name: codeflow-postgres-free
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: codeflow-keyvalue-free
+          property: connectionString
+      # Needs the static site's URL, which does not exist until the first deploy. Owner step.
+      - key: CORS_ORIGINS
+        sync: false
+
+  # ── Web (static SPA) — free, always on, never sleeps ────────────────────────────────────────
+  - type: web
+    name: codeflow-web
+    runtime: static
+    # Only the two packages the SPA imports are built; `pnpm -r build` here would also build the
+    # api, the worker and the MCP server to produce a folder of static files.
+    # VITE_API_BASE_URL is set in the BUILD COMMAND, not in envVars: Render does not expand `$VAR`
+    # inside an envVar `value:`, so it would bake the literal string into the bundle.
+    buildCommand: >-
+      corepack enable &&
+      pnpm install --frozen-lockfile &&
+      pnpm --filter @codeflow/shared-types --filter @codeflow/config build &&
+      VITE_API_BASE_URL="https://$CODEFLOW_API_HOST"
+      pnpm --filter @codeflow/web build
+    staticPublishPath: apps/web/dist
+    pullRequestPreviewsEnabled: false
+    envVars:
+      - key: CODEFLOW_API_HOST
+        sync: false
+    routes:
+      # SPA fallback. Every unmatched path is the app's own router's problem, not a 404.
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  # ── Redis — the queue, the shared rate limit, the shared daily budget ───────────────────────
+  - type: keyvalue
+    name: codeflow-keyvalue-free
+    plan: free
+    region: oregon
+    # REQUIRED, not tuning. BullMQ keeps job state in Redis; under any `allkeys-*` policy the store
+    # evicts keys when it fills and jobs vanish mid-flight with no error anywhere.
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+databases:
+  # ── Postgres + pgvector — the Q&A index ─────────────────────────────────────────────────────
+  #
+  # RENDER'S FREE POSTGRES EXPIRES AFTER 30 DAYS and is then deleted. That is not a footnote: on day
+  # 31 POSTGRES_URL points at nothing, `createRetrievalStores` degrades to an in-memory index and
+  # SAYS SO on /health, and — because this topology runs both halves in one process — Q&A keeps
+  # working from that in-memory index rather than failing. It stops surviving restarts, which is a
+  # real loss and a survivable one.
+  #
+  # pgvector needs 15+. The extension is created by the APPLICATION, not here:
+  # `createPgvectorStore.ensureSchema()` runs CREATE EXTENSION IF NOT EXISTS vector and the
+  # dimension-typed table on first use.
+  - name: codeflow-postgres-free
+    plan: free
+    region: oregon
+    postgresMajorVersion: "16"
+    ipAllowList: []
+
+# MongoDB is NOT here. Atlas M0 is free forever and external; `MONGO_URI` is a secret the owner
+# fills in the shared env group. Create the cluster FIRST — the API refuses to boot without it.
+envVarGroups:
+  - name: codeflow-shared
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      # One Gemini key powers both chat and embeddings, which is the cheapest configuration and the
+      # reason it is the documented default.
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      # OFF on free, deliberately. The fan-out is 5N+1 provider calls where the single-shot stage is
+      # 1 — the right trade for a real onboarding guide and the wrong one for a free demo. Turning it
+      # on is a single variable; see GO_LIVE.md.
+      - key: FANOUT_SYNTHESIS
+        value: "false"
+      # Also off: it touches the deterministic spine, and on a 0.1-CPU free instance there is no
+      # parallelism to win anyway.
+      - key: PARALLEL_STAGES
+        value: "false"
+      # Set it to turn `usd: null` into a real number. Format and current values in GO_LIVE.md §1.
+      - key: LLM_PRICING
+        sync: false
