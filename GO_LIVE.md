@@ -176,8 +176,12 @@ Three things `DEPLOY.md` adds that are easy to get wrong and silent when wrong:
   of a run, so it looks idle while it is the bottleneck.
 - **Readiness gates rollout.** `/ready` is 503 until warm-up completes; a scale-out instance must not be
   counted as capacity while it is still loading WASM grammars.
-- **Keepalive:** `.github/workflows/keepalive.yml` is present and DISABLED. Enable it only if the host
-  sleeps idle containers, and point it at `/health` (liveness), not `/ready`.
+- **Keepalive: REMOVED, on purpose.** `scripts/keepalive.mjs` and `.github/workflows/keepalive.yml`
+  are gone. A 10-minute cron ping keeps a free instance awake by keeping it RUNNING — ~4,300 requests
+  a month — which burns the ~750 free instance-hours and gets the service suspended for the rest of
+  the month. A suspended service is worse than a sleeping one: sleeping wakes in 30-50s, suspended
+  does not wake. Cold start is handled in the browser instead (wake-on-visit, `apps/web/src/lib/useWake.ts`),
+  which costs hours only when a human is actually there. Nothing to enable.
 
 Then run the live benchmark, which is the only number here that says anything about real hardware:
 

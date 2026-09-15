@@ -286,8 +286,14 @@ Record the output in `CURRENT_STATE.md`. Two honesty notes that travel with the 
 - **Termination grace ≥ 300s.** An analysis job `SIGKILL`ed mid-run is re-delivered by BullMQ and
   redoes all of its work, *including the provider spend*.
 - `WORKER_CONCURRENCY` tunes jobs per instance (default 2, ceiling 8). Past the ceiling, scale out.
-- **Do not enable `keepalive.yml` unless the host sleeps idle containers**, and point it at
-  `/health` (liveness), never `/ready`.
+- **There is deliberately NO scheduled keep-alive, and removing it was a decision, not a cleanup.**
+  A cron ping every 10 minutes does defeat idle sleep — and it is ~4,300 requests a month that hold
+  the container up 24/7, which exhausts a free tier's ~750 instance-hours and SUSPENDS the service
+  for the remainder of the month. That is strictly worse than the problem: a sleeping service wakes
+  in 30-50 seconds; a suspended one does not wake at all. The replacement is WAKE-ON-VISIT in the
+  browser (`apps/web/src/lib/useWake.ts`): one fire-and-forget `GET /health` when a real person
+  opens the page, retried with backoff and stopped the moment it answers. A month with no visitors
+  costs no hours. On a PAID plan that never sleeps, none of this applies and nothing needs enabling.
 
 ---
 
