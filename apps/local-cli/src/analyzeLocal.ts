@@ -34,9 +34,20 @@ import type { AnalysisResult, PipelineInput, PipelineStage } from "@codeflow/sha
  *   - the index is `createFileVectorStore` — a JSON file on disk (LanceDB probed and rejected: 656 MB
  *     and it drags `onnxruntime-node` back in);
  *   - retrieval is the SAME `hybridSearch` the hosted path uses.
- * There is no HTTP client, no socket and no provider key anywhere in this module's import graph. That
- * is a property a reader can verify by reading the imports, which is the strongest form the claim can
- * take.
+ * WHAT THAT CLAIM IS, EXACTLY — because the first version of this comment overstated it and the
+ * zero-egress test is what caught that. It said there was "no HTTP client anywhere in this module's
+ * import graph". There is: importing `@codeflow/analyzers` for the stages pulls in that package's
+ * BARREL, which re-exports `llmClient.ts` and `embeddingClient.ts`, and both call `fetch`.
+ *
+ * Nothing leaks, and the accurate statement is stronger than the loose one because it is checkable
+ * at two levels:
+ *   - This module NEVER REFERENCES a provider constructor. Reachability through a barrel is not use;
+ *     nothing here can construct a client, so nothing here can call one.
+ *   - The PUBLISHED BUNDLE contains no `fetch` call, no provider client and no provider hostname at
+ *     all — Rollup drops them as unreferenced. That is the artifact a user installs, it is
+ *     deliberately not minified, and anyone can grep the file they downloaded to confirm it.
+ * Both are asserted in `__tests__/zeroEgress.test.ts`, including an exact list of the two reachable
+ * fetch-capable modules, so a third cannot appear quietly.
  *
  * THE SYNTHESIZE STAGE IS ABSENT, deliberately. It needs an LLM, and there is no keyless local one —
  * so rather than degrade it into something that looks like a summary and is not, the local run stops

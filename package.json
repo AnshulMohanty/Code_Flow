@@ -12,7 +12,7 @@
     "dev:web": "pnpm --filter @codeflow/web dev",
     "dev:api": "pnpm --filter @codeflow/api dev",
     "dev:worker": "pnpm --filter @codeflow/worker dev",
-    "dev:local": "pnpm --filter @codeflow/local-cli dev",
+    "dev:local": "pnpm --filter codeflow-local dev",
     "eval": "pnpm --filter @codeflow/eval run eval",
     "build": "pnpm -r build",
     "test": "pnpm -r --workspace-concurrency=1 test",

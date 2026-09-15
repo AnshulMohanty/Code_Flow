@@ -338,3 +338,41 @@ All three are off in both blueprints, each for a stated reason, and each is one 
 
 Turn `FANOUT_SYNTHESIS` on **after** `LLM_PRICING`, not before — otherwise the first thing the
 fan-out does is spend an unknown amount of money and report `usd: null`.
+
+---
+
+## 11. Publishing `codeflow-local` to npm
+
+The package is prepared but **has never been published**. `npm publish` is an owner step: it needs an
+npm account with 2FA, and the name `codeflow-local` must still be free.
+
+```bash
+cd apps/local-cli
+pnpm build && pnpm bundle            # tsc, then the single-file bundle npm actually ships
+npm pack --dry-run                   # confirm the tarball is ONLY bundle/ + package.json + README
+node bundle/codeflow-local.mjs analyze ../../packages/graph --no-index   # run the artifact itself
+npm publish --access public
+```
+
+**Why the bundle matters and is not an optimisation.** `dist/index.js` imports `@codeflow/parsers`,
+`@codeflow/graph`, `@codeflow/analyzers` and friends — every one of them `private: true` and never
+published. A package shipped that way resolves those from the public registry, finds nothing, and
+fails at install for every user. `bundle/codeflow-local.mjs` compiles the whole workspace graph in and
+leaves exactly two runtime dependencies: `web-tree-sitter` and `@vscode/tree-sitter-wasm`, the second
+of which is loaded by path at runtime and so cannot be inlined.
+
+**Check before you publish:**
+
+| Check | Why |
+|---|---|
+| `npm view codeflow-local` returns 404 | The name is free. If not, scope it (`@yourname/codeflow-local`) and update `bin` — the command name can stay `codeflow-local`. |
+| `pnpm --filter codeflow-local test` is green | `zeroEgress.test.ts` greps the SHIPPED bundle for `fetch(`, provider clients and provider hostnames. It is the privacy guarantee, checked against the artifact rather than the source. |
+| `bundle/` is not minified | Deliberate. The product claim is "this sends nothing anywhere", and the cheapest way for a stranger to verify that is to read the file they installed. |
+| The version was bumped | `0.1.0` is the first. npm will not accept a republish of the same version. |
+
+After publishing, `npx codeflow-local .` works anywhere with Node 20+. Until then the command in the
+README works from a checkout:
+
+```bash
+node apps/local-cli/bundle/codeflow-local.mjs analyze /path/to/repo
+```

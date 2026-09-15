@@ -66,8 +66,14 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
       --index-dir DIR     the index built by \`analyze\` (default <repo>/.codeflow)
       -k N                how many code chunks to return (default 5)
 
-Local mode has NO AI summary: synthesis needs an LLM and there is no keyless local one. The graph,
-metrics, communities, cycles and grounded retrieval all work offline.`;
+WHAT YOU GET, and what you do not:
+  ✓ dependency graph, centrality, cycles, communities, symbols, entry points  — all offline
+  ✓ grounded search over your code                                            — lexical, offline
+  ✗ AI summary / reading order    — needs a model; there is no keyless local one
+  ✗ semantic search               — the local embedder matches WORDS, not meaning
+
+Nothing is uploaded. No API key is read. The published bundle contains no network client at all —
+grep it for "fetch(" if you would rather check than trust.`;
 
 async function main(): Promise<number> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
@@ -171,8 +177,17 @@ async function main(): Promise<number> {
  *
  * Built with `new RegExp` over a normalised path rather than a literal, so the pattern needs no
  * escape sequences at all and cannot regress into the same class of bug.
+ *
+ * THREE ENTRYPOINTS, because there are three ways this file legitimately becomes `argv[1]`:
+ *   - `src/index.ts`   — `pnpm dev:local`, via tsx
+ *   - `dist/index.js`  — the tsc output, inside the workspace
+ *   - `codeflow-local.mjs` — the PUBLISHED bundle, which is what `npx codeflow-local` runs
+ *
+ * The third was missed on the first pass and the symptom was identical to the Windows bug above:
+ * the bundle ran, matched nothing, and exited 0 in silence. Anything narrower than this ships a CLI
+ * that works everywhere except where users actually run it.
  */
-const ENTRY_PATTERN = new RegExp("local-cli/(?:dist|src)/index[.](?:js|ts)$");
+const ENTRY_PATTERN = new RegExp("(?:local-cli/(?:dist|src)/index[.](?:js|ts)|codeflow-local(?:[.]mjs)?)$");
 
 /** `process.argv[1]` with the platform separator normalised to "/". Exported for the test. */
 export function normalizeEntryPath(argvPath: string | undefined): string {

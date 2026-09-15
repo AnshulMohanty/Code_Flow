@@ -1,10 +1,9 @@
 {
-  "name": "@codeflow/local-cli",
-  "version": "0.0.0",
-  "private": true,
+  "name": "codeflow-local",
+  "version": "0.1.0",
   "type": "module",
   "bin": {
-    "codeflow-local": "./dist/index.js"
+    "codeflow-local": "./bundle/codeflow-local.mjs"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
@@ -12,19 +11,50 @@
     "build": "tsc -p tsconfig.json",
     "pretypecheck": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build",
+    "pretest": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/analyzers build && pnpm bundle",
     "test": "vitest run --passWithNoTests",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "bundle": "vite build --config vite.config.ts",
+    "prepublishOnly": "pnpm build && pnpm bundle"
   },
   "dependencies": {
+    "@vscode/tree-sitter-wasm": "0.3.1",
+    "web-tree-sitter": "0.26.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
     "@codeflow/analyzers": "workspace:*",
     "@codeflow/config": "workspace:*",
     "@codeflow/graph": "workspace:*",
     "@codeflow/parsers": "workspace:*",
     "@codeflow/retrieval": "workspace:*",
-    "@codeflow/shared-types": "workspace:*"
+    "@codeflow/shared-types": "workspace:*",
+    "vite": "^5.4.11"
   },
-  "devDependencies": {
-    "@types/node": "^22.9.0"
+  "description": "Analyse a repository entirely on your machine — dependency graph, metrics and grounded search. No API key, no network, no code leaves the device.",
+  "license": "MIT",
+  "keywords": [
+    "code-analysis",
+    "dependency-graph",
+    "tree-sitter",
+    "offline",
+    "cli",
+    "codebase",
+    "onboarding"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AnshulMohanty/Code_Flow.git",
+    "directory": "apps/local-cli"
+  },
+  "homepage": "https://github.com/AnshulMohanty/Code_Flow#analyse-a-private-repo-offline",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bundle"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
