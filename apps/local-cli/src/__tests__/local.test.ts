@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { analyzeLocal, LOCAL_MIN_SIMILARITY, LOCAL_SIMILARITY_MEASURED, queryLocal } from "../analyzeLocal.js";
-import { parseArgs } from "../index.js";
+import { isDirectInvocation, normalizeEntryPath, parseArgs } from "../index.js";
 
 /**
  * V3-P5 task 4 acceptance: a small fixture repository analysed FULLY OFFLINE — no keys, no network —
@@ -246,5 +246,43 @@ describe("parseArgs", () => {
 
   it("handles no arguments at all", () => {
     expect(parseArgs([]).command).toBeUndefined();
+  });
+});
+
+describe("the entrypoint guard runs the CLI on every platform, not just POSIX", () => {
+  /**
+   * THE BUG THIS PINS. The guard tested `process.argv[1]` against a pattern whose separator class
+   * matched only a forward slash. `process.argv[1]` uses the PLATFORM separator, so on Windows the
+   * path is backslash-delimited and the guard was ALWAYS false: `codeflow-local` exited 0 with no
+   * output — no error, no usage message, nothing. A silent no-op is the worst way for an entrypoint
+   * guard to fail, because nothing looks wrong, and it is invisible to a POSIX-only CI.
+   *
+   * The paths below are written with explicit char codes so this test cannot be defeated by the same
+   * class of escaping problem it exists to catch.
+   */
+  const BACKSLASH = String.fromCharCode(92);
+  const win = (...parts: string[]) => parts.join(BACKSLASH);
+
+  it("recognises a Windows src path", () => {
+    expect(isDirectInvocation(win("D:", "Code_Flow", "apps", "local-cli", "src", "index.ts"))).toBe(true);
+  });
+
+  it("recognises a Windows dist path (what `npx codeflow-local` actually runs)", () => {
+    expect(isDirectInvocation(win("C:", "npx", "local-cli", "dist", "index.js"))).toBe(true);
+  });
+
+  it("still recognises POSIX paths", () => {
+    expect(isDirectInvocation("/home/me/repo/apps/local-cli/src/index.ts")).toBe(true);
+    expect(isDirectInvocation("/usr/lib/node_modules/local-cli/dist/index.js")).toBe(true);
+  });
+
+  it("does NOT fire for a sibling module — the guard still stops an import running main()", () => {
+    expect(isDirectInvocation("/repo/apps/local-cli/src/analyzeLocal.ts")).toBe(false);
+    expect(isDirectInvocation(win("D:", "repo", "apps", "local-cli", "src", "analyzeLocal.ts"))).toBe(false);
+    expect(isDirectInvocation(undefined)).toBe(false);
+  });
+
+  it("normalises the platform separator rather than assuming one", () => {
+    expect(normalizeEntryPath(win("a", "b", "c"))).not.toContain(BACKSLASH);
   });
 });

@@ -161,8 +161,30 @@ async function main(): Promise<number> {
  * Without this guard, a test importing `parseArgs` from here would execute `main()` as a side effect
  * of the import — which is exactly what happened the first time, and it surfaced as
  * "process.exit unexpectedly called with 1" rather than as anything that named the cause.
+ *
+ * THE SEPARATOR IS NORMALISED FIRST, and that is not a nicety. `process.argv[1]` uses the PLATFORM
+ * separator, so on Windows this path is delimited by backslashes — and the previous pattern's
+ * character class matched only a forward slash. The guard was therefore ALWAYS FALSE on Windows, and
+ * `codeflow-local` exited 0 with NO OUTPUT on every Windows machine: not an error, not a usage
+ * message, nothing. A silent no-op is the worst way for an entrypoint guard to fail, because nothing
+ * looks wrong — and it is invisible to a POSIX-only CI.
+ *
+ * Built with `new RegExp` over a normalised path rather than a literal, so the pattern needs no
+ * escape sequences at all and cannot regress into the same class of bug.
  */
-const invokedDirectly = process.argv[1] !== undefined && /local-cli[\/](?:dist|src)[\/]index\.(?:js|ts)$/.test(process.argv[1]);
+const ENTRY_PATTERN = new RegExp("local-cli/(?:dist|src)/index[.](?:js|ts)$");
+
+/** `process.argv[1]` with the platform separator normalised to "/". Exported for the test. */
+export function normalizeEntryPath(argvPath: string | undefined): string {
+  return (argvPath ?? "").split(path.sep).join("/");
+}
+
+/** True when this module is the process entrypoint rather than an import. Exported for the test. */
+export function isDirectInvocation(argvPath: string | undefined): boolean {
+  return ENTRY_PATTERN.test(normalizeEntryPath(argvPath));
+}
+
+const invokedDirectly = isDirectInvocation(process.argv[1]);
 
 if (invokedDirectly) {
   main()
