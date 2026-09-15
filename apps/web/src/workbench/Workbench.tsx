@@ -7,6 +7,7 @@ import { askDisabledReason } from "../site/MarketingSite";
 import { RepoField } from "../site/RepoField";
 import type { AnalysisState, AskState } from "../lib/useAnalysis";
 import type { MetaState } from "../lib/useMeta";
+import type { WakeState } from "../lib/useWake";
 import { TabDomains } from "./TabDomains";
 import { TabExplore } from "./TabExplore";
 import { TabImpact } from "./TabImpact";
@@ -36,6 +37,8 @@ const TABS: Array<{ id: WorkbenchTab; num: string; label: string }> = [
 
 export interface WorkbenchProps {
   meta: MetaState;
+  /** Whether the backend has answered yet. Gates the analyze field — see `EntryStep`. */
+  wake: WakeState;
   analysis: AnalysisState;
   ask: AskState;
   onAnalyze(input: { owner: string; repo: string }): void;
@@ -43,7 +46,7 @@ export interface WorkbenchProps {
   onExit(): void;
 }
 
-export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: WorkbenchProps) {
+export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit }: WorkbenchProps) {
   const [tab, setTab] = useState<WorkbenchTab>("system");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -140,7 +143,7 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
         ) : null}
 
         {!result && !busy ? (
-          <EntryStep meta={meta} onAnalyze={onAnalyze} error={analysis.error} />
+          <EntryStep meta={meta} wake={wake} onAnalyze={onAnalyze} error={analysis.error} />
         ) : !result ? (
           <ResolvingStep analysis={analysis} meta={meta} />
         ) : graph && model ? (
@@ -181,10 +184,12 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
  */
 export function EntryStep({
   meta,
+  wake,
   onAnalyze,
   error,
 }: {
   meta: MetaState;
+  wake: WakeState;
   onAnalyze(input: { owner: string; repo: string }): void;
   error: string | null;
 }) {

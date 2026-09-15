@@ -26,6 +26,10 @@ const META = {
 function stubFetch(routes: Record<string, unknown>, options: { metaFails?: boolean } = {}) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    // Wake-on-visit hits /health on mount (see lib/useWake.ts). Answered by default: these tests are
+    // about what the app does with a REACHABLE backend, and an unrouted /health would put every one
+    // of them into the cold-start retry path.
+    if (url.endsWith("/health")) return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
     if (url.includes("/api/meta")) {
       if (options.metaFails) return new Response("nope", { status: 500 });
       return new Response(JSON.stringify(META), { status: 200, headers: { "content-type": "application/json" } });
@@ -118,15 +122,25 @@ describe("the marketing site, before any analysis", () => {
 });
 
 describe("the status pill never claims a connection it does not have", () => {
-  it("reads CONNECTING with a grey dot before /api/meta resolves", async () => {
+  // WHAT THE PILL REPORTS CHANGED, and the tests changed with it rather than being deleted. It used
+  // to read `meta.status` — "did /api/meta return". On a free tier where the backend sleeps, the
+  // honest answer for the first thirty seconds of a visit is neither "connecting" nor "offline" but
+  // "asleep, being woken", and those differ in the one way a visitor cares about: the third is worth
+  // waiting for. The pill now reads the real `GET /health` outcome. Every guarantee the old tests
+  // made is still asserted — here for the reachable states, and in SiteNav.test.tsx for OFFLINE,
+  // which is only reachable through the App after the full 67-second backoff.
+
+  it("reads WARMING, not a frozen spinner, while the wake request is in flight", async () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     render(<App />);
     const pill = document.querySelector(".pill")!;
-    expect(pill).toHaveTextContent(/CONNECTING/);
+    expect(pill).toHaveTextContent(/WARMING/);
     expect(pill.getAttribute("data-live")).toBe("false");
+    // It says WHY, so a visitor knows this resolves rather than hangs.
+    expect(pill.getAttribute("title")).toMatch(/sleeps when idle|30-50 seconds/i);
   });
 
-  it("reads READY with a green dot and the SERVER's version once it does", async () => {
+  it("reads READY with a green dot and the SERVER's version once /health answers", async () => {
     vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
     await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/READY/));
@@ -136,14 +150,14 @@ describe("the status pill never claims a connection it does not have", () => {
     expect(pill).toHaveTextContent("v1.1.0");
   });
 
-  it("reads OFFLINE, not READY, when the API cannot be reached", async () => {
-    // A green READY pill on a build talking to nothing is the most misleading thing a status
-    // indicator can do.
+  it("is green on REACHABILITY, and still falls back to an em-dash version when /api/meta fails", async () => {
+    // Two different facts, reported separately. A deployment can answer /health while /api/meta is
+    // failing; the useful fact for a visitor is the first, and inventing a version because the
+    // second failed would be the lie the pill exists to avoid.
     vi.stubGlobal("fetch", stubFetch({}, { metaFails: true }));
     render(<App />);
-    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/OFFLINE/));
-    expect(document.querySelector(".pill")!.getAttribute("data-live")).toBe("false");
-    // And the version falls back to an em-dash rather than a guess.
+    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/READY/));
+    expect(document.querySelector(".pill")!.getAttribute("data-live")).toBe("true");
     expect(document.querySelector(".pill")).toHaveTextContent("—");
   });
 });

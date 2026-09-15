@@ -7,6 +7,7 @@ import { buildSiteModel, count } from "../lib/siteModel";
 import { moduleLabel } from "../lib/citation";
 import { suggestedQuestions } from "../lib/questions";
 import type { MetaState } from "../lib/useMeta";
+import type { WakeState } from "../lib/useWake";
 import type { AskState, AnalysisState } from "../lib/useAnalysis";
 import { HeroMesh } from "./HeroMesh";
 import { LanguageTicker } from "./LanguageTicker";
@@ -26,6 +27,8 @@ import { SiteNav } from "./SiteNav";
 
 export interface MarketingSiteProps {
   meta: MetaState;
+  /** Whether the backend has answered yet. Drives the status pill and gates the analyze button. */
+  wake: WakeState;
   analysis: AnalysisState;
   ask: AskState;
   onAnalyze(input: { owner: string; repo: string }): void;
@@ -33,7 +36,7 @@ export interface MarketingSiteProps {
   onOpenWorkbench(): void;
 }
 
-export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWorkbench }: MarketingSiteProps) {
+export function MarketingSite({ meta, wake, analysis, ask, onAnalyze, onAsk, onOpenWorkbench }: MarketingSiteProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
@@ -86,6 +89,7 @@ export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWor
     <div ref={rootRef}>
       <SiteNav
         meta={meta}
+        wake={wake}
         activeSection={activeSection}
         onNavigate={navigate}
         onOpenPalette={() => setPaletteOpen(true)}

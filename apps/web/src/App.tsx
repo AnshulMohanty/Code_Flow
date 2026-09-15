@@ -65,6 +65,7 @@ export function App() {
     return (
       <Workbench
         meta={meta}
+        wake={wake}
         analysis={state}
         ask={ask}
         onAnalyze={(input) => void analyze(input)}
@@ -77,6 +78,7 @@ export function App() {
   return (
     <MarketingSite
       meta={meta}
+      wake={wake}
       analysis={state}
       ask={ask}
       onAnalyze={analyzeAndOpen}
