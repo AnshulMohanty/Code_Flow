@@ -42,7 +42,9 @@ function wake(fetchImpl: ReturnType<typeof vi.fn>) {
 
 describe("useWake — a visitor wakes the backend; nothing on a schedule does", () => {
   it("fires exactly ONE request, to /health, when the backend answers", async () => {
-    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    // The parameter is declared so the mock's recorded call args are TYPED as a one-tuple; without
+    // it TypeScript infers a zero-length tuple and the URL assertion below cannot compile.
+    const fetchImpl = vi.fn(async (_input?: RequestInfo | URL) => new Response("{}", { status: 200 }));
     const { result } = wake(fetchImpl);
 
     expect(result.current.status).toBe("waking");

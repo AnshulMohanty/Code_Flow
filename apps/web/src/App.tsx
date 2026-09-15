@@ -3,6 +3,7 @@ import { MarketingSite } from "./site/MarketingSite";
 import { Workbench } from "./workbench/Workbench";
 import { useAnalysis } from "./lib/useAnalysis";
 import { useMeta } from "./lib/useMeta";
+import { useDemoSnapshot } from "./lib/useDemoSnapshot";
 import { useWake } from "./lib/useWake";
 
 /**
@@ -32,6 +33,8 @@ type Surface = "site" | "workbench";
 export function App() {
   const wake = useWake();
   const meta = useMeta(wake.status);
+  // Lazily fetched as its own chunk, so it costs the entry bundle nothing — see useDemoSnapshot.
+  const demo = useDemoSnapshot();
   const { state, ask, analyze, askQuestion } = useAnalysis();
   const [surface, setSurface] = useState<Surface>(() => readSurface());
 
@@ -79,6 +82,7 @@ export function App() {
     <MarketingSite
       meta={meta}
       wake={wake}
+      demo={demo}
       analysis={state}
       ask={ask}
       onAnalyze={analyzeAndOpen}
