@@ -24,7 +24,9 @@ pnpm install --frozen-lockfile
 pnpm -r typecheck && pnpm -r lint && pnpm test && pnpm -r build && node --test tests/*.mjs
 ```
 
-Expected: **1336 tests**, legacy **25/25**, every command exit 0.
+Expected: **1450 vitest tests** (92 files across 15 packages), root suite **26/26**, every command
+exit 0. The `codeflow-local` package contributes **31** of those (9 zero-egress + 22 behaviour) and can
+be run alone with `pnpm --filter codeflow-local test`.
 
 ---
 

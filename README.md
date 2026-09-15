@@ -254,8 +254,9 @@ pnpm -r build
 node --test tests/*.mjs          # root suite
 ```
 
-**1441 vitest tests + 26 root tests**, all passing, at the time of writing. CI runs the same four
-commands plus parser-parity, a keyless eval check, and a build of all three Docker images.
+**1450 vitest tests (92 files, 15 packages) + 26 root tests**, all passing — measured on the commit
+that introduced this line, not estimated. CI runs the same four commands plus parser-parity, a
+keyless eval check, and a build of all three Docker images.
 
 > Note (Windows): run installs one at a time — concurrent `pnpm install`s corrupt the
 > node_modules link step.
