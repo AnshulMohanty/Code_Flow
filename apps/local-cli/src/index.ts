@@ -169,11 +169,18 @@ async function main(): Promise<number> {
  * "process.exit unexpectedly called with 1" rather than as anything that named the cause.
  *
  * THE SEPARATOR IS NORMALISED FIRST, and that is not a nicety. `process.argv[1]` uses the PLATFORM
- * separator, so on Windows this path is delimited by backslashes — and the previous pattern's
+ * separator, so on Windows this path is delimited by backslashes — and the original pattern's
  * character class matched only a forward slash. The guard was therefore ALWAYS FALSE on Windows, and
  * `codeflow-local` exited 0 with NO OUTPUT on every Windows machine: not an error, not a usage
  * message, nothing. A silent no-op is the worst way for an entrypoint guard to fail, because nothing
  * looks wrong — and it is invisible to a POSIX-only CI.
+ *
+ * THE FIRST FIX FOR THAT WAS ITSELF PLATFORM-DEPENDENT, which is the more interesting bug. It split on
+ * `path.sep`, and `path.sep` describes the HOST, not the string: on Linux it is "/", so a Windows-style
+ * argv path passed straight through with its backslashes intact. The result was a normaliser that
+ * worked only where normalisation was already unnecessary — green on a Windows laptop, red on the
+ * Linux CI runner. The normalisation is now unconditional (see `normalizeEntryPath`), so the guard
+ * reads the string it was given instead of inferring anything from the platform underneath it.
  *
  * Built with `new RegExp` over a normalised path rather than a literal, so the pattern needs no
  * escape sequences at all and cannot regress into the same class of bug.
@@ -189,9 +196,23 @@ async function main(): Promise<number> {
  */
 const ENTRY_PATTERN = new RegExp("(?:local-cli/(?:dist|src)/index[.](?:js|ts)|codeflow-local(?:[.]mjs)?)$");
 
-/** `process.argv[1]` with the platform separator normalised to "/". Exported for the test. */
+/**
+ * `process.argv[1]` with EVERY backslash turned into "/", on every platform. Exported for the test.
+ *
+ * Deliberately NOT `path.sep`. `path.sep` is whatever the RUNNING host uses, so on Linux it is "/"
+ * and splitting on it leaves a backslash-delimited path completely untouched — the normaliser became
+ * a no-op on exactly the platform that needed it least and the CI that needed it most. A backslash is
+ * never a legal character in a POSIX path segment here, so rewriting it unconditionally is safe in
+ * both directions and makes the guard depend on the STRING it was handed rather than on the OS it
+ * happens to be running under.
+ *
+ * `BACKSLASH` is spelled by char code for the same reason the test does it: this function exists to
+ * fix an escaping bug, and it should not be able to be defeated by one.
+ */
+const BACKSLASH = String.fromCharCode(92);
+
 export function normalizeEntryPath(argvPath: string | undefined): string {
-  return (argvPath ?? "").split(path.sep).join("/");
+  return (argvPath ?? "").split(BACKSLASH).join("/");
 }
 
 /** True when this module is the process entrypoint rather than an import. Exported for the test. */
