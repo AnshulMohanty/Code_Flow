@@ -16,7 +16,7 @@ Companion documents:
 | `render.yaml` | The Blueprint itself, with the reasoning per field. |
 | `.env.example` | Every variable the code reads, what breaks without it, and what it turns into in the UI. |
 | `GO_LIVE.md` | The wider go-live runbook: first analysis, the proofs that need a real service, the scored eval. |
-| `VERIFICATION_REPORT.md` §D | What remains owner-only, and why. |
+| `docs/archive/VERIFICATION_REPORT.md` §D | What remains owner-only, and why. |
 
 ---
 
@@ -327,7 +327,7 @@ MongoDB stays Atlas on Railway too.
 
 ## Appendix B — what is still owner-only after all of this
 
-Deploying does not close these. They are in `VERIFICATION_REPORT.md` §D and `GO_LIVE.md` §4–5:
+Deploying does not close these. They are in `docs/archive/VERIFICATION_REPORT.md` §D and `GO_LIVE.md` §4–5:
 
 | | Why it needs you |
 |---|---|

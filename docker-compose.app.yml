@@ -77,7 +77,7 @@ services:
       CORS_ORIGINS: http://localhost:5173
       LLM_PROVIDER: gemini
       EMBEDDING_PROVIDER: gemini # Gemini powers BOTH chat + embeddings from one key (avoids Voyage's free-tier 3 RPM)
-      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see README.md)}
     ports:
       - "4000:4000"
     depends_on:
@@ -100,7 +100,7 @@ services:
       POSTGRES_URL: postgres://codeflow:codeflow@postgres:5432/codeflow
       LLM_PROVIDER: gemini
       EMBEDDING_PROVIDER: gemini
-      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see README.md)}
       # V3-P5: jobs per instance. 2 is the default and right for a laptop; the ceiling is 8 and
       # the correct move past that is more worker replicas, not a bigger number here.
       WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-2}"
