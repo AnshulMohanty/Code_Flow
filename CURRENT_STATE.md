@@ -1423,6 +1423,16 @@ former blocker — is **DONE** this session).
     kept deliberately small (see its module note on why `warmedUp` is its own field). The fix is
     small and worth doing: surface `retrieval: { mode, degradation }` the way warm-up surfaces its
     per-task list.
+    **✅ RESOLVED.** `/health` now carries `retrieval: { mode, degradation? }`, read from a
+    synchronous snapshot recorded when the store factory resolves — the endpoint never awaits the
+    dependency it reports on, because a health check that can block on an outage is two outages.
+    FOUR states rather than two, since "we have no Postgres" and "we have not looked yet" are
+    different facts: `postgres` · `memory` (with the reason) · `not-configured` (no embedding
+    provider, so no index can exist and none is expected) · `pending`. An ambiguous provider config
+    is REPORTED here rather than thrown, so a liveness probe does not read a misconfigured
+    embedding key as a dead process. Related: the no-URL branch of `createRetrievalStores` used to
+    return no degradation at all, so the log lines this entry describes never fired for the most
+    common case — fixed alongside.
 33. **A Render static site bakes the API URL at BUILD time (V3-SECURITY+DEPLOY).** The web
     Dockerfile's entrypoint rewrites `/config.js` from `API_BASE_URL` at container start, so ONE
     image works across environments. A static site has no entrypoint, so `render.yaml` passes

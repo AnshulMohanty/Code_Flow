@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { warmupRegistry } from "@codeflow/analyzers";
+import { retrievalHealth } from "../services/ragQaService.js";
 
 /**
  * `/health` — LIVENESS and READINESS, reported separately (V3-P5 task 1).
@@ -21,6 +22,12 @@ import { warmupRegistry } from "@codeflow/analyzers";
  * service permanently. The API's real tasks are now registered at the composition root
  * (`../health/warmup.ts`), so the boolean reports a fact. It remains false in a process that
  * registered nothing — which is the honest answer to "did this process come up ready", not a bug.
+ *
+ * `retrieval` CLOSES LEDGER #32. The retrieval backend's degradation was announced in the LOGS
+ * ONLY, so from outside the process "the API is up" and "the API can answer anything the worker
+ * indexed" looked identical — while a memory-backed API refuses every question and returns 200 on
+ * everything else. It is reported here rather than left to be inferred, and it is a SNAPSHOT: a
+ * health endpoint that awaits the dependency it reports on turns one outage into two.
  */
 export const healthRouter = Router();
 
@@ -34,6 +41,8 @@ healthRouter.get("/health", (_req, res) => {
     // Readiness, separate from liveness above.
     warmedUp: warmup.warmedUp,
     warming: warmup.warming,
+    // Ledger #32 — which retrieval index this process is actually talking to.
+    retrieval: retrievalHealth(),
     warmup: {
       ...(warmup.durationMs !== undefined ? { durationMs: warmup.durationMs } : {}),
       ...(warmup.warmedAt ? { warmedAt: warmup.warmedAt } : {}),
