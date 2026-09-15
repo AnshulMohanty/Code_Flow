@@ -56,7 +56,16 @@ const NETWORK_MODULES = [
 /** Provider keys. A local CLI has no business reading one; if it can, it can also send one. */
 const KEY_PATTERN = /process\.env\.[A-Z_]*(?:API_KEY|_TOKEN|SECRET)/;
 
-/** `fetch(` / `new WebSocket(` / `XMLHttpRequest`, as CALLS rather than as the word in a comment. */
+/**
+ * `fetch(` / `new WebSocket(` / `XMLHttpRequest`, as CALLS rather than as the word in a comment.
+ *
+ * IT MATCHES INSIDE STRING LITERALS TOO, and that is left as-is deliberately. The `--help` text
+ * originally invited readers to `grep it for "fetch("`, which tripped this check and failed the
+ * build — the copy describing the guarantee defeated the guarantee's own test. The fix was to
+ * reword the copy, not to teach the pattern to ignore strings: a check that skips string literals
+ * also skips `globalThis["fetch"](url)`, and the false positive is cheap while the false negative
+ * is the one that matters. Prose here simply does not name the token.
+ */
 const NETWORK_CALL_PATTERN = /(?:^|[^.\w])(?:fetch|WebSocket|XMLHttpRequest|EventSource)\s*\(/;
 
 /**

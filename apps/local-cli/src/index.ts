@@ -72,8 +72,8 @@ WHAT YOU GET, and what you do not:
   ✗ AI summary / reading order    — needs a model; there is no keyless local one
   ✗ semantic search               — the local embedder matches WORDS, not meaning
 
-Nothing is uploaded. No API key is read. The published bundle contains no network client at all —
-grep it for "fetch(" if you would rather check than trust.`;
+Nothing is uploaded. No API key is read. The published bundle contains no network client at all, and
+it is shipped unminified so you can read it yourself rather than take that on trust.`;
 
 async function main(): Promise<number> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
