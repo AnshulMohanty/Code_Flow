@@ -33,6 +33,24 @@ import { API_BASE_URL } from "./apiClient";
 
 export type WakeStatus = "waking" | "ready" | "offline";
 
+/**
+ * Why a real analysis cannot start yet, or null when it can.
+ *
+ * Lives beside the wake state rather than in a component because BOTH surfaces gate on it — the
+ * marketing hero field and the workbench entry step — and two copies of this sentence would drift
+ * the first time either was reworded.
+ *
+ * The two reasons differ in what they ask of the reader, which is why this returns a string rather
+ * than a boolean: "waking" is worth waiting thirty seconds for, and "offline" is not.
+ */
+export function analyzeBlockedReason(wake: WakeState): string | null {
+  if (wake.status === "ready") return null;
+  if (wake.status === "waking") {
+    return "Warming the analysis engine — this takes about 30 seconds on a cold start. A demo repository below works right now.";
+  }
+  return "The analysis backend did not answer, so a new repository cannot be analysed. The cached demo repositories below still work.";
+}
+
 export interface WakeState {
   status: WakeStatus;
   /** How many requests have been sent. Surfaced so the pill can say "still waking" honestly. */

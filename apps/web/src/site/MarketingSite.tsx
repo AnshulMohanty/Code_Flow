@@ -7,7 +7,7 @@ import { buildSiteModel, count } from "../lib/siteModel";
 import { moduleLabel } from "../lib/citation";
 import { suggestedQuestions } from "../lib/questions";
 import type { MetaState } from "../lib/useMeta";
-import type { WakeState } from "../lib/useWake";
+import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
 import type { AskState, AnalysisState } from "../lib/useAnalysis";
 import { HeroMesh } from "./HeroMesh";
 import { LanguageTicker } from "./LanguageTicker";
@@ -121,7 +121,7 @@ export function MarketingSite({ meta, wake, analysis, ask, onAnalyze, onAsk, onO
               answers questions with the file and line it read.
             </p>
             <div>
-              <RepoField onAnalyze={onAnalyze} busy={busy} error={analysis.error} />
+              <RepoField onAnalyze={onAnalyze} busy={busy} error={analysis.error} notReady={analyzeBlockedReason(wake)} />
               <p className="subline">
                 <span className="subline-ok">✓ deterministic pass first</span>
                 {model?.totalMs !== undefined && model?.totalMs !== null ? (

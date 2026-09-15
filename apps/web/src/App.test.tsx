@@ -47,6 +47,20 @@ function stubFetch(routes: Record<string, unknown>, options: { metaFails?: boole
   });
 }
 
+/**
+ * Fill the repo field and click Analyze — AFTER waiting for the button to enable.
+ *
+ * Analysing a fresh repository needs the API and the queue, so the button is disabled and reads
+ * "Warming up…" until wake-on-visit's `GET /health` answers (see lib/useWake.ts). Waiting for it is
+ * exactly what a real visitor does, so the tests do it rather than reaching past the gate — a test
+ * that clicked a disabled button would be asserting against a UI nobody can drive.
+ */
+async function startAnalysis(value: string) {
+  const button = await waitFor(() => screen.getByRole("button", { name: /^Analyze$/ }));
+  fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value } });
+  fireEvent.click(button);
+}
+
 function completedJob(jobId: string) {
   return {
     id: jobId,
@@ -177,8 +191,7 @@ describe("running a real analysis", () => {
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
 
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
 
     // The tabs appear only once there is a result.
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
@@ -191,8 +204,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
 
     const edgeCount = result.graph!.edges.length;
@@ -204,8 +216,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
 
     const legend = document.querySelector(".legend")!;
@@ -218,8 +229,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
@@ -235,8 +245,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
@@ -248,8 +257,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
 
@@ -263,8 +271,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
 
@@ -276,8 +283,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 
@@ -343,8 +349,7 @@ describe("Q&A availability is stated, never a dead end", () => {
       }),
     );
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 
@@ -386,8 +391,7 @@ describe("citation chips resolve, or do not pretend to", () => {
       }),
     );
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 

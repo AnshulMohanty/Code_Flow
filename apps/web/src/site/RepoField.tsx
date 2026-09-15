@@ -14,6 +14,12 @@ import { useState, type FormEvent } from "react";
  * VALIDATION IS LOCAL AND IMMEDIATE. A malformed entry is a message under the field, not a round
  * trip and a 400. The parse is the same one the API applies, so a value this field accepts is a
  * value the API accepts.
+ *
+ * IT IS GATED ON THE BACKEND BEING AWAKE, and `notReady` is why. Analysing a fresh repository needs
+ * the API and the queue; clicking it against a sleeping container produces a request that appears to
+ * hang for thirty seconds and then may still fail. A disabled button that SAYS what it is waiting
+ * for and points at something that works meanwhile is a better answer than a click that goes
+ * nowhere — and it is a different thing from `busy`, which means "your analysis is running".
  */
 
 export interface RepoFieldProps {
@@ -22,14 +28,24 @@ export interface RepoFieldProps {
   autoFocus?: boolean;
   /** Rendered under the field. The caller's error (an API failure), separate from a parse error. */
   error?: string | null;
+  /**
+   * Why a real analysis cannot start yet, or null when it can. Present ⇒ the button is disabled and
+   * this is shown. A STRING rather than a boolean because the two reasons need different words: a
+   * backend that is waking is worth waiting for, and one that never answered is not.
+   */
+  notReady?: string | null;
 }
 
-export function RepoField({ onAnalyze, busy, autoFocus, error }: RepoFieldProps) {
+export function RepoField({ onAnalyze, busy, autoFocus, error, notReady }: RepoFieldProps) {
   const [value, setValue] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    // Belt and braces with the disabled attribute: a form still submits on Enter in some browsers
+    // when a submit button is disabled, and an enqueue against a sleeping backend is the hang this
+    // gate exists to prevent.
+    if (notReady) return;
     const parsed = parseRepo(value);
     if ("error" in parsed) {
       setParseError(parsed.error);
@@ -59,13 +75,19 @@ export function RepoField({ onAnalyze, busy, autoFocus, error }: RepoFieldProps)
             if (parseError) setParseError(null);
           }}
         />
-        <button type="submit" disabled={busy}>
-          {busy ? "Analyzing…" : "Analyze"}
+        <button type="submit" disabled={busy || Boolean(notReady)} title={notReady ?? undefined}>
+          {busy ? "Analyzing…" : notReady ? "Warming up…" : "Analyze"}
         </button>
       </div>
       {parseError || error ? (
         <p className="subline" role="alert" style={{ color: "var(--oxblood)" }}>
           {parseError ?? error}
+        </p>
+      ) : notReady ? (
+        // Not role="alert": nothing has gone wrong. It is a state the page is passing through, and
+        // announcing it as an error would be its own small lie.
+        <p className="subline" data-not-ready="true">
+          {notReady}
         </p>
       ) : null}
     </form>

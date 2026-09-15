@@ -7,7 +7,7 @@ import { askDisabledReason } from "../site/MarketingSite";
 import { RepoField } from "../site/RepoField";
 import type { AnalysisState, AskState } from "../lib/useAnalysis";
 import type { MetaState } from "../lib/useMeta";
-import type { WakeState } from "../lib/useWake";
+import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
 import { TabDomains } from "./TabDomains";
 import { TabExplore } from "./TabExplore";
 import { TabImpact } from "./TabImpact";
@@ -200,7 +200,7 @@ export function EntryStep({
       <h1 className="display display-l" style={{ maxWidth: "22ch", marginBottom: 34 }}>
         Give me a URL. I&rsquo;ll give you the map<span className="dot" aria-hidden="true" />
       </h1>
-      <RepoField onAnalyze={onAnalyze} autoFocus error={error} />
+      <RepoField onAnalyze={onAnalyze} autoFocus error={error} notReady={analyzeBlockedReason(wake)} />
       <p className="wb-recents">
         <span>indexed:</span>
         {meta.status === "loading" ? (
