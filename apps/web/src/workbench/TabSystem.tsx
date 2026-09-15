@@ -1,4 +1,4 @@
-import type { AnalysisResult } from "@codeflow/shared-types";
+import type { AnalysisResult, FileRole } from "@codeflow/shared-types";
 import { useMemo } from "react";
 import {
   ARCHITECTURE_RULES,
@@ -43,7 +43,25 @@ export interface TabSystemProps {
 /** Modules listed per lane. Render-only — the lane's COUNT is always the full one. */
 const LANE_RENDER_CAP = 14;
 
+/**
+ * The roles the design's row shows, in its order.
+ *
+ * MOVED HERE FROM TAB 04. It sat above the inferred domain lanes, which meant that hiding the lanes
+ * when a run produced none would also have hidden this — and these are the parser's own
+ * classification: real, measured, and available on every run including a keyless one. Losing
+ * measured data to tidy away an empty panel would be the wrong trade in this codebase specifically.
+ */
+const SHOWN_ROLES: FileRole[] = ["source", "build", "config", "test", "docs"];
+
 export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProps) {
+  const roleCounts = useMemo(() => {
+    const tally = new Map<string, number>();
+    for (const file of result.structure?.files ?? []) {
+      tally.set(file.role, (tally.get(file.role) ?? 0) + 1);
+    }
+    return tally;
+  }, [result]);
+
   const roleByPath = useMemo(
     () => new Map((result.structure?.files ?? []).map((file) => [file.path, file.role as string])),
     [result],
@@ -213,6 +231,30 @@ export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProp
           ))
         )}
       </section>
+
+      <p className="wb-step" style={{ marginTop: 34 }}>
+        Structural roles — deterministic pass
+      </p>
+      <div className="roles">
+        {SHOWN_ROLES.map((role) => {
+          const value = roleCounts.get(role) ?? 0;
+          return (
+            <div className="role" key={role} data-zero={value === 0}>
+              <p className="role-count">{count(value)}</p>
+              <p className="role-name">
+                {role}
+                {/* A zero is a FACT here, not a gap: the parser looked and found none. Saying "none"
+                    beside the 0 distinguishes it from a figure nobody measured. */}
+                {value === 0 ? <span className="role-note"> · none</span> : null}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+      <p className="honest-detail">
+        The parser&rsquo;s own classification of every file it discovered. No model is involved, and
+        these are available on every run — including one with no provider key.
+      </p>
     </>
   );
 }

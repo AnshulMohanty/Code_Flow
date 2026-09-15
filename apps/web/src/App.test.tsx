@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { mockAnalysisResult } from "./test/fixture";
+import { mockAnalysisResult, withDomainLanes } from "./test/fixture";
 import { parseRepo } from "./site/RepoField";
 import type { AnalysisResult } from "@codeflow/shared-types";
 
@@ -211,7 +211,34 @@ describe("running a real analysis", () => {
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
     expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument();
+  });
+
+  it("HIDES the Domains tab on a run with no inferred lanes, rather than opening onto an apology", async () => {
+    // The fan-out is 5N+1 provider calls where the single-shot stage is 1, so it is off by default
+    // and off on every free deployment. A tab whose only content is "this was not enabled" reads as
+    // something broken rather than something optional.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    expect(screen.queryByRole("tab", { name: /04 DOMAINS/ })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("tab")).toHaveLength(3);
+  });
+
+  it("keeps the parser's STRUCTURAL ROLES visible on TAB 01 — hiding a tab must not lose measured data", async () => {
+    // These counts are the parser's own classification, available on every run including a keyless
+    // one. They used to sit above the inferred lanes on TAB 04; hiding that tab would have taken
+    // them with it, so they moved rather than disappeared.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    expect(screen.getByText(/Structural roles — deterministic pass/i)).toBeInTheDocument();
+    expect(screen.getByText(/available on every run — including one with no provider key/i)).toBeInTheDocument();
   });
 
   it("TAB 01 derives the container diagram from the real edge count", async () => {
@@ -239,32 +266,45 @@ describe("running a real analysis", () => {
     expect(legend).toHaveTextContent(/no rule violations detected/);
   });
 
-  it("TAB 04 labels the domain lanes as INFERENCE, three times over", async () => {
-    const result = mockAnalysisResult("acme/repo");
+  it("TAB 04 appears when there ARE lanes, and labels every one of them as inference", async () => {
+    const result = withDomainLanes(mockAnalysisResult("acme/repo"));
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
     await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
-    expect(screen.getByText(/Structural roles — deterministic pass/i)).toBeInTheDocument();
-    expect(screen.getByText(/Roles come from the parser/i)).toBeInTheDocument();
-    expect(screen.getByText(/labelled as inference, never as fact/i)).toBeInTheDocument();
+    // Said at the top of the tab, and again on the lane itself. A reader who cannot tell an agent's
+    // guess from the parser's count will trust both equally, and only one of them is checkable.
+    expect(screen.getByText(/Everything on this tab is INFERRED by specialist agents/i)).toBeInTheDocument();
     expect(screen.getByText(/Domain lanes — specialist agents · inferred/i)).toBeInTheDocument();
+    expect(screen.getByText(/agent · auth-surface/i)).toBeInTheDocument();
   });
 
-  it("TAB 04 says so plainly when there are NO inferred domains, and does not substitute communities", async () => {
-    // Quietly showing the structural community partition as a "domain" is exactly the confusion the
-    // view exists to prevent.
-    const result = mockAnalysisResult("acme/repo");
+  it("TAB 04 points at where the MEASURED roles live, instead of showing them twice", async () => {
+    const result = withDomainLanes(mockAnalysisResult("acme/repo"));
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
     await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
-    expect(screen.getByText(/No inferred domains for this run/i)).toBeInTheDocument();
-    expect(screen.getByText(/deliberately not shown here as though it were an inferred domain/i)).toBeInTheDocument();
+    expect(screen.getByText(/are on TAB 01/i)).toBeInTheDocument();
+  });
+
+  it("NEVER substitutes the community partition for an inferred domain", async () => {
+    // Communities are STRUCTURAL and domains are INFERRED. Quietly showing one as the other — to
+    // have something on the tab — is exactly the confusion this view exists to prevent, and is why
+    // the tab is hidden rather than backfilled when the fan-out did not run.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    // ...and is still not offered as a domain anywhere.
+    expect(screen.queryByRole("tab", { name: /04 DOMAINS/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Domain lanes/i)).not.toBeInTheDocument();
   });
 
   it("TAB 03 relabels the coverage card to the fact it actually has", async () => {
