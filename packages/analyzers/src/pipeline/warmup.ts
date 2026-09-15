@@ -1,5 +1,10 @@
 /**
- * COLD-START WARMUP + the persistent warm pool (V3-P5 task 1).
+ * BOOT-TIME WARM-UP — process-lifetime warm caches (V3-P5 task 1).
+ *
+ * RENAMED FROM "persistent warm worker pool", which is what V3_PLAN called it and what this module
+ * never was. Nothing here pools processes or workers. The behaviour is unchanged — this is the same
+ * registry, still gating /ready — and only the name was wrong. A name that overstates the mechanism
+ * survives into a README, then into a conversation where somebody asks how the pool is sized.
  *
  * WHAT IS ACTUALLY COLD IN THIS CODEBASE — measured, not guessed at. Three things cost real time on
  * the first job of a process and nothing on every job after:
@@ -14,9 +19,9 @@
  *      `CREATE TABLE` on first use. Idempotent, and still a round trip nobody should pay inside a
  *      request.
  *
- * So the "warm pool" here is not a pool of processes — this runs one worker process with BullMQ
- * concurrency — it is a registry of PROCESS-LIFETIME resources initialised once at boot and reused
- * by every job. Calling it a pool of workers would be describing an architecture this does not have.
+ * So what this is, precisely: a registry of PROCESS-LIFETIME resources initialised once at boot and
+ * reused by every job in that process. Not a pool of processes — one worker process runs jobs at
+ * BullMQ concurrency — and not a pool of anything else. "Boot-time warm-up" is the whole mechanism.
  *
  * THE HH_Goa PATTERN, and why `warmedUp` is on `/health` rather than assumed: a container that
  * accepts traffic before its caches are warm serves its first users a latency that looks like a bug.
