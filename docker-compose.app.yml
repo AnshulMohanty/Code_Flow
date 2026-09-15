@@ -1,8 +1,14 @@
-# CodeFlow — full self-contained stack (web + api + worker + Mongo + Redis).
+# CodeFlow — full self-contained stack (web + api + worker + Mongo + Redis + Postgres/pgvector).
 #
 # This is the "download and run" file: it builds all three app images from source and runs
 # them alongside Mongo + Redis, so a recipient needs NOTHING except Docker Desktop and a
 # Gemini API key. (The plain docker-compose.yml is the dev-only stores file.)
+#
+# POSTGRES IS NOT OPTIONAL HERE, and it used to be absent. Without it both the api and the worker
+# resolved an IN-MEMORY retrieval index (see packages/retrieval/src/stores/createStores.ts): the
+# worker wrote the Q&A index into its own heap and the API queried its own empty one, so every
+# question came back "I could not find that", for every repository. The deterministic analysis was
+# unaffected, which is exactly what made it hard to see. ONE instance holds both halves of the index.
 #
 #   1. Create  codeflow.env  next to this file with one line:  GEMINI_API_KEY=your-key
 #   2. Run:    docker compose --env-file codeflow.env -f docker-compose.app.yml up -d --build
@@ -34,6 +40,27 @@ services:
       timeout: 3s
       retries: 10
 
+  # The Q&A index (V3-P2). `pgvector/pgvector` is the official Postgres image with the `vector`
+  # extension already compiled in, which is why it is used rather than `postgres:16` plus a build
+  # step: the retrieval adapter runs `CREATE EXTENSION IF NOT EXISTS vector` itself on first use.
+  # Mirrors the service in docker-compose.yml so the dev-stores path and this one cannot drift.
+  #
+  # Credentials are dev-only and deliberately obvious; nothing here is a secret.
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: codeflow
+      POSTGRES_PASSWORD: codeflow
+      POSTGRES_DB: codeflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codeflow -d codeflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   api:
     build:
       context: .
@@ -42,6 +69,9 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017/codeflow
       REDIS_URL: redis://redis:6379
+      # The API READS the index the worker WRITES, so both must name the SAME instance. Resolving
+      # these two independently is what produced the silent in-memory split this service fixes.
+      POSTGRES_URL: postgres://codeflow:codeflow@postgres:5432/codeflow
       API_PORT: "4000"
       # The browser loads the SPA from http://localhost:5173 and calls the API at this origin.
       CORS_ORIGINS: http://localhost:5173
@@ -55,6 +85,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   worker:
     build:
@@ -64,6 +96,8 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017/codeflow
       REDIS_URL: redis://redis:6379
+      # The SAME instance the api names above — see the note there.
+      POSTGRES_URL: postgres://codeflow:codeflow@postgres:5432/codeflow
       LLM_PROVIDER: gemini
       EMBEDDING_PROVIDER: gemini
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in codeflow.env (see QUICKSTART.md)}
@@ -85,6 +119,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
 
   web:
     build:
@@ -101,3 +137,4 @@ services:
 
 volumes:
   mongo-data:
+  postgres-data:
