@@ -19,6 +19,16 @@ import { createPostgresSqlClient, type PostgresClient, type PostgresPoolOptions 
  * index lives in one process's heap, so the API cannot answer questions about an index the
  * worker built, and nothing survives a restart — so the caller is expected to surface it the
  * way V3-P0 surfaces a missing Redis, not to treat it as equivalent.
+ *
+ * THE NO-URL BRANCH USED TO BE THE EXCEPTION TO THAT RULE, and it was the one that mattered. It
+ * returned `mode: "memory"` with NO `degradation` field, on the reasoning that "not configured is a
+ * CHOICE, not a failure" — which is true about the CONFIGURATION and false about the CONSEQUENCE.
+ * Both callers gate their loud warning on `stores.degradation` being present, so an unset
+ * POSTGRES_URL produced a worker and an API that each built a private index, never told anyone, and
+ * refused every question. The distinction the old comment wanted to draw is real, so it is kept —
+ * in the WORDING of the string ("not configured" reads differently from "could not be
+ * constructed") — but it is no longer drawn by staying silent. A supported mode with a severe
+ * consequence still has to say what the consequence is.
  */
 export interface CreateRetrievalStoresOptions {
   /** The embedding space the index will live in. Baked into the store, and into the pgvector
@@ -56,6 +66,18 @@ export interface RetrievalStores {
   sql: PostgresClient | null;
 }
 
+/**
+ * The no-URL degradation, exported so a caller can recognise THIS case specifically rather than
+ * regex-matching prose. A single-process deployment (the local CLI, a one-container demo) can
+ * legitimately treat it as expected and log at info; a two-process deployment must treat it as
+ * broken, because it is.
+ */
+export const NO_POSTGRES_DEGRADATION =
+  "POSTGRES_URL is not configured, so the Q&A index is per-process in-memory: it does not survive a " +
+  "restart and is invisible to every other process. In a split api/worker deployment this means the " +
+  "API can only answer for indexes it built itself, which is none of them — every question returns " +
+  "an honest refusal. Set POSTGRES_URL (pgvector) to make Q&A work across processes.";
+
 export async function createRetrievalStores(options: CreateRetrievalStoresOptions): Promise<RetrievalStores> {
   const url = options.postgresUrl?.trim();
   if (!url) {
@@ -63,6 +85,7 @@ export async function createRetrievalStores(options: CreateRetrievalStoresOption
       vectorStore: createMemoryVectorStore(options.space),
       textStore: createMemoryChunkTextStore(),
       mode: "memory",
+      degradation: NO_POSTGRES_DEGRADATION,
       sql: null,
     };
   }

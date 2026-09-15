@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createPgvectorStore, toVectorLiteral, vectorTableName } from "../stores/pgvectorStore.js";
 import { createPostgresChunkTextStore } from "../stores/postgresChunkTextStore.js";
-import { createRetrievalStores } from "../stores/createStores.js";
+import { createRetrievalStores, NO_POSTGRES_DEGRADATION } from "../stores/createStores.js";
 import type { SqlClientLike, SqlQueryResult } from "../stores/sqlClient.js";
 
 // HERMETIC test of the PRODUCTION adapters. No container, no port, no cleanup: the adapters
@@ -292,19 +292,47 @@ describe("createPostgresChunkTextStore", () => {
 });
 
 describe("createRetrievalStores — the one factory both processes call", () => {
-  it("with no POSTGRES_URL: in-memory, mode 'memory', and NO degradation (a supported mode)", async () => {
+  it("with no POSTGRES_URL: in-memory, mode 'memory', AND a degradation string", async () => {
     const stores = await createRetrievalStores({ space: SPACE });
     expect(stores.mode).toBe("memory");
     expect(stores.vectorStore.id).toBe("memory-vector-store");
     expect(stores.textStore.id).toBe("memory-chunk-text-store");
-    // Not configured is a CHOICE (the single-container demo), so it is not reported as a
-    // degradation. Configured-but-unreachable is, and that is the distinction below.
-    expect(stores.degradation).toBeUndefined();
     expect(stores.sql).toBeNull();
+    // THIS ASSERTION IS INVERTED FROM WHAT IT USED TO BE, deliberately. It previously asserted
+    // `degradation` was UNDEFINED here, reasoning that an unconfigured Postgres is a choice rather
+    // than a failure. The CONFIGURATION is indeed a choice; the CONSEQUENCE is not. All three
+    // callers (worker boot, the API's Q&A path, the MCP server) gate their warning on this field
+    // being present, so the old behaviour meant an unset POSTGRES_URL produced two processes that
+    // each built a private index, told nobody, and refused every question. The test was pinning
+    // the silence as though it were the specification.
+    expect(stores.degradation).toBe(NO_POSTGRES_DEGRADATION);
+    expect(stores.degradation).toMatch(/per-process|invisible to every other process/i);
   });
 
-  it("treats an empty/whitespace URL as unset", async () => {
-    expect((await createRetrievalStores({ space: SPACE, postgresUrl: "   " })).mode).toBe("memory");
+  it("names the variable and the fix, so the log line is actionable rather than only alarming", () => {
+    expect(NO_POSTGRES_DEGRADATION).toMatch(/POSTGRES_URL/);
+    expect(NO_POSTGRES_DEGRADATION).toMatch(/pgvector/);
+  });
+
+  it("distinguishes 'not configured' from 'could not be constructed' in the WORDING, not by silence", async () => {
+    // The distinction the old comment cared about is real and worth keeping — an operator who never
+    // set the variable needs a different next step from one whose driver failed to load. It is now
+    // carried by the two strings differing, which is the part a human actually reads.
+    const unset = await createRetrievalStores({ space: SPACE });
+    const broken = await createRetrievalStores({
+      space: SPACE,
+      postgresUrl: "postgres://user@host:5432/db",
+      createClient: async () => null,
+    });
+    expect(unset.degradation).not.toBe(broken.degradation);
+    expect(unset.degradation).toMatch(/not configured/i);
+    expect(broken.degradation).toMatch(/could not be constructed/i);
+  });
+
+  it("treats an empty/whitespace URL as unset — including reporting the unset degradation", async () => {
+    const stores = await createRetrievalStores({ space: SPACE, postgresUrl: "   " });
+    expect(stores.mode).toBe("memory");
+    expect(stores.degradation).toBe(NO_POSTGRES_DEGRADATION);
   });
 
   it("with a URL but no usable driver: memory + a degradation string", async () => {

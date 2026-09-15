@@ -98,6 +98,7 @@ export type { SqlClientLike, SqlQueryResult } from "./stores/sqlClient.js";
 // backend they are talking to. Reports honest degradation instead of silently going in-memory.
 export {
   createRetrievalStores,
+  NO_POSTGRES_DEGRADATION,
   type CreateRetrievalStoresOptions,
   type RetrievalStores,
 } from "./stores/createStores.js";
