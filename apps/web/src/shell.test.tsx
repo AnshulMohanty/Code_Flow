@@ -23,6 +23,10 @@ import { App } from "./App";
  * one still re-renders.
  */
 
+// Same reason as App.test.tsx: this file asserts what the shell shows with NOTHING to show, and a
+// bundled snapshot would legitimately fill it. See the note there.
+vi.mock("./lib/useDemoSnapshot", () => ({ useDemoSnapshot: () => null }));
+
 beforeEach(() => {
   window.location.hash = "";
   vi.stubGlobal("EventSource", undefined);

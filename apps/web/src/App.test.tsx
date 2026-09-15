@@ -14,6 +14,20 @@ import type { AnalysisResult } from "@codeflow/shared-types";
  * fabricated data. Every fetch is stubbed, so nothing here touches a network.
  */
 
+/**
+ * NO BUNDLED SNAPSHOT IN THIS SUITE, deliberately.
+ *
+ * This file pins the "nothing has been measured yet" invariant — four em-dashes, an honest empty
+ * state, no path to data the user did not ask for. Once a build ships a generated snapshot, the real
+ * loader would fill those views with a pre-computed analysis and every one of those assertions would
+ * be describing a different page.
+ *
+ * Without this mock the tests still PASS, which is worse than failing: the loader is async, so the
+ * synchronous assertions win the race by accident. An invariant that holds by timing is not pinned.
+ * The snapshot path has its own tests in site/demoSnapshot.test.tsx.
+ */
+vi.mock("./lib/useDemoSnapshot", () => ({ useDemoSnapshot: () => null }));
+
 const META = {
   analyzerVersion: "1.1.0",
   build: "abc1234def",
