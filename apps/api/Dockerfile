@@ -19,7 +19,14 @@ RUN pnpm --filter=@codeflow/api deploy --prod /prod
 FROM node:20-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
-RUN useradd --system --create-home --uid 1001 codeflow
+# `git` is required at runtime: in embedded-worker mode (RUN_WORKER_IN_PROCESS=true, which is how
+# render.free.yaml deploys this image) the BullMQ consumer runs IN THIS PROCESS and shallow-clones
+# the repositories it analyses. The clone spawns the `git` binary directly (shell:false), so a
+# missing binary is an ENOENT that fails Ingest before any parsing or provider call. Installed
+# identically to apps/worker/Dockerfile so the two runtime images cannot drift.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --create-home --uid 1001 codeflow
 COPY --from=build --chown=codeflow:codeflow /prod ./
 USER codeflow
 # API_PORT (default 4000) + MONGO_URI / REDIS_URL / provider keys are injected at RUN, never baked.
