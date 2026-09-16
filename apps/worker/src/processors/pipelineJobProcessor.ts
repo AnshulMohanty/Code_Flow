@@ -444,6 +444,14 @@ export async function runAnalysisJob(
     // A guardrail outcome (repo-too-large / budget-exhausted) carries a distinct typed
     // reason so the UI can say "too large" / "at capacity" rather than a generic failure.
     const statusReason = statusReasonForMode;
+    // THE REAL CAUSE, PERSISTED. A stage failure does not throw: the orchestrator catches it and
+    // RETURNS a summary with status "failed", so this non-throwing path -- not the catch below --
+    // is what records a failed run. It previously wrote no `error`, so the exact message ("server
+    // certificate verification failed", a provider 401) lived only in the run summary and the API
+    // answered "Analysis failed.", the one string that says nothing. `error` is already whitelisted
+    // by updateAnalysisJob and is already the fallback for `message`, so surfacing it costs one
+    // field and no new contract.
+    const failedStage = withWarnings.pipeline?.stages?.find((stage) => stage.status === "failed");
     await deps.service.updateJob(payload.jobId, {
       status: toJobStatus(status),
       runStatus: status,
@@ -453,6 +461,7 @@ export async function runAnalysisJob(
       ...(degradations.length ? { degradations } : {}),
       progress: 1,
       currentStep: cached ? "Cached analysis returned." : `Analysis ${status}.`,
+      ...(failedStage?.error ? { error: failedStage.error } : {}),
       analysisId,
       cached,
       commitSha: result.commitSha,
