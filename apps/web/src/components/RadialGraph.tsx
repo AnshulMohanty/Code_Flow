@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import type { GraphModel } from "../lib/graphModel";
 import { edgeKey, radialFocus, radialLayout } from "../lib/radial";
+import { moduleLabel } from "../lib/citation";
 import { count } from "../lib/siteModel";
 
 /**
@@ -29,6 +30,10 @@ export interface RadialGraphProps {
 export function RadialGraph({ model, selectedId, onSelect, readout, caption }: RadialGraphProps) {
   const layout = useMemo(() => radialLayout(model), [model]);
   const focus = useMemo(() => radialFocus(model, selectedId), [model, selectedId]);
+  // WHAT AN EDGE IS, on hover. The design's instruction is "hover a module · hover an edge for the
+  // import", and an unlabelled line is the one thing in this picture a reader cannot decode. The
+  // tooltip states the real, resolved edge — `importer → imported` — and nothing else.
+  const [edgeTip, setEdgeTip] = useState<{ label: string; x: number; y: number } | null>(null);
 
   if (model.nodes.length === 0) {
     return (
@@ -72,13 +77,26 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
 
         {layout.edges.map((edge) => {
           const key = edgeKey(edge.from, edge.to);
+          const hot = focus.edges.has(key);
           return (
-            <path
-              key={key}
-              className="graph-edge"
-              d={edge.path}
-              data-hot={focus.edges.has(key) ? "true" : undefined}
-            />
+            <g key={key}>
+              <path className="graph-edge" d={edge.path} data-hot={hot ? "true" : undefined} />
+              {/* A transparent fat stroke over the hairline: the drawn edge is under a pixel wide and
+                  no pointer can reliably land on it. Same geometry, so the hit area is never
+                  somewhere the line is not. */}
+              <path
+                className="graph-edge-hit"
+                d={edge.path}
+                onMouseMove={(event) =>
+                  setEdgeTip({
+                    label: `${moduleLabel(edge.from)} → ${moduleLabel(edge.to)}`,
+                    x: event.clientX,
+                    y: event.clientY,
+                  })
+                }
+                onMouseLeave={() => setEdgeTip(null)}
+              />
+            </g>
           );
         })}
 
@@ -120,6 +138,11 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
         })}
       </svg>
       {readout ? <p className="graph-readout">{readout}</p> : null}
+      {edgeTip ? (
+        <span className="graph-tip" aria-hidden="true" style={{ left: edgeTip.x, top: edgeTip.y }}>
+          {edgeTip.label}
+        </span>
+      ) : null}
     </div>
   );
 }
