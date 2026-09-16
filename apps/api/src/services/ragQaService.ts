@@ -260,13 +260,13 @@ export function retrievalHealth(environment: Record<string, string | undefined> 
   try {
     embeddingConfigured = Boolean(createEmbeddingClientFromEnv(environment));
   } catch {
-    // An ambiguous provider config THROWS at construction (both keys, no explicit choice). That is
+    // An ambiguous provider config THROWS at construction (several keys, no explicit choice). That is
     // a real misconfiguration, and it is reported here rather than thrown: a /health that 500s
     // tells a probe the process is dead when it is serving every deterministic read fine.
     return {
       mode: "not-configured",
       degradation:
-        "The embedding provider is configured ambiguously (both keys set with no EMBEDDING_PROVIDER), " +
+        "The embedding provider is configured ambiguously (more than one provider key set with no EMBEDDING_PROVIDER), " +
         "so no retrieval index can be opened and Q&A is unavailable.",
     };
   }

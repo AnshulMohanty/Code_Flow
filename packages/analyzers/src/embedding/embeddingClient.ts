@@ -25,7 +25,7 @@ export interface EmbeddingRequest {
  * local index and a hosted one must be impossible to mix, and the type is what makes that structural
  * rather than a convention.
  */
-export type EmbeddingProvider = "voyage" | "gemini" | "local";
+export type EmbeddingProvider = "voyage" | "gemini" | "openai" | "local";
 
 /**
  * One vector per input text plus what the call cost. Widened from a bare `number[][]` in
@@ -63,7 +63,8 @@ export interface VoyageClientOptions {
 }
 
 const DEFAULT_VOYAGE_MODEL = "voyage-code-3";
-const DEFAULT_VOYAGE_DIM = 1024;
+/** Exported because the pgvector TABLE NAME is derived from it — see `resolveEmbeddingDimension`. */
+export const DEFAULT_VOYAGE_DIM = 1024;
 
 /**
  * Minimal `fetch`-based Voyage embeddings client — no SDK dependency. This is the
@@ -157,7 +158,9 @@ export interface GeminiEmbeddingClientOptions {
 }
 
 const DEFAULT_GEMINI_EMBED_MODEL = "gemini-embedding-001";
-const DEFAULT_GEMINI_EMBED_DIM = 768;
+/** 768 is a CHOICE, not a constant of the system: it is why today's table is `codeflow_vectors_768`.
+ *  Exported so `resolveEmbeddingDimension` can answer which table an env addresses. */
+export const DEFAULT_GEMINI_EMBED_DIM = 768;
 // Gemini's batchEmbedContents accepts up to ~100 requests per call; cap conservatively.
 // The RAG stage already batches by its own limits, then this client re-chunks under this.
 const GEMINI_EMBED_MAX_BATCH = 100;
@@ -237,6 +240,141 @@ export function createGeminiEmbeddingClient(options: GeminiEmbeddingClientOption
         const reported =
           usageNumber(json.usageMetadata?.totalTokenCount) ?? usageNumber(json.usageMetadata?.promptTokenCount);
         usageParts.push(reported !== undefined ? measuredUsage(reported, 0) : estimatedUsage(batch.join("\n")));
+      }
+
+      return { vectors, usage: sumUsage(usageParts) };
+    },
+  };
+}
+
+export interface OpenAiEmbeddingClientOptions {
+  apiKey: string;
+  /** Defaults to "text-embedding-3-small" (1536 dims). "text-embedding-3-large" is 3072. */
+  model?: string;
+  /**
+   * Output vector length. Defaults to the MODEL'S NATIVE dimension (see OPENAI_EMBED_NATIVE_DIM),
+   * never to a constant: a wrong default here would be written into the pgvector table name and the
+   * mismatch would only surface as an empty result set.
+   *
+   * The v3 models are Matryoshka-trained, so a shorter vector is a valid truncation rather than a
+   * different space, and `dimensions` is sent only when it differs from native — text-embedding-
+   * ada-002 does not accept the parameter at all and would 400 on it.
+   */
+  dimension?: number;
+  /** Override for tests/proxies; defaults to the public API. */
+  baseUrl?: string;
+  /** Sent as `OpenAI-Organization` when present. */
+  organization?: string;
+}
+
+export const DEFAULT_OPENAI_EMBED_MODEL = "text-embedding-3-small";
+/**
+ * Native output width per model. A model that is not listed falls back to 1536, which is the width
+ * of every OpenAI embedding model that has ever shipped except -3-large — and because the resolved
+ * number is both the table key and the homogeneity assertion, an unknown model that is actually
+ * wider fails LOUDLY on the first upsert rather than corrupting an index.
+ */
+const OPENAI_EMBED_NATIVE_DIM: Record<string, number> = {
+  "text-embedding-3-small": 1536,
+  "text-embedding-3-large": 3072,
+  "text-embedding-ada-002": 1536,
+};
+const OPENAI_EMBED_FALLBACK_DIM = 1536;
+/**
+ * Inputs per request. OpenAI documents a 2048-input / 300K-token ceiling per call; 256 keeps a
+ * batch of large code chunks well under the token half of that, which is the half a repository
+ * actually hits. The RAG stage batches by its own limits first, then this re-chunks under them.
+ */
+const OPENAI_EMBED_MAX_BATCH = 256;
+
+/** The model's native vector width, exported so config resolution and tests agree on one answer. */
+export function openAiEmbeddingDimension(model: string): number {
+  return OPENAI_EMBED_NATIVE_DIM[model] ?? OPENAI_EMBED_FALLBACK_DIM;
+}
+
+/**
+ * Minimal `fetch`-based OpenAI embeddings client — no SDK, mirroring `createVoyageClient`. Behind
+ * the SAME `EmbeddingClient` interface, so the RAG stage (chunking / grounding / caching) and the
+ * Q&A path are unchanged. Selected by `EMBEDDING_PROVIDER=openai` — see providers.ts.
+ *
+ *   POST {baseUrl}/v1/embeddings   header authorization: Bearer <key>
+ *   body { input: string[], model, dimensions? }
+ *   → { data: [{ embedding: number[], index: number }, ...], usage: { prompt_tokens, total_tokens } }
+ *
+ * THE DIMENSION IS THE PART THAT MATTERS. It is reported on `.dimension`, which the worker and the
+ * API both read into `EmbeddingSpace.embeddingDim`, which becomes the pgvector table name
+ * (`codeflow_vectors_1536`). Switching to this provider therefore CANNOT query the 768-wide Gemini
+ * table: it addresses a different table, `ensureSchema()` creates it, and `assertEmbeddingSpace`
+ * refuses at the boundary if the two ever disagree. What it does mean is that the old index does not
+ * transfer — a repository has to be re-analysed in the new space.
+ *
+ * OpenAI has no `input_type` distinction (its v3 models embed queries and documents in one space),
+ * so `inputType` is accepted and deliberately unused rather than faked into a prefix that would
+ * change the vectors for no measured benefit.
+ */
+export function createOpenAiEmbeddingClient(options: OpenAiEmbeddingClientOptions): EmbeddingClient {
+  const baseUrl = options.baseUrl ?? "https://api.openai.com";
+  const model = options.model ?? DEFAULT_OPENAI_EMBED_MODEL;
+  const native = openAiEmbeddingDimension(model);
+  const dimension = options.dimension ?? native;
+
+  return {
+    provider: "openai",
+    model,
+    dimension,
+    async embed(request: EmbeddingRequest): Promise<EmbeddingResult> {
+      if (request.texts.length === 0) {
+        return { vectors: [], usage: { inputTokens: 0, outputTokens: 0, measured: true } };
+      }
+
+      const vectors: number[][] = [];
+      const usageParts: TokenUsage[] = [];
+      for (let offset = 0; offset < request.texts.length; offset += OPENAI_EMBED_MAX_BATCH) {
+        const batch = request.texts.slice(offset, offset + OPENAI_EMBED_MAX_BATCH);
+        const response = await fetch(`${baseUrl}/v1/embeddings`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${options.apiKey}`,
+            ...(options.organization ? { "openai-organization": options.organization } : {}),
+          },
+          body: JSON.stringify({
+            input: batch,
+            model,
+            // Only when it is a real truncation. ada-002 rejects the parameter outright.
+            ...(dimension !== native ? { dimensions: dimension } : {}),
+          }),
+        });
+
+        if (!response.ok) {
+          const detail = await response.text().catch(() => "");
+          throw new Error(`OpenAI embeddings API error ${response.status}: ${detail.slice(0, 500)}`);
+        }
+
+        const json = (await response.json()) as {
+          data?: Array<{ embedding?: number[]; index?: number }>;
+          usage?: { prompt_tokens?: unknown; total_tokens?: unknown };
+        };
+        const data = json.data ?? [];
+        if (data.length !== batch.length) {
+          throw new Error(`OpenAI API returned ${data.length} embeddings for ${batch.length} inputs.`);
+        }
+
+        // Re-ordered by `index` like the Voyage adapter: the vectors must align to the input order
+        // or every chunk in the batch is stored against the wrong file and line range.
+        const ordered: number[][] = new Array(batch.length);
+        data.forEach((entry, i) => {
+          const at = typeof entry.index === "number" ? entry.index : i;
+          if (!Array.isArray(entry.embedding)) {
+            throw new Error(`OpenAI API returned a non-array embedding at index ${at}.`);
+          }
+          ordered[at] = entry.embedding;
+        });
+        vectors.push(...ordered);
+
+        // Embeddings have no output tokens; OpenAI reports both counters with the same value.
+        const totalTokens = usageNumber(json.usage?.total_tokens) ?? usageNumber(json.usage?.prompt_tokens);
+        usageParts.push(totalTokens !== undefined ? measuredUsage(totalTokens, 0) : estimatedUsage(batch.join("\n")));
       }
 
       return { vectors, usage: sumUsage(usageParts) };

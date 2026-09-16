@@ -66,7 +66,7 @@ export interface LlmCompletionResult {
 
 /** A chat/synthesis provider identifier (part of the synthesis cache key, so switching
  *  providers never serves a completion from the wrong model). */
-export type LlmProvider = "anthropic" | "gemini";
+export type LlmProvider = "anthropic" | "gemini" | "openai";
 
 /** Returns the model's raw completion + its real token cost. */
 export interface LlmClient {
@@ -266,4 +266,118 @@ function geminiSystemInstruction(request: LlmCompletionRequest): Record<string, 
   const parts = [request.cachePrefix, request.system].filter((value): value is string => Boolean(value));
   if (!parts.length) return {};
   return { systemInstruction: { parts: parts.map((text) => ({ text })) } };
+}
+
+export interface OpenAiClientOptions {
+  apiKey: string;
+  /** Defaults to "gpt-4.1" — see DEFAULT_OPENAI_MODEL for why that tier and not a cheaper one. */
+  model?: string;
+  /** Override for tests/proxies, and for an Azure/OpenRouter-compatible gateway. */
+  baseUrl?: string;
+  maxTokens?: number;
+  /** Sent as `OpenAI-Organization` when present. Some accounts require it; most do not. */
+  organization?: string;
+}
+
+/**
+ * The frontier default. Chosen to match what `SYNTHESIS_MODEL` means for Anthropic (the model whose
+ * output a user reads), not the cheapest one that answers — `FAST_MODEL` is where cheap belongs.
+ */
+const DEFAULT_OPENAI_MODEL = "gpt-4.1";
+/** Rows per completion when `maxTokens` is unset. Same number the Anthropic adapter defaults to. */
+const OPENAI_DEFAULT_MAX_TOKENS = 2048;
+
+/**
+ * Minimal `fetch`-based OpenAI Chat Completions client — no SDK, mirroring the Anthropic and Gemini
+ * adapters. Behind the SAME `LlmClient` interface, so every stage (synthesize, the specialist
+ * fan-out, the agent turns, the judge) is unchanged and the grounding/citation path cannot tell the
+ * difference. Selected by `LLM_PROVIDER=openai` — see providers.ts.
+ *
+ *   POST {baseUrl}/v1/chat/completions   header authorization: Bearer <key>
+ *   body { model, messages: [{role, content}], temperature, max_completion_tokens,
+ *          response_format: { type: "json_object" } }
+ *   → { choices: [{ message: { content } }], usage: { prompt_tokens, completion_tokens,
+ *       prompt_tokens_details: { cached_tokens } } }
+ *
+ * `response_format: json_object` is the counterpart of Gemini's `responseMimeType` and of the
+ * fence-stripping the Anthropic path relies on: every AI stage here parses JSON, and asking the
+ * provider for JSON is cheaper and more reliable than repairing prose. OpenAI requires the word
+ * "JSON" to appear in the conversation for that mode, which the stages' own schema instructions
+ * already satisfy — and `completionText` still strips a fence if one arrives anyway.
+ *
+ * PROMPT CACHING is AUTOMATIC on OpenAI (prefixes over ~1024 tokens), so like Gemini there is no
+ * breakpoint to declare; the stable prefix leads the system message to keep that prefix
+ * byte-identical between calls. A hit comes back as `prompt_tokens_details.cached_tokens` and is
+ * REPORTED, never assumed. Note OpenAI counts cached tokens INSIDE `prompt_tokens`, which is the
+ * same convention `measuredUsage` already applies to Anthropic's `cache_read_input_tokens`.
+ *
+ * REASONING MODELS (the o-series) are deliberately NOT the default: they reject `temperature: 0`,
+ * and temperature 0 is what makes a given SHA's output stable for the eval set. Setting
+ * `OPENAI_MODEL` to one is therefore a supported-provider/unsupported-model combination, and it
+ * fails loudly at the first call rather than quietly producing non-reproducible analyses.
+ */
+export function createOpenAiClient(options: OpenAiClientOptions): LlmClient {
+  const baseUrl = options.baseUrl ?? "https://api.openai.com";
+  const model = options.model ?? DEFAULT_OPENAI_MODEL;
+  const defaultMaxTokens = options.maxTokens ?? OPENAI_DEFAULT_MAX_TOKENS;
+
+  return {
+    provider: "openai",
+    model,
+    async complete(request: LlmCompletionRequest): Promise<LlmCompletionResult> {
+      const system = [request.cachePrefix, request.system].filter((value): value is string => Boolean(value));
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${options.apiKey}`,
+          ...(options.organization ? { "openai-organization": options.organization } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            ...(system.length ? [{ role: "system", content: system.join("\n\n") }] : []),
+            { role: "user", content: request.prompt },
+          ],
+          temperature: request.temperature ?? 0,
+          max_completion_tokens: request.maxTokens ?? defaultMaxTokens,
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`OpenAI API error ${response.status}: ${detail.slice(0, 500)}`);
+      }
+
+      const json = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string | null } }>;
+        usage?: {
+          prompt_tokens?: unknown;
+          completion_tokens?: unknown;
+          prompt_tokens_details?: { cached_tokens?: unknown };
+        };
+      };
+      const text = (json.choices ?? [])
+        .map((choice) => choice.message?.content)
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .join("");
+      if (!text) {
+        throw new Error("OpenAI API returned no text content.");
+      }
+
+      const inputTokens = usageNumber(json.usage?.prompt_tokens);
+      const outputTokens = usageNumber(json.usage?.completion_tokens);
+      const usage =
+        inputTokens !== undefined
+          ? measuredUsage(inputTokens, outputTokens ?? 0, {
+              read: usageNumber(json.usage?.prompt_tokens_details?.cached_tokens),
+            })
+          : // OpenAI always reports usage on a non-streaming call, but a missing counter must not
+            // silently record 0 tokens against the wallet — same rule as the Anthropic adapter.
+            estimatedUsage(`${request.cachePrefix ?? ""}${request.system ?? ""}\n${request.prompt}`, text);
+
+      return { text, usage };
+    },
+  };
 }
