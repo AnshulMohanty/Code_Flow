@@ -16,7 +16,12 @@ FROM node:20-slim AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 # `git` is required at runtime: the worker shallow-clones public repos to analyze them.
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# ca-certificates is EXPLICIT because it is only a *Recommends* of git, which
+# --no-install-recommends drops. Without it git's libcurl has no CA bundle and EVERY https clone
+# dies with "server certificate verification failed. CAfile: none" -- fast, and before any parsing
+# or provider call, so the job looks like an instant empty success. Node's own fetch is unaffected
+# (it bundles its CA store), which is exactly why this fails ONLY the clone and nothing else.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --create-home --uid 1001 codeflow
 COPY --from=build --chown=codeflow:codeflow /prod ./
