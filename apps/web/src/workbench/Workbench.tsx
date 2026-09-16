@@ -1,3 +1,4 @@
+import type { AnalysisResult } from "@codeflow/shared-types";
 import { useCallback, useMemo, useState } from "react";
 import { CommandPalette, usePaletteHotkey, type PaletteItem } from "../components/CommandPalette";
 import { Hud } from "../components/Hud";
@@ -7,7 +8,8 @@ import { askDisabledReason } from "../site/MarketingSite";
 import { RepoField } from "../site/RepoField";
 import type { AnalysisState, AskState } from "../lib/useAnalysis";
 import type { MetaState } from "../lib/useMeta";
-import { TabDomains } from "./TabDomains";
+import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
+import { hasDomainLanes, TabDomains } from "./TabDomains";
 import { TabExplore } from "./TabExplore";
 import { TabImpact } from "./TabImpact";
 import { TabSystem } from "./TabSystem";
@@ -34,8 +36,26 @@ const TABS: Array<{ id: WorkbenchTab; num: string; label: string }> = [
   { id: "domains", num: "04", label: "Domains" },
 ];
 
+/**
+ * Which tabs this run can actually fill.
+ *
+ * DOMAINS IS CONDITIONAL. Its content is `result.ai.domains`, produced only by the bounded specialist
+ * fan-out — which is 5N+1 provider calls where the single-shot stage is 1, so it is OFF by default
+ * and off on every free deployment. A tab that exists only to explain that a feature was not enabled
+ * is worse than no tab: it reads as something broken rather than something optional.
+ *
+ * The parser's structural roles used to live on that tab and now live on TAB 01, so hiding it costs
+ * no measured data — which is the only reason hiding it is acceptable here. See TabDomains.tsx.
+ */
+function visibleTabs(result: AnalysisResult | null): typeof TABS {
+  if (!result || hasDomainLanes(result)) return TABS;
+  return TABS.filter((tab) => tab.id !== "domains");
+}
+
 export interface WorkbenchProps {
   meta: MetaState;
+  /** Whether the backend has answered yet. Gates the analyze field — see `EntryStep`. */
+  wake: WakeState;
   analysis: AnalysisState;
   ask: AskState;
   onAnalyze(input: { owner: string; repo: string }): void;
@@ -43,7 +63,7 @@ export interface WorkbenchProps {
   onExit(): void;
 }
 
-export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: WorkbenchProps) {
+export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit }: WorkbenchProps) {
   const [tab, setTab] = useState<WorkbenchTab>("system");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -54,13 +74,20 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
   const graph = useMemo(() => (result ? buildGraphModel(result) : null), [result]);
   const model = useMemo(() => (result ? buildSiteModel(result, meta.facts) : null), [result, meta.facts]);
 
+  const tabs = useMemo(() => visibleTabs(result), [result]);
+
+  // A tab that disappears under the user must not leave the panel blank. This cannot happen from the
+  // tab bar (the tab is gone before there is a result to hide it for), but it can from a command
+  // palette entry or a restored state, so the fallback is real rather than defensive decoration.
+  const activeTab: WorkbenchTab = tabs.some((entry) => entry.id === tab) ? tab : "system";
+
   const jump = useCallback((next: WorkbenchTab, fileId?: string) => {
     setTab(next);
     if (fileId) setSelectedId(fileId);
   }, []);
 
   const paletteItems = useMemo<PaletteItem[]>(() => {
-    const items: PaletteItem[] = TABS.map((entry) => ({
+    const items: PaletteItem[] = tabs.map((entry) => ({
       id: `tab:${entry.id}`,
       label: `${entry.num} ${entry.label}`,
       kind: "tab",
@@ -93,13 +120,13 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
 
         {result ? (
           <div className="wb-tabs" role="tablist" aria-label="Workbench views">
-            {TABS.map((entry) => (
+            {tabs.map((entry) => (
               <button
                 key={entry.id}
                 type="button"
                 role="tab"
                 className="wb-tab"
-                aria-selected={tab === entry.id}
+                aria-selected={activeTab === entry.id}
                 onClick={() => setTab(entry.id)}
               >
                 {entry.num} {entry.label.toUpperCase()}
@@ -140,15 +167,15 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
         ) : null}
 
         {!result && !busy ? (
-          <EntryStep meta={meta} onAnalyze={onAnalyze} error={analysis.error} />
+          <EntryStep meta={meta} wake={wake} onAnalyze={onAnalyze} error={analysis.error} />
         ) : !result ? (
           <ResolvingStep analysis={analysis} meta={meta} />
         ) : graph && model ? (
           <>
-            {tab === "system" ? (
+            {activeTab === "system" ? (
               <TabSystem result={result} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
             ) : null}
-            {tab === "explore" ? (
+            {activeTab === "explore" ? (
               <TabExplore
                 result={result}
                 graph={graph}
@@ -159,10 +186,10 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
                 askDisabledReason={askDisabledReason(result, ask)}
               />
             ) : null}
-            {tab === "impact" ? (
+            {activeTab === "impact" ? (
               <TabImpact result={result} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
             ) : null}
-            {tab === "domains" ? <TabDomains result={result} graph={graph} onSelect={(id) => jump("impact", id ?? undefined)} /> : null}
+            {activeTab === "domains" ? <TabDomains result={result} graph={graph} onSelect={(id) => jump("impact", id ?? undefined)} /> : null}
           </>
         ) : null}
       </main>
@@ -181,10 +208,12 @@ export function Workbench({ meta, analysis, ask, onAnalyze, onAsk, onExit }: Wor
  */
 export function EntryStep({
   meta,
+  wake,
   onAnalyze,
   error,
 }: {
   meta: MetaState;
+  wake: WakeState;
   onAnalyze(input: { owner: string; repo: string }): void;
   error: string | null;
 }) {
@@ -195,7 +224,7 @@ export function EntryStep({
       <h1 className="display display-l" style={{ maxWidth: "22ch", marginBottom: 34 }}>
         Give me a URL. I&rsquo;ll give you the map<span className="dot" aria-hidden="true" />
       </h1>
-      <RepoField onAnalyze={onAnalyze} autoFocus error={error} />
+      <RepoField onAnalyze={onAnalyze} autoFocus error={error} notReady={analyzeBlockedReason(wake)} />
       <p className="wb-recents">
         <span>indexed:</span>
         {meta.status === "loading" ? (

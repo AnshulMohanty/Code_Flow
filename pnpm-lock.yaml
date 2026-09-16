@@ -41,6 +41,9 @@ importers:
       '@codeflow/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@codeflow/worker':
+        specifier: workspace:*
+        version: link:../worker
       bullmq:
         specifier: ^5.34.5
         version: 5.76.6
@@ -72,6 +75,13 @@ importers:
 
   apps/local-cli:
     dependencies:
+      '@vscode/tree-sitter-wasm':
+        specifier: 0.3.1
+        version: 0.3.1
+      web-tree-sitter:
+        specifier: 0.26.13
+        version: 0.26.13
+    devDependencies:
       '@codeflow/analyzers':
         specifier: workspace:*
         version: link:../../packages/analyzers
@@ -90,10 +100,12 @@ importers:
       '@codeflow/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
-    devDependencies:
       '@types/node':
         specifier: ^22.9.0
         version: 22.19.17
+      vite:
+        specifier: ^5.4.11
+        version: 5.4.21(@types/node@22.19.17)
 
   apps/mcp:
     dependencies:

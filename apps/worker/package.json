@@ -3,6 +3,14 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "prebuild": "pnpm --filter @codeflow/config build && pnpm --filter @codeflow/shared-types build && pnpm --filter @codeflow/observability build && pnpm --filter @codeflow/retrieval build && pnpm --filter @codeflow/memory build && pnpm --filter @codeflow/analyzers build && pnpm --filter @codeflow/agents build && pnpm --filter @codeflow/parsers build && pnpm --filter @codeflow/graph build",

@@ -14,7 +14,8 @@
       "@codeflow/memory": ["packages/memory/dist/index.d.ts"],
       "@codeflow/config": ["../../packages/config/dist/index.d.ts"],
       "@codeflow/retrieval": ["packages/retrieval/dist/index.d.ts"],
-      "@codeflow/shared-types": ["../../packages/shared-types/dist/index.d.ts"]
+      "@codeflow/shared-types": ["../../packages/shared-types/dist/index.d.ts"],
+      "@codeflow/worker": ["../../apps/worker/dist/index.d.ts"]
     }
   },
   "include": ["src"]

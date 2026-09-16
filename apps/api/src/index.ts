@@ -1,10 +1,11 @@
 import { createApp } from "./app.js";
+import { resolveEmbeddedWorker } from "./config/embeddedWorker.js";
 import { apiPortResolution, env } from "./config/env.js";
 import { connectMongo, isMongoConnected } from "./db/connectMongo.js";
 import { warmUpApi } from "./health/warmup.js";
 import { createRedisRateLimitStore } from "./middleware/rateLimit.js";
 import { getSharedRedis, isSharedRedisEnabled } from "./queues/redisClient.js";
-import { isQaConfigured, warmQaDependencies } from "./services/ragQaService.js";
+import { getQaRetrievalStores, isQaConfigured, warmQaDependencies } from "./services/ragQaService.js";
 
 /**
  * API composition root. V3-P0 wires the PRODUCTION rate-limit store here: Guard 4's limit
@@ -42,6 +43,31 @@ try {
     qaConfigured: () => isQaConfigured(),
     warmQa: () => warmQaDependencies(),
   });
+
+  // --- EMBEDDED WORKER (free-tier single-service mode) ------------------------
+  // Started AFTER warm-up so the tree-sitter grammars and the retrieval schema are already paid for
+  // when the first job arrives, and BEFORE listen so the queue is being drained by the time the
+  // service is routable. The import is DYNAMIC: with the flag off the worker's module graph — BullMQ,
+  // the cloner, the whole analyzer chain — is never loaded, so a normal API deployment pays nothing
+  // for this path, not a dependency and not a millisecond of cold start.
+  const embedded = resolveEmbeddedWorker(process.env);
+  for (const note of embedded.notes) console.log(`[codeflow] ${note}`);
+  if (embedded.embedded) {
+    const { startAnalysisWorker } = await import("@codeflow/worker");
+    await startAnalysisWorker({
+      // This process already connected; a second connect on the same mongoose singleton would
+      // replace the connection every route above is using.
+      mongoAlreadyConnected: true,
+      // The same store objects the Q&A path reads. Without this, a deployment with no Postgres has
+      // the worker writing an index into one in-memory store and the API querying another.
+      retrieval: await getQaRetrievalStores(),
+      concurrency: embedded.concurrency,
+      // The API already serves /health on the one port the platform routes to.
+      healthServer: false,
+      // The host owns the process lifecycle; two SIGTERM handlers racing to exit is not a shutdown.
+      handleSignals: false,
+    });
+  }
 
   // A managed host routes to the port it assigned; binding elsewhere is reported as unhealthy
   // with no useful error, so say which variable chose this one.

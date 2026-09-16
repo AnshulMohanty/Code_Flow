@@ -1,4 +1,4 @@
-import type { AnalysisResult, FileRole } from "@codeflow/shared-types";
+import type { AnalysisResult } from "@codeflow/shared-types";
 import { useMemo } from "react";
 import type { GraphModel } from "../lib/graphModel";
 import { buildAdjacency, isEntryProbable } from "../lib/architecture";
@@ -6,24 +6,25 @@ import { moduleLabel } from "../lib/citation";
 import { count } from "../lib/siteModel";
 
 /**
- * TAB 04 — DOMAINS. Two halves, and keeping them apart is the whole job of this view.
+ * TAB 04 — DOMAINS. Inferred domain lanes, and nothing else.
  *
- * TOP: STRUCTURAL ROLES — DETERMINISTIC PASS. The parser's `classifyRole` output, counted. These are
- * facts: a file either matched a test pattern or it did not.
+ * `result.ai.domains`, produced by the bounded specialist fan-out, labelled as inference in the
+ * header and on every lane. A reader must never mistake an agent's guess about "authentication" for
+ * a measured fact, so the distinction is stated more than once rather than in a tooltip.
  *
- * BOTTOM: DOMAIN LANES — SPECIALIST AGENTS · INFERRED. `result.ai.domains`, produced by the fan-out
- * and labelled as inference in the header, in the serif note between the halves, and on every lane.
+ * THE TAB IS HIDDEN ENTIRELY WHEN THERE ARE NO LANES — see `hasDomainLanes` and the tab list in
+ * Workbench.tsx. The fan-out is 5N+1 provider calls where the single-shot stage is 1, so it is OFF by
+ * default and off on every free deployment; a tab that exists only to apologise for a feature nobody
+ * enabled is worse than no tab.
  *
- * WHY THE LABELLING IS BELT AND BRACES. These two blocks sit inches apart and look alike. A reader
- * who cannot tell them apart will read an agent's guess about "authentication" with the same
- * confidence as the parser's count of test files — and the second is checkable while the first is a
- * model's opinion. So the distinction is stated three times, in three registers, rather than once in
- * a tooltip.
+ * WHAT MOVED, AND WHY THAT MATTERED. This view used to open with the parser's STRUCTURAL ROLES — real
+ * counts, available on every run including a keyless one. Hiding this tab would have hidden those
+ * too, so they moved to TAB 01, where they belong anyway: they are facts about the system, not about
+ * any agent. Discarding measured data to tidy away an empty panel would have been the wrong trade.
  *
- * WHEN THERE ARE NO DOMAIN LANES (a keyless run, a single-shot synthesis, a cached result from before
- * the field existed) the bottom half says so plainly. It does NOT fall back to showing the community
- * partition as though it were a domain: communities are structural, domains are inferred, and
- * quietly substituting one for the other would be exactly the confusion this view exists to prevent.
+ * WHAT IS STILL DELIBERATELY ABSENT: the community partition. Communities are STRUCTURAL and domains
+ * are INFERRED, and quietly substituting one for the other — to have something to show — would be
+ * exactly the confusion this view exists to prevent.
  */
 
 export interface TabDomainsProps {
@@ -32,18 +33,18 @@ export interface TabDomainsProps {
   onSelect(fileId: string | null): void;
 }
 
-/** The roles the design's top row shows, in its order. */
-const SHOWN_ROLES: FileRole[] = ["source", "build", "config", "test", "docs"];
+/**
+ * Does this analysis have inferred domain lanes to show?
+ *
+ * Exported because the TAB LIST needs the same answer this component does: the tab is not rendered
+ * at all when it is false, and two places deciding that independently is how a tab ends up in the
+ * bar with nothing behind it.
+ */
+export function hasDomainLanes(result: AnalysisResult): boolean {
+  return (result.ai?.domains ?? []).length > 0;
+}
 
 export function TabDomains({ result, graph, onSelect }: TabDomainsProps) {
-  const roleCounts = useMemo(() => {
-    const tally = new Map<string, number>();
-    for (const file of result.structure?.files ?? []) {
-      tally.set(file.role, (tally.get(file.role) ?? 0) + 1);
-    }
-    return tally;
-  }, [result]);
-
   const adjacency = useMemo(() => buildAdjacency(graph), [graph]);
   const entryPointIds = useMemo(() => new Set((result.entryPoints ?? []).map((entry) => entry.fileId)), [result]);
 
@@ -52,28 +53,9 @@ export function TabDomains({ result, graph, onSelect }: TabDomainsProps) {
 
   return (
     <>
-      <p className="wb-step">Structural roles — deterministic pass</p>
-
-      <div className="roles">
-        {SHOWN_ROLES.map((role) => {
-          const value = roleCounts.get(role) ?? 0;
-          return (
-            <div className="role" key={role} data-zero={value === 0}>
-              <p className="role-count">{count(value)}</p>
-              <p className="role-name">
-                {role}
-                {/* A zero is a FACT here, not a gap: the parser looked and found none. Saying "none"
-                    beside the 0 distinguishes it from a figure nobody measured. */}
-                {value === 0 ? <span className="role-note"> · none</span> : null}
-              </p>
-            </div>
-          );
-        })}
-      </div>
-
-      <p className="inference-note" style={{ margin: "18px 0 26px" }}>
-        Roles come from the parser. Domains below are inferred by specialist agents — labelled as
-        inference, never as fact.
+      <p className="inference-note" style={{ margin: "0 0 26px" }}>
+        Everything on this tab is INFERRED by specialist agents. The parser&rsquo;s own structural
+        roles — which are measured, not inferred — are on TAB 01.
       </p>
 
       <div className="wb-head">
@@ -82,7 +64,7 @@ export function TabDomains({ result, graph, onSelect }: TabDomainsProps) {
         </p>
         <p className="wb-head-note">
           {lanes.length === 0
-            ? "none available for this run"
+            ? "none — this tab is hidden when a run produces none"
             : `${count(lanes.length)} detected${emptyLanes > 0 ? ` · ${count(emptyLanes)} with no findings` : ""}`}
         </p>
       </div>

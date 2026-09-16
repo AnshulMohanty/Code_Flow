@@ -330,13 +330,13 @@ script.
 **Goal:** the engineering-marvel layer and distribution.
 **Entry gate:** Phase 4 `[x]`.
 
-- [x] **Latency:** DAG-layered parallel scheduling over the known pipeline DAG; persistent warm worker pool; model routing; speculative prefetch on the hard tail; cold-start warmup (HH_Goa pattern) with `/health.warmedUp`. Report the 4 latency tiers independently (`coreAnalysis`, `aiSynthesis`, `qaCoreHit`, `qaGenerate`).
+- [x] **Latency:** DAG-layered parallel scheduling over the known pipeline DAG; ~~persistent warm worker pool~~ **boot-time warm-up (process-lifetime warm caches)**; model routing; speculative prefetch on the hard tail; cold-start warmup (HH_Goa pattern) with `/health.warmedUp`. Report the 4 latency tiers independently (`coreAnalysis`, `aiSynthesis`, `qaCoreHit`, `qaGenerate`).
       → **DONE, but only after V3-FINAL closed two gaps V3-P5 left open.** The measurement changed the
       design: pure LAYER BARRIERS measurably UNDER-parallelise this DAG (shape `[1,1,1,1,1,2,1]` — `rag`
       is ready a layer before `synthesize`, so a barrier serialises the two slowest stages against each
       other), so stages launch by DEPENDENCY READINESS instead. Byte-identical slices across both modes,
       asserted. Sequential 67ms → layered 38ms (**1.76×**) — and that number is ORCHESTRATION-ONLY, on a
-      harness whose stages do no real parse work. The "warm pool" is a registry of PROCESS-lifetime
+      harness whose stages do no real parse work. The **boot-time warm-up** is a registry of PROCESS-lifetime
       resources, not a pool of processes; calling it the latter would describe an architecture that does
       not exist. **The two gaps:** `createSpeculator` shipped with ZERO production call sites, and
       `/health.warmedUp` on the API was STRUCTURALLY always false (zero registered tasks, and the flag is

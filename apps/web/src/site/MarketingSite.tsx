@@ -7,7 +7,10 @@ import { buildSiteModel, count } from "../lib/siteModel";
 import { moduleLabel } from "../lib/citation";
 import { suggestedQuestions } from "../lib/questions";
 import type { MetaState } from "../lib/useMeta";
+import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
 import type { AskState, AnalysisState } from "../lib/useAnalysis";
+import { snapshotLabel, type DemoSnapshot } from "../lib/demoSnapshot";
+import { DemoStrip } from "./DemoStrip";
 import { HeroMesh } from "./HeroMesh";
 import { LanguageTicker } from "./LanguageTicker";
 import { RepoField } from "./RepoField";
@@ -20,12 +23,26 @@ import { SiteNav } from "./SiteNav";
  *
  * Everything after the hero is driven by a REAL analysis. Before one exists, section 01 shows an
  * honest empty state instead of the card, section 02's three grounding states read as descriptions
- * with none active, and section 03's four stats are em-dashes. That is the correct first screenshot:
- * a page about measured numbers that has nothing to measure yet should say so.
+ * with none active, and section 03's four stats are em-dashes. That is the correct first screenshot
+ * for a build with nothing at all to show.
+ *
+ * THE DEMO SNAPSHOT SITS BETWEEN THOSE TWO STATES, and the distinction it has to hold is the whole
+ * reason it is safe. When a build ships a generated snapshot (see lib/demoSnapshot.ts) the views
+ * render its REAL numbers rather than em-dashes — because they are real numbers about a real
+ * repository at a pinned commit, not invented ones. What makes that different from the deleted
+ * "Use Mock Data" button is that the snapshot can never be mistaken for the visitor's own run: a
+ * banner names the repository, the commit, the date it was produced and what it is MISSING, and it
+ * is rendered wherever the snapshot is. A live analysis replaces it the moment one exists.
+ *
+ * A build with NO snapshot is unchanged — same empty state, same four em-dashes.
  */
 
 export interface MarketingSiteProps {
   meta: MetaState;
+  /** Whether the backend has answered yet. Drives the status pill and gates the analyze button. */
+  wake: WakeState;
+  /** The bundled pre-computed analysis, or null when this build has none. */
+  demo: DemoSnapshot | null;
   analysis: AnalysisState;
   ask: AskState;
   onAnalyze(input: { owner: string; repo: string }): void;
@@ -33,7 +50,7 @@ export interface MarketingSiteProps {
   onOpenWorkbench(): void;
 }
 
-export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWorkbench }: MarketingSiteProps) {
+export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAsk, onOpenWorkbench }: MarketingSiteProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
@@ -41,7 +58,11 @@ export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWor
 
   usePaletteHotkey(() => setPaletteOpen(true));
 
-  const result = analysis.result;
+  // A LIVE run always wins. The snapshot is what fills the page before one exists — never something
+  // that survives alongside one, which would leave two different repositories on screen at once.
+  const live = analysis.result;
+  const showingSnapshot = !live && demo !== null;
+  const result = live ?? demo?.result ?? null;
   const graph = useMemo(() => (result ? buildGraphModel(result) : null), [result]);
   const model = useMemo(() => (result ? buildSiteModel(result, meta.facts) : null), [result, meta.facts]);
 
@@ -86,6 +107,7 @@ export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWor
     <div ref={rootRef}>
       <SiteNav
         meta={meta}
+        wake={wake}
         activeSection={activeSection}
         onNavigate={navigate}
         onOpenPalette={() => setPaletteOpen(true)}
@@ -117,7 +139,8 @@ export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWor
               answers questions with the file and line it read.
             </p>
             <div>
-              <RepoField onAnalyze={onAnalyze} busy={busy} error={analysis.error} />
+              <RepoField onAnalyze={onAnalyze} busy={busy} error={analysis.error} notReady={analyzeBlockedReason(wake)} />
+              <DemoStrip onAnalyze={onAnalyze} activeFullName={showingSnapshot ? demo.provenance.repoFullName : null} />
               <p className="subline">
                 <span className="subline-ok">✓ deterministic pass first</span>
                 {model?.totalMs !== undefined && model?.totalMs !== null ? (
@@ -151,6 +174,8 @@ export function MarketingSite({ meta, analysis, ask, onAnalyze, onAsk, onOpenWor
               it.
             </p>
           </div>
+
+          {showingSnapshot && demo ? <SnapshotBanner snapshot={demo} /> : null}
 
           {model && graph && result ? (
             <PipelineCard
@@ -288,4 +313,50 @@ export function askDisabledReason(result: AnalysisResult, ask: AskState): string
     return "No Q&A index was built for this run, so there is nothing to ask against. The map above is the deterministic pass, which does not need a provider key.";
   }
   return null;
+}
+
+/**
+ * THE PROVENANCE BANNER — what makes rendering a pre-computed analysis honest rather than a lie.
+ *
+ * It is not a tooltip and not a footnote. A visitor who reads nothing else has to be able to tell
+ * that these numbers describe a NAMED repository at a PINNED commit, produced on a stated date, and
+ * not their own run. The commit is a link, so any claim on screen can be checked against the source
+ * it was read from.
+ *
+ * `limitations` is rendered, not summarised. A local snapshot has no AI summary and no Q&A index,
+ * and a reader looking at an empty Ask block deserves to know that is the method rather than the
+ * repository.
+ */
+function SnapshotBanner({ snapshot }: { snapshot: DemoSnapshot }) {
+  const { provenance } = snapshot;
+  const [owner, name] = provenance.repoFullName.split("/");
+  const commitUrl =
+    owner && name ? `https://github.com/${owner}/${name}/tree/${provenance.commitSha}` : null;
+
+  return (
+    <aside className="snapshot-banner" data-snapshot="true" role="note">
+      <p className="snapshot-banner-title">
+        Pre-computed demo — not a live run
+      </p>
+      <p className="snapshot-banner-body">
+        {snapshotLabel(provenance)}
+        {commitUrl ? (
+          <>
+            {" · "}
+            <a href={commitUrl} target="_blank" rel="noreferrer">
+              view the commit
+            </a>
+          </>
+        ) : null}
+      </p>
+      <p className="snapshot-banner-body">Produced by {provenance.producedBy}.</p>
+      {provenance.limitations.length > 0 ? (
+        <ul className="snapshot-banner-limits">
+          {provenance.limitations.map((limitation) => (
+            <li key={limitation}>{limitation}</li>
+          ))}
+        </ul>
+      ) : null}
+    </aside>
+  );
 }

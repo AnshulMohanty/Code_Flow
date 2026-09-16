@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { mockAnalysisResult } from "./test/fixture";
+import { mockAnalysisResult, withDomainLanes } from "./test/fixture";
 import { parseRepo } from "./site/RepoField";
 import type { AnalysisResult } from "@codeflow/shared-types";
 
@@ -13,6 +13,20 @@ import type { AnalysisResult } from "@codeflow/shared-types";
  * number it did not measure, no view presents inference as fact, and there is no path from the UI to
  * fabricated data. Every fetch is stubbed, so nothing here touches a network.
  */
+
+/**
+ * NO BUNDLED SNAPSHOT IN THIS SUITE, deliberately.
+ *
+ * This file pins the "nothing has been measured yet" invariant — four em-dashes, an honest empty
+ * state, no path to data the user did not ask for. Once a build ships a generated snapshot, the real
+ * loader would fill those views with a pre-computed analysis and every one of those assertions would
+ * be describing a different page.
+ *
+ * Without this mock the tests still PASS, which is worse than failing: the loader is async, so the
+ * synchronous assertions win the race by accident. An invariant that holds by timing is not pinned.
+ * The snapshot path has its own tests in site/demoSnapshot.test.tsx.
+ */
+vi.mock("./lib/useDemoSnapshot", () => ({ useDemoSnapshot: () => null }));
 
 const META = {
   analyzerVersion: "1.1.0",
@@ -26,6 +40,10 @@ const META = {
 function stubFetch(routes: Record<string, unknown>, options: { metaFails?: boolean } = {}) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    // Wake-on-visit hits /health on mount (see lib/useWake.ts). Answered by default: these tests are
+    // about what the app does with a REACHABLE backend, and an unrouted /health would put every one
+    // of them into the cold-start retry path.
+    if (url.endsWith("/health")) return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
     if (url.includes("/api/meta")) {
       if (options.metaFails) return new Response("nope", { status: 500 });
       return new Response(JSON.stringify(META), { status: 200, headers: { "content-type": "application/json" } });
@@ -41,6 +59,20 @@ function stubFetch(routes: Record<string, unknown>, options: { metaFails?: boole
     }
     throw new Error(`unrouted fetch: ${url}`);
   });
+}
+
+/**
+ * Fill the repo field and click Analyze — AFTER waiting for the button to enable.
+ *
+ * Analysing a fresh repository needs the API and the queue, so the button is disabled and reads
+ * "Warming up…" until wake-on-visit's `GET /health` answers (see lib/useWake.ts). Waiting for it is
+ * exactly what a real visitor does, so the tests do it rather than reaching past the gate — a test
+ * that clicked a disabled button would be asserting against a UI nobody can drive.
+ */
+async function startAnalysis(value: string) {
+  const button = await waitFor(() => screen.getByRole("button", { name: /^Analyze$/ }));
+  fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value } });
+  fireEvent.click(button);
 }
 
 function completedJob(jobId: string) {
@@ -118,15 +150,25 @@ describe("the marketing site, before any analysis", () => {
 });
 
 describe("the status pill never claims a connection it does not have", () => {
-  it("reads CONNECTING with a grey dot before /api/meta resolves", async () => {
+  // WHAT THE PILL REPORTS CHANGED, and the tests changed with it rather than being deleted. It used
+  // to read `meta.status` — "did /api/meta return". On a free tier where the backend sleeps, the
+  // honest answer for the first thirty seconds of a visit is neither "connecting" nor "offline" but
+  // "asleep, being woken", and those differ in the one way a visitor cares about: the third is worth
+  // waiting for. The pill now reads the real `GET /health` outcome. Every guarantee the old tests
+  // made is still asserted — here for the reachable states, and in SiteNav.test.tsx for OFFLINE,
+  // which is only reachable through the App after the full 67-second backoff.
+
+  it("reads WARMING, not a frozen spinner, while the wake request is in flight", async () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     render(<App />);
     const pill = document.querySelector(".pill")!;
-    expect(pill).toHaveTextContent(/CONNECTING/);
+    expect(pill).toHaveTextContent(/WARMING/);
     expect(pill.getAttribute("data-live")).toBe("false");
+    // It says WHY, so a visitor knows this resolves rather than hangs.
+    expect(pill.getAttribute("title")).toMatch(/sleeps when idle|30-50 seconds/i);
   });
 
-  it("reads READY with a green dot and the SERVER's version once it does", async () => {
+  it("reads READY with a green dot and the SERVER's version once /health answers", async () => {
     vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
     await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/READY/));
@@ -136,14 +178,14 @@ describe("the status pill never claims a connection it does not have", () => {
     expect(pill).toHaveTextContent("v1.1.0");
   });
 
-  it("reads OFFLINE, not READY, when the API cannot be reached", async () => {
-    // A green READY pill on a build talking to nothing is the most misleading thing a status
-    // indicator can do.
+  it("is green on REACHABILITY, and still falls back to an em-dash version when /api/meta fails", async () => {
+    // Two different facts, reported separately. A deployment can answer /health while /api/meta is
+    // failing; the useful fact for a visitor is the first, and inventing a version because the
+    // second failed would be the lie the pill exists to avoid.
     vi.stubGlobal("fetch", stubFetch({}, { metaFails: true }));
     render(<App />);
-    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/OFFLINE/));
-    expect(document.querySelector(".pill")!.getAttribute("data-live")).toBe("false");
-    // And the version falls back to an em-dash rather than a guess.
+    await waitFor(() => expect(document.querySelector(".pill")).toHaveTextContent(/READY/));
+    expect(document.querySelector(".pill")!.getAttribute("data-live")).toBe("true");
     expect(document.querySelector(".pill")).toHaveTextContent("—");
   });
 });
@@ -163,22 +205,47 @@ describe("running a real analysis", () => {
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
 
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
 
     // The tabs appear only once there is a result.
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
     expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument();
+  });
+
+  it("HIDES the Domains tab on a run with no inferred lanes, rather than opening onto an apology", async () => {
+    // The fan-out is 5N+1 provider calls where the single-shot stage is 1, so it is off by default
+    // and off on every free deployment. A tab whose only content is "this was not enabled" reads as
+    // something broken rather than something optional.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    expect(screen.queryByRole("tab", { name: /04 DOMAINS/ })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("tab")).toHaveLength(3);
+  });
+
+  it("keeps the parser's STRUCTURAL ROLES visible on TAB 01 — hiding a tab must not lose measured data", async () => {
+    // These counts are the parser's own classification, available on every run including a keyless
+    // one. They used to sit above the inferred lanes on TAB 04; hiding that tab would have taken
+    // them with it, so they moved rather than disappeared.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    expect(screen.getByText(/Structural roles — deterministic pass/i)).toBeInTheDocument();
+    expect(screen.getByText(/available on every run — including one with no provider key/i)).toBeInTheDocument();
   });
 
   it("TAB 01 derives the container diagram from the real edge count", async () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
 
     const edgeCount = result.graph!.edges.length;
@@ -190,8 +257,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
 
     const legend = document.querySelector(".legend")!;
@@ -200,42 +266,52 @@ describe("running a real analysis", () => {
     expect(legend).toHaveTextContent(/no rule violations detected/);
   });
 
-  it("TAB 04 labels the domain lanes as INFERENCE, three times over", async () => {
-    const result = mockAnalysisResult("acme/repo");
+  it("TAB 04 appears when there ARE lanes, and labels every one of them as inference", async () => {
+    const result = withDomainLanes(mockAnalysisResult("acme/repo"));
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
-    expect(screen.getByText(/Structural roles — deterministic pass/i)).toBeInTheDocument();
-    expect(screen.getByText(/Roles come from the parser/i)).toBeInTheDocument();
-    expect(screen.getByText(/labelled as inference, never as fact/i)).toBeInTheDocument();
+    // Said at the top of the tab, and again on the lane itself. A reader who cannot tell an agent's
+    // guess from the parser's count will trust both equally, and only one of them is checkable.
+    expect(screen.getByText(/Everything on this tab is INFERRED by specialist agents/i)).toBeInTheDocument();
     expect(screen.getByText(/Domain lanes — specialist agents · inferred/i)).toBeInTheDocument();
+    expect(screen.getByText(/agent · auth-surface/i)).toBeInTheDocument();
   });
 
-  it("TAB 04 says so plainly when there are NO inferred domains, and does not substitute communities", async () => {
-    // Quietly showing the structural community partition as a "domain" is exactly the confusion the
-    // view exists to prevent.
-    const result = mockAnalysisResult("acme/repo");
+  it("TAB 04 points at where the MEASURED roles live, instead of showing them twice", async () => {
+    const result = withDomainLanes(mockAnalysisResult("acme/repo"));
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /04 DOMAINS/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /04 DOMAINS/ }));
 
-    expect(screen.getByText(/No inferred domains for this run/i)).toBeInTheDocument();
-    expect(screen.getByText(/deliberately not shown here as though it were an inferred domain/i)).toBeInTheDocument();
+    expect(screen.getByText(/are on TAB 01/i)).toBeInTheDocument();
+  });
+
+  it("NEVER substitutes the community partition for an inferred domain", async () => {
+    // Communities are STRUCTURAL and domains are INFERRED. Quietly showing one as the other — to
+    // have something on the tab — is exactly the confusion this view exists to prevent, and is why
+    // the tab is hidden rather than backfilled when the fan-out did not run.
+    const result = mockAnalysisResult("acme/repo");
+    vi.stubGlobal("fetch", stubFetch(routes(result)));
+    render(<App />);
+    await startAnalysis("acme/repo");
+    await waitFor(() => expect(screen.getByRole("tab", { name: /01 SYSTEM/ })).toBeInTheDocument(), { timeout: 4000 });
+
+    // ...and is still not offered as a domain anywhere.
+    expect(screen.queryByRole("tab", { name: /04 DOMAINS/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Domain lanes/i)).not.toBeInTheDocument();
   });
 
   it("TAB 03 relabels the coverage card to the fact it actually has", async () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
 
@@ -249,8 +325,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /03 IMPACT/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /03 IMPACT/ }));
 
@@ -262,8 +337,7 @@ describe("running a real analysis", () => {
     const result = mockAnalysisResult("acme/repo");
     vi.stubGlobal("fetch", stubFetch(routes(result)));
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 
@@ -329,8 +403,7 @@ describe("Q&A availability is stated, never a dead end", () => {
       }),
     );
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 
@@ -372,8 +445,7 @@ describe("citation chips resolve, or do not pretend to", () => {
       }),
     );
     render(<App />);
-    fireEvent.change(screen.getByLabelText(/GitHub repository/i), { target: { value: "acme/repo" } });
-    fireEvent.click(screen.getByRole("button", { name: /^Analyze$/ }));
+    await startAnalysis("acme/repo");
     await waitFor(() => expect(screen.getByRole("tab", { name: /02 EXPLORE/ })).toBeInTheDocument(), { timeout: 4000 });
     fireEvent.click(screen.getByRole("tab", { name: /02 EXPLORE/ }));
 

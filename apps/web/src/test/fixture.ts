@@ -185,3 +185,33 @@ function normalizeRepoName(value: string) {
   const trimmed = value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
   return trimmed || "octocat/hello-world";
 }
+
+/**
+ * The same fixture, plus INFERRED domain lanes.
+ *
+ * Separate rather than folded into the base fixture on purpose: the base result has no
+ * `ai.domains`, which is the shape of every run without the specialist fan-out — the DEFAULT,
+ * since the fan-out is 5N+1 provider calls and is off unless someone turns it on. Tests about
+ * what a normal run shows must use the normal shape; only tests about the lanes themselves need
+ * this one.
+ */
+export function withDomainLanes(result: AnalysisResult): AnalysisResult {
+  return {
+    ...result,
+    ai: {
+      ...result.ai,
+      domains: [
+        {
+          cluster: 0,
+          title: "auth surface",
+          agentTag: "auth-surface",
+          specialists: ["security", "architecture"],
+          moduleIds: ["src/auth.ts", "src/index.ts"],
+          entryProbable: 1,
+          headlines: ["Session verification happens once, at the edge."],
+          corroborated: 1,
+        },
+      ],
+    },
+  };
+}

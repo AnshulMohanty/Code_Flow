@@ -16,7 +16,7 @@ Companion documents:
 | `render.yaml` | The Blueprint itself, with the reasoning per field. |
 | `.env.example` | Every variable the code reads, what breaks without it, and what it turns into in the UI. |
 | `GO_LIVE.md` | The wider go-live runbook: first analysis, the proofs that need a real service, the scored eval. |
-| `VERIFICATION_REPORT.md` §D | What remains owner-only, and why. |
+| `docs/archive/VERIFICATION_REPORT.md` §D | What remains owner-only, and why. |
 
 ---
 
@@ -286,8 +286,14 @@ Record the output in `CURRENT_STATE.md`. Two honesty notes that travel with the 
 - **Termination grace ≥ 300s.** An analysis job `SIGKILL`ed mid-run is re-delivered by BullMQ and
   redoes all of its work, *including the provider spend*.
 - `WORKER_CONCURRENCY` tunes jobs per instance (default 2, ceiling 8). Past the ceiling, scale out.
-- **Do not enable `keepalive.yml` unless the host sleeps idle containers**, and point it at
-  `/health` (liveness), never `/ready`.
+- **There is deliberately NO scheduled keep-alive, and removing it was a decision, not a cleanup.**
+  A cron ping every 10 minutes does defeat idle sleep — and it is ~4,300 requests a month that hold
+  the container up 24/7, which exhausts a free tier's ~750 instance-hours and SUSPENDS the service
+  for the remainder of the month. That is strictly worse than the problem: a sleeping service wakes
+  in 30-50 seconds; a suspended one does not wake at all. The replacement is WAKE-ON-VISIT in the
+  browser (`apps/web/src/lib/useWake.ts`): one fire-and-forget `GET /health` when a real person
+  opens the page, retried with backoff and stopped the moment it answers. A month with no visitors
+  costs no hours. On a PAID plan that never sleeps, none of this applies and nothing needs enabling.
 
 ---
 
@@ -321,7 +327,7 @@ MongoDB stays Atlas on Railway too.
 
 ## Appendix B — what is still owner-only after all of this
 
-Deploying does not close these. They are in `VERIFICATION_REPORT.md` §D and `GO_LIVE.md` §4–5:
+Deploying does not close these. They are in `docs/archive/VERIFICATION_REPORT.md` §D and `GO_LIVE.md` §4–5:
 
 | | Why it needs you |
 |---|---|
@@ -331,3 +337,95 @@ Deploying does not close these. They are in `VERIFICATION_REPORT.md` §D and `GO
 | MCP from a real agent | Point Cursor / Claude Code / Windsurf at `apps/mcp` with `CODEFLOW_MCP_SCOPES` set. Confirm a tool outside the scope list is **absent**, not present-and-refusing. |
 | The scored eval | Needs `GEMINI_API_KEY` and **spends money**. Until it runs, the thresholds are placeholders and no gating decision should rest on them. |
 | Judge labels | Hand-label **≥ 20** (answer, chunks) pairs. `judgeIsGateable` requires sample size **and** Cohen's kappa ≥ 0.6 **and** a CI lower bound ≥ 0.7. Do not shortcut this with invented labels — a judge calibrated against those is worse than an uncalibrated one, because it looks trustworthy. |
+
+---
+
+## Appendix C — the FREE deployment, and what it actually costs you
+
+**Nothing in this appendix has been executed either.** It is the free-tier shape described so it can
+be reviewed, with the tradeoffs stated rather than discovered.
+
+The paid shape above is the right architecture: the worker holds a job for minutes and scales on
+queue depth, the API scales on request volume, and separating them is what lets either move without
+the other. It is also not deployable for free — Render has no free `worker` service type — and an
+architecture nobody can run is not better than one they can.
+
+### The shape
+
+| Piece | Free option | What you give up |
+|---|---|---|
+| `codeflow-web` | Render **static site** | Nothing. Static hosting is free, always on, and never sleeps. This is why the frontend must paint without the API — see below. |
+| `codeflow-api` | Render **free web service**, with `RUN_WORKER_IN_PROCESS=true` | The BullMQ consumer runs inside the API process. One event loop for parsing and HTTP; concurrency forced to 1; a worker crash takes the API with it. |
+| MongoDB | **Atlas M0** (external, free forever) | 512 MB. Fine for an analysis cache; it is the first thing to fill. |
+| Redis | Render **Key Value**, free instance | Small. Set `maxmemoryPolicy: noeviction` — under any `allkeys-*` policy BullMQ jobs are evicted mid-flight with no error anywhere. |
+| Postgres / pgvector | Render **free Postgres** | **Expires after 30 days.** When it does, `POSTGRES_URL` points at nothing and retrieval degrades — see the next section, which is the part worth reading. |
+
+`render.free.yaml` is that blueprint. `render.yaml` remains the paid one; neither is applied.
+
+### The two things that are genuinely different, not just smaller
+
+**1. The frontend is always on and the backend is not.** A free web service suspends after ~15
+minutes idle and takes roughly 30–50 seconds to wake. Three things in the code exist for exactly
+this, and they are the reason a visitor never sees a dead page:
+
+- The SPA renders its whole shell — nav, hero, sections, workbench chrome — with **no API call on
+  the paint path**. A test asserts this with the API unreachable.
+- **Wake-on-visit** (`apps/web/src/lib/useWake.ts`): one fire-and-forget `GET /health` on first
+  mount, retried with backoff because the first request during a cold start usually times out, and
+  **stopped** the moment it answers. The status pill reflects the real result; the analyze button
+  stays in an honest "warming up" state until it does.
+- The curated **demo repositories** are pre-warmed into the analysis cache, so there is real content
+  on screen while the backend is still coming up.
+
+**There is deliberately NO scheduled pinger, and this is the decision most likely to be second-guessed.**
+A cron ping every 10 minutes keeps the service awake — and is ~4,300 requests a month that hold the
+container running 24/7, which exhausts Render's free **~750 instance-hours** and **suspends the
+service for the remainder of the month**. That is strictly worse than sleeping: a sleeping service
+wakes in 40 seconds; a suspended one does not wake at all. A wake triggered by a real visitor costs
+hours only when somebody is actually there. `scripts/keepalive.mjs` and `.github/workflows/keepalive.yml`
+were removed for this reason, not because they did not work.
+
+**2. Q&A survives losing Postgres in this mode, and only in this mode.** When the free Postgres
+expires, `createRetrievalStores` falls back to a per-process in-memory index and says so — on
+`/health` as `retrieval.mode: "memory"` with the reason, and in the boot log. In the normal split
+deployment that means the worker writes an index the API cannot read and **every question is
+refused**. In embedded mode the API and the worker share a heap, so they are handed the **same store
+instance** and Q&A keeps working — with no durability: the index is rebuilt on every restart and
+holds only what this process analysed.
+
+That is a real, stated limitation, not a workaround. It is also the one thing the single-process
+shape is better at.
+
+### Enabling it
+
+```bash
+# On the API service only:
+RUN_WORKER_IN_PROCESS=true
+```
+
+The flag is read by `resolveEmbeddedWorker` (`apps/api/src/config/embeddedWorker.ts`), which forces
+concurrency to 1 and logs both facts at boot. An unrecognised value is treated as FALSE **and
+announced** — a typo here silently produces the opposite deployment, and the symptom is "jobs queue
+and nothing happens", which looks like a Redis problem.
+
+With the flag off, the worker module is never even imported: the API uses a dynamic import, so a
+normal deployment pays nothing for this path.
+
+### Railway
+
+The same flag is the whole story there too. Railway has no free worker/web distinction — it bills
+usage — so one service running the API image with `RUN_WORKER_IN_PROCESS=true` is the equivalent
+shape, plus the same external Atlas. Railway's plugin marketplace has Postgres and Redis; pgvector
+needs the `pgvector/pgvector` image rather than the default Postgres plugin. Nothing in the code
+changes between the two hosts.
+
+### What you should expect it to feel like
+
+- First visit after an idle period: page paints instantly, pill reads **warming analysis engine…**,
+  demo repositories are clickable, analyze is disabled with the reason. ~30–50 s later the pill
+  flips to **ready** and analyze enables.
+- A demo click on a warm cache: roughly one round trip.
+- A fresh repository: a real clone-and-parse, minutes for anything large, and `WORKER_CONCURRENCY`
+  is ignored — one job at a time.
+- After 30 days: `retrieval.mode` on `/health` reads `memory`. Read the degradation string; it names
+  the variable and the fix.

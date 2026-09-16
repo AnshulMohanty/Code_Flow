@@ -1,9 +1,36 @@
 # CodeFlow — Current State
 
-> Live status. Canonical intent lives in [PLAN.md](PLAN.md); execution history in
-> [PHASE_LOG.md](PHASE_LOG.md). When this conflicts with PLAN.md, PLAN.md wins.
+> **This file is the LEDGER.** What is open, what is deferred, and what was decided against. For what
+> the system is, read [README.md](README.md); for how and why it is built that way,
+> [ARCHITECTURE.md](ARCHITECTURE.md). Superseded planning docs are in
+> [docs/archive/](docs/archive/README.md) — including `PLAN.md` and `PHASE_LOG.md`, which this file
+> used to defer to and which are now historical rather than canonical.
 
-_Last updated: 2026-08-31 — V3-P4: bounded agent fan-out + test-time compute (specialists over communities, blackboard, supervisor, best-of-N) (branch `v3/p4-agent-fanout`)._
+_Last updated: 2026-09-15 — Phases A–D: the Postgres hole, honest retrieval health, free-tier deploy
+shape (static frontend + wake-on-visit + no scheduled pinger), and a documentation pass that removed
+every claim the code does not support._
+
+> ### Read this before the phase history below
+>
+> Everything under "V3-P0 … V3-FINAL" is an APPEND-ONLY record of what each phase shipped, written at
+> the time. It is accurate about what was built and it is **not** a summary of the product — several
+> of its headline numbers are hermetic, orchestration-only measurements, and several features it
+> describes with enthusiasm are flag-gated and off by default.
+>
+> Three corrections that apply throughout, rather than being repeated at each mention:
+>
+> 1. **Best-of-N and speculative prefetch are EXPERIMENTAL.** Both are built, tested, flag-gated and
+>    off by default, and neither has ever been measured against a live model at real scale. The
+>    hermetic tests prove best-of-N picks the better-*scoring* candidate; nothing proves a
+>    better-scoring candidate is a better *answer*. They have been removed from the README and from
+>    any pitch text on that basis. See ARCHITECTURE.md §7.
+> 2. **The tracing is CUSTOM IN-PROCESS REQUEST TRACING, not OpenTelemetry.** There is no
+>    `@opentelemetry/*` dependency in this repository. What exists is a zero-dependency recorder, a
+>    `fetch`-based exporter in the Langfuse/Helicone shape, and an OTel *bridge* that takes an
+>    injected tracer-provider. Anywhere below that says "OTel-shaped", read it as that. See
+>    ARCHITECTURE.md §6.
+> 3. **Wall-clock and speedup figures below are ORCHESTRATION-ONLY** unless stated otherwise —
+>    measured on a hermetic harness whose stages do no parse and no clone work.
 
 > ✅ **V3-P4 is DONE** — the multi-agent centrepiece. Stage 7 is now a fan-out of five specialist
 > lenses over V3-P1's **Louvain communities** (low-coupling BY CONSTRUCTION, which is why the
@@ -56,7 +83,7 @@ _Last updated: 2026-08-31 — V3-P4: bounded agent fan-out + test-time compute (
 > negatives, and generated negative controls. **742 tests** (was 526).
 
 > ✅ **V3-CLEANUP is DONE** — a leaner tree by PROOF, not by eye. The audit lives in
-> [CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md), committed **before** anything was deleted: 13 REMOVE
+> [CLEANUP_MANIFEST.md](docs/archive/CLEANUP_MANIFEST.md), committed **before** anything was deleted: 13 REMOVE
 > verdicts each with a grep/import-graph receipt, 12 KEEP verdicts each with the reason written down
 > so the next pass does not re-litigate them, and 3 items left for the owner to call. Removed the
 > empty `@codeflow/exports` package, the `apps/card-action` stub, two never-written Mongo models,
@@ -299,9 +326,11 @@ for PLAN **P1** (orchestrator) and is now done.
     selected-file (drill-down reads it); cycles highlighted (node + edge); `prefers-reduced-motion`
     settles the sim fast (warmupTicks, cooldownTicks 0); empty/degenerate graph → graceful empty
     state. The store holds `graph: GraphModel` (built alongside `dashboard`).
-- The legacy P5-era mock panels (`RepositorySummary`/`HealthPanel`/`SecurityPanel`/etc.) are no
-  longer rendered (the dashboard replaces them); the files remain on disk, superseded — flagged for
-  a cleanup pass (ledger).
+- The legacy P5-era mock panels (`RepositorySummary`/`HealthPanel`/`SecurityPanel`/etc.) are
+  **gone** — deleted in V3-CLEANUP, not merely unrendered. This line previously said "the files
+  remain on disk, superseded"; a grep for all eleven component names returns zero hits, and
+  `docs/archive/CLEANUP_MANIFEST.md` is the evidence. The FEATURES those panels implied — a security
+  scanner, architecture rules, PR risk — were never built at all; see ARCHITECTURE.md §12.
 
 ### Pipeline (PLAN P1/P2/P3) — deterministic complete + first AI stage (Ingest → … → Analyze → Synthesize)
 
@@ -615,12 +644,12 @@ guards + their tests only.
 
 ### V3-P5 — marvel + reach (branch `v3/p5-marvel-reach`)
 
-> Full detail and the honest deviations: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P5`,
+> Full detail and the honest deviations: **[PHASE_LOG.md](docs/archive/PHASE_LOG.md)** (`2026-08-31 — V3-P5`,
 > backfilled 2026-09-01).
 
 | # | Task | Status |
 |---|---|---|
-| 1 | **Latency** — readiness-based parallel stages, warm pool, model routing, speculative prefetch, `/health.warmedUp`, four latency tiers | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** Scheduling, warm-up, routing and the tiers all landed and are measured (sequential 67ms → layered 38ms, **1.76×**, orchestration-only). Two pieces did NOT resolve truthfully: `createSpeculator` had zero call sites, and `/health.warmedUp` on the API was structurally always false. |
+| 1 | **Latency** — readiness-based parallel stages, boot-time warm-up (process-lifetime warm caches; NOT a worker pool — renamed, behaviour unchanged), model routing, speculative prefetch, `/health.warmedUp`, four latency tiers | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** Scheduling, warm-up, routing and the tiers all landed and are measured (sequential 67ms → layered 38ms, **1.76×**, orchestration-only). Two pieces did NOT resolve truthfully: `createSpeculator` had zero call sites, and `/health.warmedUp` on the API was structurally always false. |
 | 2 | **Observability** — OTel-shaped traces, per-agent interaction graph, per-step tokens/$, Langfuse/Helicone, versioned blackboard | ⚠️ **PARTIAL at ship, CLOSED in V3-FINAL.** The tracer, the interaction graph and the cost model are real. But `exportersFromEnv`, `createVersionedBlackboard` and `Span.recordUsage` all had zero production call sites — so every trace went nowhere and **every cost report read $0.00**. |
 | 3 | **MCP server** (`apps/mcp`) — graph + retrieval + verifier tools, default-deny scopes | ✅ **MET.** Built on `@modelcontextprotocol/sdk` after a dependency probe; the tools are the SAME objects the internal agent uses, so the two cannot drift. ⚠️ Never called by a real external agent — that is manual. |
 | 4 | **Local-first CLI** — on-device parse, embedded store, local embeddings, zero egress | ✅ **MET, with two named substitutions.** Shares the core packages; only the embedder and store differ. LanceDB (656 MB, NAPI, drags back onnxruntime) and int8 MiniLM (needs a NAPI tokenizer) were probed and REJECTED on evidence; a JSON file store and feature-hashed bag-of-words ship instead. **Both OWNER-DEFERRED** — see the ledger. |
@@ -636,8 +665,8 @@ prove anything USES it. Every one of the four had a full passing suite.
 
 ### V3-FINAL — wire-in + frontend build + verify (branch `v3/final-build-verify`)
 
-> Full detail: **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-09-01 — V3-FINAL`).
-> Per-check verdicts and the still-remaining owner list: **[VERIFICATION_REPORT.md](VERIFICATION_REPORT.md)**.
+> Full detail: **[PHASE_LOG.md](docs/archive/PHASE_LOG.md)** (`2026-09-01 — V3-FINAL`).
+> Per-check verdicts and the still-remaining owner list: **[VERIFICATION_REPORT.md](docs/archive/VERIFICATION_REPORT.md)**.
 
 **Part 1 — the unwired modules**
 
@@ -665,7 +694,7 @@ prove anything USES it. Every one of the four had a full passing suite.
 
 **Part 3 — verification**
 
-All nine checks in `VERIFICATION_REPORT.md`. One finding fixed in-pass: the Arena's citation verifier
+All nine checks in `docs/archive/VERIFICATION_REPORT.md`. One finding fixed in-pass: the Arena's citation verifier
 had no consumer and `@codeflow/eval` kept its own copy, so V3-P0 §0.5's stated benefit was not true.
 The RULE (not the async wrapper) is now shared.
 
@@ -675,7 +704,7 @@ build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval che
 ### V3-P4 — bounded agent fan-out + test-time compute (branch `v3/p4-agent-fanout`)
 
 > Full detail, every measurement and six flagged judgment calls:
-> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P4`).
+> **[PHASE_LOG.md](docs/archive/PHASE_LOG.md)** (`2026-08-31 — V3-P4`).
 
 - **Parallelism is EARNED.** Five specialists over "the repo" would be five agents reading the same
   files and reporting overlapping paragraphs — parallel in wall-clock, redundant in content. The
@@ -730,7 +759,7 @@ build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval che
 ### V3-P3 — agentic Q&A + memory (branch `v3/p3-agentic-memory`)
 
 > Full detail, including the `LlmClient` audit finding and every judgment call:
-> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P3`).
+> **[PHASE_LOG.md](docs/archive/PHASE_LOG.md)** (`2026-08-31 — V3-P3`).
 
 - **`@codeflow/agents` (new, 91 tests).** A bounded ReAct loop over a plain completion, because the
   audit found `LlmClient` has **no native tool-calling** and its two adapters expose tool use
@@ -778,7 +807,7 @@ build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval che
 ### V3-P2 — retrieval (branch `v3/p2-retrieval`)
 
 > Full detail, including the reranker dependency probe and every judgment call:
-> **[PHASE_LOG.md](PHASE_LOG.md)** (`2026-08-31 — V3-P2`).
+> **[PHASE_LOG.md](docs/archive/PHASE_LOG.md)** (`2026-08-31 — V3-P2`).
 
 - **`@codeflow/retrieval` (new, 155 tests).** Owns `VectorStore`, `ChunkTextStore`, `Reranker`, the
   embedding-space homogeneity guard and the cosine primitive. Depends only on `shared-types` +
@@ -828,7 +857,7 @@ build ✅ (exit 0) · legacy 25/25 ✅ · compose config ✅ · keyless eval che
 
 ### V3-CLEANUP — dead code + orphan files (branch `v3/cleanup-deadcode`)
 
-> Full audit + every verdict with its evidence: **[CLEANUP_MANIFEST.md](CLEANUP_MANIFEST.md)**
+> Full audit + every verdict with its evidence: **[CLEANUP_MANIFEST.md](docs/archive/CLEANUP_MANIFEST.md)**
 > (committed before any deletion, so the reasoning is reviewable separately from the diffs).
 
 - **Method, not vibes.** An import-graph orphan sweep over all 220 tracked `.ts`/`.tsx` files —
@@ -1423,6 +1452,16 @@ former blocker — is **DONE** this session).
     kept deliberately small (see its module note on why `warmedUp` is its own field). The fix is
     small and worth doing: surface `retrieval: { mode, degradation }` the way warm-up surfaces its
     per-task list.
+    **✅ RESOLVED.** `/health` now carries `retrieval: { mode, degradation? }`, read from a
+    synchronous snapshot recorded when the store factory resolves — the endpoint never awaits the
+    dependency it reports on, because a health check that can block on an outage is two outages.
+    FOUR states rather than two, since "we have no Postgres" and "we have not looked yet" are
+    different facts: `postgres` · `memory` (with the reason) · `not-configured` (no embedding
+    provider, so no index can exist and none is expected) · `pending`. An ambiguous provider config
+    is REPORTED here rather than thrown, so a liveness probe does not read a misconfigured
+    embedding key as a dead process. Related: the no-URL branch of `createRetrievalStores` used to
+    return no degradation at all, so the log lines this entry describes never fired for the most
+    common case — fixed alongside.
 33. **A Render static site bakes the API URL at BUILD time (V3-SECURITY+DEPLOY).** The web
     Dockerfile's entrypoint rewrites `/config.js` from `API_BASE_URL` at container start, so ONE
     image works across environments. A static site has no entrypoint, so `render.yaml` passes

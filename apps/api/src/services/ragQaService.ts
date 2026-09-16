@@ -90,10 +90,25 @@ async function resolveBudget(): Promise<BudgetHandle> {
   return sharedBudget;
 }
 
+/**
+ * The retrieval stores this process resolved, or null when none can be (no embedding provider).
+ *
+ * Exists for EMBEDDED-WORKER mode. Without a Postgres both processes fall back to a per-process
+ * in-memory index, and in the normal split deployment that means the worker writes an index the API
+ * cannot read — every question refused. Running in one process only helps if they are handed the
+ * SAME object, which is what this returns. Memoized, so asking for it does not open a second pool.
+ */
+export async function getQaRetrievalStores(): Promise<RetrievalStores | null> {
+  const embeddingClient = createEmbeddingClientFromEnv(process.env);
+  if (!embeddingClient) return null;
+  return resolveRetrieval({ embeddingModel: embeddingClient.model, embeddingDim: embeddingClient.dimension });
+}
+
 /** Test seam: forget the memoized budget so a suite can re-resolve it. */
 export function resetQaBudgetForTests(): void {
   sharedBudget = null;
   sharedRetrieval = null;
+  retrievalSnapshot = null;
   sessionStore = null;
   repoStore = null;
   answerCache = null;
@@ -204,8 +219,71 @@ function resolveAnswerCache(): Promise<AnalysisCacheHandle> {
  */
 let sharedRetrieval: Promise<RetrievalStores> | null = null;
 
+/**
+ * WHAT `/health` REPORTS ABOUT RETRIEVAL (ledger #32).
+ *
+ * The retrieval backend's degradation was announced in the LOGS ONLY, so "the API is up" and "the
+ * API can answer anything the worker indexed" were indistinguishable from outside the process. That
+ * is the one pair a deploy check most needs to tell apart, because the failure is silent by
+ * construction: a memory-backed API answers every question with an honest refusal and reports 200
+ * on every other endpoint.
+ *
+ * FOUR STATES, not two, because "we do not have a Postgres" and "we have not looked yet" are
+ * different facts and collapsing them would make one of them a lie:
+ *   postgres        the shared index resolved. Cross-process Q&A works.
+ *   memory          it resolved to a per-process index. `degradation` says why.
+ *   not-configured  no embedding provider, so no index can exist at all and none is expected.
+ *   pending         configured, not yet resolved. Only visible before warm-up completes, since
+ *                   `warmQaDependencies` resolves it at boot.
+ */
+export interface RetrievalHealth {
+  mode: "postgres" | "memory" | "not-configured" | "pending";
+  /** Present whenever this is not a fully working shared index. */
+  degradation?: string;
+}
+
+/** Pure mapper, exported so the mapping is testable without resolving a store. */
+export function retrievalHealthOf(stores: Pick<RetrievalStores, "mode" | "degradation">): RetrievalHealth {
+  return { mode: stores.mode, ...(stores.degradation ? { degradation: stores.degradation } : {}) };
+}
+
+/**
+ * The last resolved state, recorded as a SYNCHRONOUS snapshot. `/health` must not await a store
+ * resolution: a health endpoint that can block on the dependency it is reporting on is the
+ * dependency's outage plus a second outage.
+ */
+let retrievalSnapshot: RetrievalHealth | null = null;
+
+export function retrievalHealth(environment: Record<string, string | undefined> = process.env): RetrievalHealth {
+  if (retrievalSnapshot) return retrievalSnapshot;
+  let embeddingConfigured = false;
+  try {
+    embeddingConfigured = Boolean(createEmbeddingClientFromEnv(environment));
+  } catch {
+    // An ambiguous provider config THROWS at construction (both keys, no explicit choice). That is
+    // a real misconfiguration, and it is reported here rather than thrown: a /health that 500s
+    // tells a probe the process is dead when it is serving every deterministic read fine.
+    return {
+      mode: "not-configured",
+      degradation:
+        "The embedding provider is configured ambiguously (both keys set with no EMBEDDING_PROVIDER), " +
+        "so no retrieval index can be opened and Q&A is unavailable.",
+    };
+  }
+  if (!embeddingConfigured) {
+    return {
+      mode: "not-configured",
+      degradation:
+        "No embedding provider is configured, so no Q&A index exists for this deployment. The " +
+        "deterministic analysis paths are unaffected.",
+    };
+  }
+  return { mode: "pending" };
+}
+
 function resolveRetrieval(space: { embeddingModel: string; embeddingDim: number }): Promise<RetrievalStores> {
   sharedRetrieval ??= createRetrievalStores({ space, postgresUrl: env.postgresUrl }).then((stores) => {
+    retrievalSnapshot = retrievalHealthOf(stores);
     if (stores.degradation) {
       console.warn(
         `[codeflow] Q&A retrieval DEGRADED — ${stores.degradation} Questions will only be answerable ` +

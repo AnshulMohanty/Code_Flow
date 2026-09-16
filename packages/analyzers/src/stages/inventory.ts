@@ -319,7 +319,7 @@ async function detectEntryPoints(
   const add = (filePath: string, kind: EntryPointKind, evidence: EntryPointEvidence) => {
     const normalized = normalizePosix(filePath);
     if (!normalized) return;
-    const key = `${normalized} ${kind} ${evidence}`;
+    const key = `${normalized}\u0000${kind}\u0000${evidence}`;
     if (seen.has(key)) return;
     seen.add(key);
     entries.push({ filePath: normalized, kind, evidence });

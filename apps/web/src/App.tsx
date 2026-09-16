@@ -3,6 +3,8 @@ import { MarketingSite } from "./site/MarketingSite";
 import { Workbench } from "./workbench/Workbench";
 import { useAnalysis } from "./lib/useAnalysis";
 import { useMeta } from "./lib/useMeta";
+import { useDemoSnapshot } from "./lib/useDemoSnapshot";
+import { useWake } from "./lib/useWake";
 
 /**
  * TWO SURFACES, ONE RUN.
@@ -15,12 +17,24 @@ import { useMeta } from "./lib/useMeta";
  * The surface is reflected in the URL hash so a workbench view survives a reload and can be linked.
  * Nothing else is in the URL: a repo in the query string would make a shared link start an analysis
  * on someone else's behalf.
+ *
+ * WAKE-ON-VISIT LIVES HERE, at the top, for the same reason `useAnalysis` does: there is ONE backend
+ * and both surfaces need the same answer about whether it is awake. Calling it per-surface would
+ * send a second wake burst every time a user crossed between them — at exactly the moment a cold
+ * container is least able to absorb one.
+ *
+ * `useMeta` takes the wake status as its refetch signal. That is not decoration: on a free tier the
+ * first /api/meta of a visit lands while the backend is still asleep and fails, and without a signal
+ * to retry on, the chrome would report OFFLINE for the whole session even after the backend woke.
  */
 
 type Surface = "site" | "workbench";
 
 export function App() {
-  const meta = useMeta();
+  const wake = useWake();
+  const meta = useMeta(wake.status);
+  // Lazily fetched as its own chunk, so it costs the entry bundle nothing — see useDemoSnapshot.
+  const demo = useDemoSnapshot();
   const { state, ask, analyze, askQuestion } = useAnalysis();
   const [surface, setSurface] = useState<Surface>(() => readSurface());
 
@@ -54,6 +68,7 @@ export function App() {
     return (
       <Workbench
         meta={meta}
+        wake={wake}
         analysis={state}
         ask={ask}
         onAnalyze={(input) => void analyze(input)}
@@ -66,6 +81,8 @@ export function App() {
   return (
     <MarketingSite
       meta={meta}
+      wake={wake}
+      demo={demo}
       analysis={state}
       ask={ask}
       onAnalyze={analyzeAndOpen}
