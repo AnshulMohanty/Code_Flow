@@ -1,3 +1,4 @@
+import { useReveal, useRevealAttrs } from "../lib/motion";
 import type { GroundingReport, GroundingState } from "../lib/siteModel";
 
 /**
@@ -41,13 +42,16 @@ export interface SectionGroundingProps {
 }
 
 export function SectionGrounding({ grounding }: SectionGroundingProps) {
+  const head = useRevealAttrs<HTMLDivElement>("clip");
+  const states = useReveal<HTMLDivElement>();
+
   return (
     <section className="section" id="grounding">
       <div className="shell">
         <p className="eyebrow" style={{ marginBottom: 20 }}>
           02 — Grounding
         </p>
-        <div className="section-head">
+        <div className="section-head" {...head}>
           <h2 className="display display-l">
             No citation,
             <br />
@@ -61,8 +65,8 @@ export function SectionGrounding({ grounding }: SectionGroundingProps) {
       </div>
 
       <div className="shell">
-        <div className="states">
-          {STATES.map((state) => {
+        <div className="states" ref={states.ref}>
+          {STATES.map((state, index) => {
             const active = grounding?.state === state.id;
             return (
               <div
@@ -71,6 +75,11 @@ export function SectionGrounding({ grounding }: SectionGroundingProps) {
                 data-state={state.id}
                 // No run yet ⇒ nothing is dimmed: the three are descriptions, not a verdict.
                 data-active={grounding === null ? "true" : active}
+                // Reveal is driven by the ROW, staggered per card: the three arrive left to right,
+                // so the eye reads them in the order the copy assumes rather than all at once.
+                data-reveal="up"
+                data-revealed={states.revealed}
+                style={{ transitionDelay: `${index * 90}ms` }}
               >
                 <p className="state-head">
                   <span aria-hidden="true">{state.mark}</span>

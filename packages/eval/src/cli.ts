@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   const embeddingClient = createEmbeddingClientFromEnv(process.env);
   if (!embeddingClient) {
     throw new Error(
-      "No embedding provider configured. Set VOYAGE_API_KEY or GEMINI_API_KEY (and EMBEDDING_PROVIDER if both).",
+      "No embedding provider configured. Set VOYAGE_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY (and EMBEDDING_PROVIDER if more than one).",
     );
   }
 

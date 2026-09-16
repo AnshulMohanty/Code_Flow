@@ -38,9 +38,26 @@ Nothing here is committed and nothing is baked into an image. Every value is rea
 
 | Variable | What breaks without it |
 |---|---|
-| `ANTHROPIC_API_KEY` **or** `GEMINI_API_KEY` | Synthesize (stage 7) never registers. The run completes as `runMode: "deterministic-only"` — an honest, usable result with no onboarding narrative. |
-| `GEMINI_API_KEY` **or** `VOYAGE_API_KEY` | RAG (stage 8) never registers, so there is no Q&A index. `/api/result/:id/ask` returns an honest "no index" rather than an error. |
-| `LLM_PROVIDER` / `EMBEDDING_PROVIDER` | Only needed when BOTH keys are present — otherwise the provider is inferred, and two keys with no explicit choice throws a clear error at boot rather than picking one. |
+| `ANTHROPIC_API_KEY` **or** `GEMINI_API_KEY` **or** `OPENAI_API_KEY` | Synthesize (stage 7) never registers. The run completes as `runMode: "deterministic-only"` — an honest, usable result with no onboarding narrative. |
+| `GEMINI_API_KEY` **or** `VOYAGE_API_KEY` **or** `OPENAI_API_KEY` | RAG (stage 8) never registers, so there is no Q&A index. `/api/result/:id/ask` returns an honest "no index" rather than an error. |
+| `LLM_PROVIDER` / `EMBEDDING_PROVIDER` | Only needed when MORE THAN ONE key is present — otherwise the provider is inferred, and several keys with no explicit choice throws a clear error at boot rather than picking one. The two are INDEPENDENT: `LLM_PROVIDER=openai` with `EMBEDDING_PROVIDER=voyage` is a supported pairing. |
+
+**Switching embedding provider changes the pgvector table, by design.** `vector(n)` is a fixed-width
+type, so the resolved dimension is part of the table name — `codeflow_vectors_<dim>` — and
+`ensureSchema()` creates whichever one the current configuration names:
+
+| Embedding config | Dim | Table |
+|---|---|---|
+| `EMBEDDING_PROVIDER=gemini` (default model) | 768 | `codeflow_vectors_768` |
+| `EMBEDDING_PROVIDER=voyage` (`voyage-code-3`) | 1024 | `codeflow_vectors_1024` |
+| `EMBEDDING_PROVIDER=openai` (`text-embedding-3-small`) | 1536 | `codeflow_vectors_1536` |
+| `EMBEDDING_PROVIDER=openai` + `OPENAI_EMBEDDING_MODEL=text-embedding-3-large` | 3072 | `codeflow_vectors_3072` |
+
+A switch therefore CANNOT query the old table with wrong-width vectors — it addresses a different
+table, and `assertEmbeddingSpace` refuses at the boundary if the client and the store ever disagree.
+What it does mean is that **the old index does not transfer**: every repository has to be re-analysed
+in the new space before Q&A can answer about it again. The deterministic map and every stored
+analysis are unaffected. Switching the CHAT provider has no index consequence at all.
 
 ### Required for the shared guards
 

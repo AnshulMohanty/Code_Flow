@@ -7,6 +7,7 @@ import {
   createEmbeddingClientFromEnv,
   createGeminiClient,
   createLlmClientFromEnv,
+  createOpenAiClient,
   createRedisBudgetHandle,
   maybeRouted,
   warmupRegistry,
@@ -137,12 +138,26 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
   // cache keys, which a router would otherwise re-scope and invalidate for nothing.
   const routedSynthesisClient = (() => {
     if (!synthesisClient || !env.fastModel) return synthesisClient;
-    const geminiKey = process.env.GEMINI_API_KEY;
-    if (!geminiKey) {
-      console.warn("[worker] FAST_MODEL is set but GEMINI_API_KEY is not; model routing disabled.");
-      return synthesisClient;
-    }
-    const fast = createGeminiClient({ apiKey: geminiKey, model: env.fastModel });
+    // The fast tier is built from the SELECTED provider where that provider has its own cheap
+    // models, and from Gemini otherwise — which is exactly the behaviour an anthropic+gemini
+    // deployment has today, unchanged. Without this branch `LLM_PROVIDER=openai` would report
+    // "FAST_MODEL is set but GEMINI_API_KEY is not", which is true and useless: the operator asked
+    // for a cheap OpenAI tier and has the key for it.
+    const fast = (() => {
+      if (synthesisClient.provider === "openai" && process.env.OPENAI_API_KEY) {
+        return createOpenAiClient({ apiKey: process.env.OPENAI_API_KEY, model: env.fastModel });
+      }
+      const geminiKey = process.env.GEMINI_API_KEY;
+      if (!geminiKey) {
+        console.warn(
+          `[worker] FAST_MODEL is set but no key is available to build a fast tier for provider ` +
+            `${synthesisClient.provider}; model routing disabled.`,
+        );
+        return null;
+      }
+      return createGeminiClient({ apiKey: geminiKey, model: env.fastModel });
+    })();
+    if (!fast) return synthesisClient;
     const routed = maybeRouted(fast, synthesisClient, {
       onDecision: (decision) => console.log(`[worker] routed ${decision.task} → ${decision.tier} (${decision.model})`),
     });

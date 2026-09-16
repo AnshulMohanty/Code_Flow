@@ -142,7 +142,11 @@ envVarGroups:
       - key: MONGO_URI
         sync: false
       # One Gemini key powers both chat and embeddings, which is the cheapest configuration and the
-      # reason it is the documented default.
+      # reason it is the documented default. The two roles are INDEPENDENT, so this is a pin and not
+      # a limit: LLM_PROVIDER also takes anthropic / openai and EMBEDDING_PROVIDER also takes
+      # voyage / openai, each reading its own key. Changing the EMBEDDING one changes the pgvector
+      # table (codeflow_vectors_<dim>: gemini 768, voyage 1024, openai 1536 or 3072), so the existing
+      # index does not transfer and repositories need re-analysing in the new space.
       - key: LLM_PROVIDER
         value: gemini
       - key: EMBEDDING_PROVIDER

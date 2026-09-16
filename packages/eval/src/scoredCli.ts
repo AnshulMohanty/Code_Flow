@@ -61,13 +61,13 @@ async function main(): Promise<void> {
 
   const embeddingClient = createEmbeddingClientFromEnv(process.env);
   if (!embeddingClient) {
-    throw new Error("No embedding provider configured. Set VOYAGE_API_KEY or GEMINI_API_KEY (and EMBEDDING_PROVIDER if both).");
+    throw new Error("No embedding provider configured. Set VOYAGE_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY (and EMBEDDING_PROVIDER if more than one).");
   }
   const chatClient = createLlmClientFromEnv(process.env);
   if (!chatClient) {
     // The answer path and the judge both need chat. Without it this would silently degrade to
     // the retrieval-only eval, which is exactly the "looks like it ran" trap V3-P0 removes.
-    throw new Error("No chat provider configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY (and LLM_PROVIDER if both).");
+    throw new Error("No chat provider configured. Set ANTHROPIC_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY (and LLM_PROVIDER if more than one).");
   }
 
   const reportsDir = path.join(root, "reports");

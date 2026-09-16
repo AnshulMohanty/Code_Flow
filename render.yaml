@@ -197,15 +197,19 @@ envVarGroups:
       # No chat key ⇒ the run completes as `runMode: "deterministic-only"`: a real dependency map
       # and no onboarding narrative. No embedding key ⇒ no Q&A index, and /ask says so instead of
       # erroring. Both are honest degradations, not failures — but they are not the product.
+      # CHAT and EMBEDDINGS are chosen INDEPENDENTLY — any pairing of the two lists works.
       - key: LLM_PROVIDER
-        sync: false # anthropic | gemini. Needed only when BOTH keys are set.
+        sync: false # anthropic | gemini | openai. Needed only when MORE THAN ONE key is set.
       - key: EMBEDDING_PROVIDER
-        sync: false # voyage | gemini
+        sync: false # voyage | gemini | openai
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: VOYAGE_API_KEY
+        sync: false
+      # Powers BOTH roles, like GEMINI_API_KEY. The two provider variables still pick one at a time.
+      - key: OPENAI_API_KEY
         sync: false
 
       # ── Optional: model overrides. Unset ⇒ the defaults in @codeflow/config. ──
@@ -215,10 +219,23 @@ envVarGroups:
         sync: false
       - key: VOYAGE_MODEL
         sync: false
+      - key: OPENAI_MODEL
+        sync: false # default gpt-4.1. SYNTHESIS_MODEL is anthropic-only and is NOT read for openai.
       - key: GEMINI_EMBEDDING_MODEL
         sync: false
       - key: GEMINI_EMBEDDING_DIM
         sync: false
+      - key: OPENAI_EMBEDDING_MODEL
+        sync: false # default text-embedding-3-small (1536); -3-large is 3072
+      # THE EMBEDDING DIMENSION IS PART OF THE PGVECTOR TABLE NAME (codeflow_vectors_<dim>), because
+      # pgvector's vector(n) is fixed-width and one table cannot hold two embedding spaces. Switching
+      # embedding provider or model therefore addresses a DIFFERENT table — which is what makes the
+      # switch safe rather than silently wrong — and means the existing index does not transfer:
+      # repositories must be re-analysed in the new space before Q&A can answer about them again.
+      #   gemini 768 -> codeflow_vectors_768   | voyage 1024 -> codeflow_vectors_1024
+      #   openai 1536 -> codeflow_vectors_1536 | openai 3072 -> codeflow_vectors_3072
+      - key: OPENAI_EMBEDDING_DIM
+        sync: false # unset => the model's native width; only truncates (v3 models are Matryoshka)
       # A cheap tier for the many small specialist calls. Unset ⇒ ONE tier and the client is used
       # unwrapped, so cache keys stay byte-identical to a non-routed deployment.
       - key: FAST_MODEL

@@ -1,3 +1,4 @@
+import { useCountUp, useReveal, useRevealAttrs } from "../lib/motion";
 import { formatStat, NOT_MEASURED, type MeasuredStat, type RunNumbers } from "../lib/siteModel";
 
 /**
@@ -10,6 +11,10 @@ import { formatStat, NOT_MEASURED, type MeasuredStat, type RunNumbers } from "..
  *
  * The design's own aside says it: "the numbers move because they're read, not written." A build with
  * no analysis loaded shows four em-dashes, and that is the correct screenshot.
+ *
+ * THE FIGURES COUNT UP when the section is scrolled to, and ONLY the measured ones. `useCountUp`
+ * takes `number | null` and returns `null` unchanged, so an em-dash never animates - a stat that
+ * ticked from 0 up to something would read as a measurement no matter what the caption said.
  */
 
 export interface SectionNumbersProps {
@@ -27,6 +32,8 @@ const EMPTY: RunNumbers = {
 
 export function SectionNumbers({ numbers, provenance }: SectionNumbersProps) {
   const stats = numbers ?? EMPTY;
+  const head = useRevealAttrs<HTMLDivElement>("clip");
+  const grid = useReveal<HTMLDivElement>();
 
   return (
     <section className="section" id="numbers">
@@ -34,7 +41,7 @@ export function SectionNumbers({ numbers, provenance }: SectionNumbersProps) {
         <p className="eyebrow" style={{ marginBottom: 20 }}>
           03 — Numbers
         </p>
-        <div className="section-head">
+        <div className="section-head" {...head}>
           <h2 className="display display-l">
             Measured,
             <br />
@@ -47,23 +54,50 @@ export function SectionNumbers({ numbers, provenance }: SectionNumbersProps) {
           </p>
         </div>
 
-        <div className="stats">
-          <Stat stat={stats.filesParsed} />
-          <Stat stat={stats.edgesResolved} />
-          <Stat stat={stats.p50AnswerMs} unit="ms" />
-          <Stat stat={stats.costPerIndex} />
+        <div className="stats" ref={grid.ref}>
+          <Stat stat={stats.filesParsed} counting={grid.revealed} order={0} />
+          <Stat stat={stats.edgesResolved} counting={grid.revealed} order={1} />
+          <Stat stat={stats.p50AnswerMs} unit="ms" counting={grid.revealed} order={2} />
+          <Stat stat={stats.costPerIndex} counting={grid.revealed} order={3} />
         </div>
       </div>
     </section>
   );
 }
 
-function Stat({ stat, unit }: { stat: MeasuredStat; unit?: string }) {
+function Stat({
+  stat,
+  unit,
+  counting,
+  order,
+}: {
+  stat: MeasuredStat;
+  unit?: string;
+  counting: boolean;
+  order: number;
+}) {
   const measured = stat.value !== null;
+  // The count runs on the stat's own value and is then formatted by the SAME formatter as the
+  // final figure, so the intermediate frames use the same units, precision and thousands rule the
+  // settled number does. Formatting the animation separately is how a stat ends up counting up in
+  // one format and landing in another.
+  const counted = useCountUp(stat.value, { active: counting });
+  // Counts and milliseconds are whole numbers at every frame; only a dollar figure keeps its
+  // decimals. `count()` is `toLocaleString`, so an un-rounded frame renders "12,480.317".
+  const shown =
+    counted === null
+      ? stat
+      : { ...stat, value: stat.format === "usd" ? counted : Math.round(counted) };
   return (
-    <div className="stat" data-measured={measured}>
+    <div
+      className="stat"
+      data-measured={measured}
+      data-reveal="up"
+      data-revealed={counting}
+      style={{ transitionDelay: `${order * 80}ms` }}
+    >
       <p className="stat-value">
-        {formatStat(stat)}
+        {formatStat(shown)}
         {measured && unit ? <span className="stat-unit">{unit}</span> : null}
       </p>
       <p className="stat-label">{stat.label}</p>

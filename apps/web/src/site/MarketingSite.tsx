@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AskBlock, PipelineCard } from "../components/PipelineCard";
 import { CommandPalette, usePaletteHotkey, type PaletteItem } from "../components/CommandPalette";
 import { buildGraphModel } from "../lib/graphModel";
+import { useMagnetic, useRevealAttrs } from "../lib/motion";
 import { buildSiteModel, count } from "../lib/siteModel";
 import { moduleLabel } from "../lib/citation";
 import { suggestedQuestions } from "../lib/questions";
@@ -55,6 +56,13 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  // MOTION, applied to elements that already exist. Section heads wipe up (`clip`) because that is
+  // what heavy display type wants; the cards below them fade up after. Every one of these degrades
+  // to "already revealed" without an IntersectionObserver or under reduced motion — see lib/motion.
+  const resolveHead = useRevealAttrs<HTMLDivElement>("clip");
+  const resolveBody = useRevealAttrs<HTMLDivElement>();
+  const ctaHead = useRevealAttrs<HTMLDivElement>("clip");
+  const ctaButton = useMagnetic<HTMLButtonElement>();
 
   usePaletteHotkey(() => setPaletteOpen(true));
 
@@ -163,7 +171,7 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
           <p className="eyebrow" style={{ marginBottom: 20 }}>
             01 — Resolve
           </p>
-          <div className="section-head">
+          <div className="section-head" {...resolveHead}>
             <h2 className="display display-l">
               Six passes,
               <br />
@@ -177,6 +185,7 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
 
           {showingSnapshot && demo ? <SnapshotBanner snapshot={demo} /> : null}
 
+          <div {...resolveBody}>
           {model && graph && result ? (
             <PipelineCard
               model={model}
@@ -215,6 +224,7 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
               </p>
             </div>
           )}
+          </div>
         </div>
       </section>
 
@@ -227,12 +237,12 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
 
       {/* ── CTA ────────────────────────────────────────────────────────────── */}
       <section className="cta dark">
-        <div className="shell">
+        <div className="shell" {...ctaHead}>
           <h2 className="display display-xl">
             Paste a repo<span className="dot" aria-hidden="true" />
           </h2>
           <div className="cta-actions">
-            <button type="button" className="btn btn-primary" onClick={onOpenWorkbench}>
+            <button type="button" className="btn btn-primary" ref={ctaButton} onClick={onOpenWorkbench}>
               Open the workbench <span aria-hidden="true">→</span>
             </button>
             <p className="cta-note">

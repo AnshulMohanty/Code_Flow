@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Cursor } from "./components/Cursor";
 import { MarketingSite } from "./site/MarketingSite";
 import { Workbench } from "./workbench/Workbench";
 import { useAnalysis } from "./lib/useAnalysis";
@@ -26,6 +27,11 @@ import { useWake } from "./lib/useWake";
  * `useMeta` takes the wake status as its refetch signal. That is not decoration: on a free tier the
  * first /api/meta of a visit lands while the backend is still asleep and fails, and without a signal
  * to retry on, the chrome would report OFFLINE for the whole session even after the backend woke.
+ *
+ * `<Cursor />` is mounted HERE, above the surface switch, for the same reason the state is: it is a
+ * property of the page, not of either surface, and remounting it on every crossing would restart
+ * its trail from the origin. It renders nothing at all without a fine pointer or under reduced
+ * motion.
  */
 
 type Surface = "site" | "workbench";
@@ -66,29 +72,35 @@ export function App() {
 
   if (surface === "workbench") {
     return (
-      <Workbench
-        meta={meta}
-        wake={wake}
-        analysis={state}
-        ask={ask}
-        onAnalyze={(input) => void analyze(input)}
-        onAsk={(question) => void askQuestion(question)}
-        onExit={() => go("site")}
-      />
+      <>
+        <Cursor />
+        <Workbench
+          meta={meta}
+          wake={wake}
+          analysis={state}
+          ask={ask}
+          onAnalyze={(input) => void analyze(input)}
+          onAsk={(question) => void askQuestion(question)}
+          onExit={() => go("site")}
+        />
+      </>
     );
   }
 
   return (
-    <MarketingSite
-      meta={meta}
-      wake={wake}
-      demo={demo}
-      analysis={state}
-      ask={ask}
-      onAnalyze={analyzeAndOpen}
-      onAsk={(question) => void askQuestion(question)}
-      onOpenWorkbench={() => go("workbench")}
-    />
+    <>
+      <Cursor />
+      <MarketingSite
+        meta={meta}
+        wake={wake}
+        demo={demo}
+        analysis={state}
+        ask={ask}
+        onAnalyze={analyzeAndOpen}
+        onAsk={(question) => void askQuestion(question)}
+        onOpenWorkbench={() => go("workbench")}
+      />
+    </>
   );
 }
 
