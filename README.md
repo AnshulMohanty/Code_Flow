@@ -2,11 +2,12 @@
 
 # CodeFlow
 
-### Maps how a codebase fits together, and answers questions cited to real files and lines.
+### The codebase map that proves its answers.
 
-CodeFlow maps how any codebase fits together and answers questions cited to real files and
-lines — built for developers navigating large, unfamiliar, or fast-moving codebases where
-nobody holds the whole map in their head.
+CodeFlow maps how a JavaScript, TypeScript or Python codebase fits together, answers questions cited
+to real files and lines, and **checks the code references in anyone's answer** — an AI agent's, a PR
+description's, a reviewer's — against the repository. The graph is scored against the TypeScript
+compiler; the checker runs offline, with no key.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)
@@ -55,6 +56,30 @@ dropped and counted, an entirely ungrounded synthesis is rejected outright, and 
 no surviving evidence is downgraded to a refusal. Citation chips link to GitHub **at the analysed
 commit**, so you can follow any claim to the source it came from.
 
+The same check is available for text CodeFlow did **not** write: `codeflow-local verify`, the
+`verify_citations` MCP tool and the GitHub Action take any prose and mark every `path:line`, GitHub
+link and named symbol as verified, unverifiable or wrong. See [Check an answer or a PR](#check-an-answer-or-a-pr).
+
+### Measured, not asserted: the import graph vs the TypeScript compiler
+
+`scripts/graph-accuracy.mjs` resolves every import in a repository with `ts.resolveModuleName` under
+the nearest `tsconfig` — what `tsc` itself does — and compares each one with CodeFlow's edge for the
+same `(file, specifier)`. Measured on 2026-11-16 at each repository's default-branch HEAD:
+
+| Repository | In-repo imports (per tsc) | Agree | Wrong | Missed | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|
+| trpc/trpc (pnpm monorepo) | 2,753 | 2,751 | 0 | 2 | 100% | 99.93% |
+| colinhacks/zod (NodeNext `.js`→`.ts`) | 823 | 821 | 0 | 2 | 100% | 99.76% |
+| CodeFlow itself | 824 | 824 | 0 | 0 | 100% | 100% |
+| shadcn-ui/taxonomy (`@/` aliases) | 260 | 260 | 0 | 0 | 100% | 100% |
+| expressjs/express | 154 | 154 | 0 | 0 | 100% | 100% |
+
+The four misses are imports written inside `declare module "…" { … }` blocks. CodeFlow additionally
+maps workspace-package imports (`@acme/ui`) to their **source** files, which tsc can only resolve to a
+built `dist/`; those are reported as "extra" by the script rather than counted either way. CI runs the
+same check on this repository and fails below 100% precision / 99% recall. Python imports are not
+benchmarked against a reference resolver yet.
+
 ---
 
 ## Real vs heuristic vs experimental
@@ -63,7 +88,11 @@ Not everything here is the same kind of thing, and the difference matters more t
 
 | Capability | Kind | What that means |
 |---|---|---|
-| Import / call graph, centrality, cycles, blast radius | **Real** | Computed from parsed source. Deterministic: same commit in, byte-identical numbers out. |
+| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports. Scored against tsc above. |
+| Call graph, centrality, blast radius | **Real** | Computed from parsed source. Deterministic: same commit in, byte-identical numbers out. Key-file ranking counts production imports only, so heavily-tested files do not outrank load-bearing ones. |
+| Import cycles | **Real** | **Load-time** cycles only: `import type`, `if TYPE_CHECKING:`, imports inside function bodies and dynamic `import()` cannot cause an import-order failure and are excluded — on Zod, tRPC and Flask that is the difference between dozens of reported cycles and the true number, zero. |
+| Citation check of arbitrary text | **Real** | Does the file exist, are the cited lines inside it (physical line count), is the named symbol declared there? It proves a reference points at something real — not that the prose around it describes that code correctly. |
+| PR impact (`impact`, GitHub Action) | **Real** | Dependents, entry points, tests that reach the change, new load-time cycles and imports that resolve to nothing — from the import graph of both sides of the diff. |
 | Symbol extraction (JS/TS/JSX/TSX/Python) | **Real** | tree-sitter WASM. Measured against authored ground truth in `packages/eval`. |
 | Community detection (Louvain) | **Real** | Seeded and canonically relabelled, so two runs of the same graph give the same partition. |
 | Citation grounding | **Real** | Structural — see above. Enforced at the point of production, and shared as one predicate between the app, the eval and the verifier harness. |
@@ -91,8 +120,13 @@ Not everything here is the same kind of thing, and the difference matters more t
 - **Cost reports tokens always and dollars only if you price them.** `usd` is `null` until
   `LLM_PRICING` is set, with the unpriced models named. Tokens are read from the provider's own
   counters either way.
-- **Nothing is deployed, and nothing has run against a live provider.** Every number in this repo
-  comes from a hermetic suite with mocked providers. See `GO_LIVE.md` for what still needs a real
+- **The graph does not see imports inside `declare module` blocks**, or `import`/`require` calls built
+  from non-literal strings. Both are rare; the accuracy table above counts them.
+- **`impact` needs the base commit locally.** It runs local git only (`diff`, `merge-base`, `archive`)
+  and never fetches, so CI checkouts need `fetch-depth: 0`.
+- **Nothing is deployed, and the AI stages have not run against a live provider.** The graph numbers
+  above are measured on real repositories; every AI-side number comes from a hermetic suite with
+  mocked providers. See `GO_LIVE.md` for what still needs a real
   service.
 
 ---
@@ -186,9 +220,9 @@ not find that" — `GET /health` reports which one you actually have, under `ret
 
 ### Manage it
 ```bash
-docker compose -f docker-compose.app.yml logs -f     # follow logs
-docker compose -f docker-compose.app.yml down        # stop
-docker compose -f docker-compose.app.yml down -v     # stop + wipe the local databases
+docker compose --env-file codeflow.env -f docker-compose.app.yml logs -f     # follow logs
+docker compose --env-file codeflow.env -f docker-compose.app.yml down        # stop
+docker compose --env-file codeflow.env -f docker-compose.app.yml down -v     # stop + wipe the local databases
 ```
 
 ---
@@ -198,7 +232,8 @@ docker compose -f docker-compose.app.yml down -v     # stop + wipe the local dat
 No key, no network, no code leaving the machine:
 
 ```bash
-npx codeflow-local .
+npx codeflow-local analyze .              # graph, metrics, cycles, communities + a lexical index
+npx codeflow-local ask . "where are retries handled?"
 ```
 
 Parsing is tree-sitter WASM, the embedder is in-process, and the index is a file on disk — there is
@@ -209,6 +244,51 @@ It stops at a complete deterministic analysis plus a searchable index. **There i
 synthesis needs a model and there is no keyless local one, so rather than degrade into something that
 looks like a summary and is not, it says what it cannot do. Search is lexical — shared identifiers
 and path words, not meaning.
+
+---
+
+## Check an answer or a PR
+
+Three model-free checks, all offline:
+
+```bash
+# 1. Every code reference in a piece of text — an AI answer, a PR description, a review comment.
+#    Exit code 1 when any reference is wrong.
+pbpaste | npx codeflow-local verify . -
+#   ✓ packages/analyzers/src/stages/rag.ts:128 `createRagStage` — declared at line 125-369
+#   ✗ apps/worker/src/index.ts:9999 — line 9999 is outside the file (412 lines)
+#   ✗ packages/config/src/loader.ts — no file "packages/config/src/loader.ts" in this repository
+
+# 2. What a change set touches, against its merge-base with main.
+npx codeflow-local impact . --base main                     # text
+npx codeflow-local impact . --base main --format markdown   # a PR comment
+npx codeflow-local impact . --base main --fail-on new-cycle,broken-import
+```
+
+**3. On every pull request** — one comment, updated in place, plus a check of the references written in
+the PR description:
+
+```yaml
+# .github/workflows/codeflow.yml
+on: pull_request
+permissions: { contents: read, pull-requests: write }
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: AnshulMohanty/Code_Flow@main
+        with:
+          fail-on: new-cycle,broken-import,wrong-citation   # optional
+```
+
+**For coding agents**, the MCP server's `verify` scope adds `verify_citations` (check a draft answer
+before showing it) next to `verify_answer` (grade a structured claim such as "who calls X").
+
+> `codeflow-local` is not on npm yet. Until it is, run it from a checkout:
+> `pnpm --filter "codeflow-local..." build && node apps/local-cli/dist/index.js <command>`.
+> The GitHub Action builds it from source in the job.
 
 ---
 
@@ -254,9 +334,10 @@ pnpm -r build
 node --test tests/*.mjs          # root suite
 ```
 
-**1450 vitest tests (92 files, 15 packages) + 26 root tests**, all passing — measured on the commit
+**1534 vitest tests (99 files, 15 packages) + 26 root tests**, all passing — measured on the commit
 that introduced this line, not estimated. CI runs the same four commands plus parser-parity, a
-keyless eval check, and a build of all three Docker images.
+keyless eval check, the graph-accuracy gate against tsc, and a Docker smoke test that builds the
+three images, boots the stack and runs a real analysis through it (`scripts/docker-smoke.sh`).
 
 > Note (Windows): run installs one at a time — concurrent `pnpm install`s corrupt the
 > node_modules link step.

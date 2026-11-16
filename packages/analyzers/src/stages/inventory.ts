@@ -85,6 +85,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
 
       const symbols: InventorySymbol[] = [];
       const loc: Record<string, number> = {};
+      const lines: Record<string, number> = {};
       const unparsedFiles: string[] = [];
       let parsedCount = 0;
 
@@ -111,6 +112,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
       for (const result of results) {
         if (result.kind === "parsed") {
           loc[result.path] = result.loc;
+          lines[result.path] = result.lines;
           for (const symbol of result.symbols) symbols.push(symbol);
           parsedCount += 1;
         } else {
@@ -130,6 +132,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
         entryPoints,
         symbolCount: symbols.length,
         loc,
+        lines,
         ...(projectTypeSignal ? { projectTypeSignal } : {}),
         ...(unparsedFiles.length ? { unparsedFiles } : {}),
       };
@@ -167,7 +170,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
 // never a stage failure.
 
 type FileParseResult =
-  | { kind: "parsed"; path: string; loc: number; symbols: InventorySymbol[] }
+  | { kind: "parsed"; path: string; loc: number; lines: number; symbols: InventorySymbol[] }
   | { kind: "unparsed"; path: string };
 
 async function parseFile(
@@ -183,7 +186,7 @@ async function parseFile(
     const parsed = registry.parseFile({ path: file.path, content, repoRoot: repoPath });
     const fileSymbols: InventorySymbol[] = [];
     collectSymbols(parsed.symbols, parsed.exports, file, fileSymbols);
-    return { kind: "parsed", path: file.path, loc: parsed.loc, symbols: fileSymbols };
+    return { kind: "parsed", path: file.path, loc: parsed.loc, lines: physicalLineCount(content), symbols: fileSymbols };
   } catch (error) {
     ctx.logger.warn("Inventory: failed to parse file; skipping.", {
       path: file.path,
@@ -191,6 +194,13 @@ async function parseFile(
     });
     return { kind: "unparsed", path: file.path };
   }
+}
+
+/** Lines as an editor numbers them: a trailing newline does not start another line. */
+export function physicalLineCount(content: string): number {
+  if (content === "") return 0;
+  const breaks = content.match(/\r\n|\r|\n/g)?.length ?? 0;
+  return /(?:\r\n|\r|\n)$/.test(content) ? breaks : breaks + 1;
 }
 
 // --- Symbol extraction ------------------------------------------------------

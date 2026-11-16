@@ -4,6 +4,7 @@
 
 import type { TokenUsage } from "@codeflow/shared-types";
 import { estimatedUsage, measuredUsage, usageNumber } from "../util/tokens.js";
+import { ProviderHttpError } from "../util/providerError.js";
 
 export interface LlmCompletionRequest {
   /** Optional system prompt. */
@@ -120,7 +121,7 @@ export function createAnthropicClient(options: AnthropicClientOptions): LlmClien
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        throw new Error(`Anthropic API error ${response.status}: ${detail.slice(0, 500)}`);
+        throw new ProviderHttpError("Anthropic", response.status, detail);
       }
 
       const json = (await response.json()) as {
@@ -227,7 +228,7 @@ export function createGeminiClient(options: GeminiClientOptions): LlmClient {
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        throw new Error(`Gemini API error ${response.status}: ${detail.slice(0, 500)}`);
+        throw new ProviderHttpError("Gemini", response.status, detail);
       }
 
       const json = (await response.json()) as {
@@ -347,7 +348,7 @@ export function createOpenAiClient(options: OpenAiClientOptions): LlmClient {
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        throw new Error(`OpenAI API error ${response.status}: ${detail.slice(0, 500)}`);
+        throw new ProviderHttpError("OpenAI", response.status, detail);
       }
 
       const json = (await response.json()) as {

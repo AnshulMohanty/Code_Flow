@@ -319,6 +319,30 @@ describe("search_code over MCP", () => {
   });
 });
 
+describe("verify_citations — references in free text, checked against the repo", () => {
+  const server = core(["verify"]);
+
+  it("is advertised under the verify scope only", () => {
+    expect(server.listTools().map((tool) => tool.name)).toContain("verify_citations");
+    expect(core(["graph"]).listTools().map((tool) => tool.name)).not.toContain("verify_citations");
+  });
+
+  it("marks a real file as verified and a fabricated one as wrong", async () => {
+    const { body, isError } = await text(server, "verify_citations", {
+      text: "Login is handled in src/auth.ts, and sessions live in src/session-store.ts:12.",
+    });
+    expect(isError).toBe(false);
+    expect(body).toContain("✓ src/auth.ts");
+    expect(body).toContain('✗ src/session-store.ts:12 — no file "src/session-store.ts"');
+    expect(body).toContain("1 verified");
+    expect(body).toContain("1 wrong");
+  });
+
+  it("refuses empty text", async () => {
+    expect((await text(server, "verify_citations", { text: "  " })).isError).toBe(true);
+  });
+});
+
 describe("verify_answer — an EXACT verdict, no model", () => {
   const server = core(["verify"]);
 

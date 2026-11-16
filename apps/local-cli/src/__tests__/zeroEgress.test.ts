@@ -259,8 +259,23 @@ describe("codeflow-local sends nothing anywhere", () => {
 });
 
 describe("the CLI source tree has no surprises", () => {
-  it("contains only the two modules it is supposed to", async () => {
+  it("contains only the modules it is supposed to", async () => {
     const files = (await readdir(CLI_ROOT)).filter((name) => name.endsWith(".ts"));
-    expect(files.sort()).toEqual(["analyzeLocal.ts", "index.ts"]);
+    expect(files.sort()).toEqual(["analyzeLocal.ts", "impact.ts", "index.ts"]);
+  });
+
+  it("spawns only local git (read-only subcommands) and tar — never anything that can fetch", async () => {
+    // `impact` is the one module that starts processes. It must stay limited to local git plumbing
+    // and tar: no `git fetch/pull/clone/ls-remote`, no curl, no shell.
+    const source = await readFile(path.join(CLI_ROOT, "impact.ts"), "utf8");
+    const spawned = [...source.matchAll(/spawn\(\s*"([^"]+)"/g)].map((m) => m[1]);
+    expect(new Set(spawned)).toEqual(new Set(["git", "tar"]));
+    expect(source).toMatch(/execFileAsync\("git",/);
+    expect(source).not.toMatch(/shell:\s*true/);
+    const gitSubcommands = [...source.matchAll(/\[\s*"(\w[\w-]*)"\s*,/g)].map((m) => m[1]);
+    for (const forbidden of ["fetch", "pull", "clone", "ls-remote", "push", "remote", "submodule"]) {
+      expect(gitSubcommands).not.toContain(forbidden);
+    }
+    for (const network of ["curl", "wget", "ssh"]) expect(source).not.toContain(`"${network}"`);
   });
 });

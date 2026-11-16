@@ -1,5 +1,6 @@
 import { buildDependencyGraph } from "@codeflow/graph";
 import { createParserRegistry, extractCpgFacts, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
+import { createModuleResolver } from "./moduleResolver.js";
 import type {
   CpgEdge,
   CpgProvenance,
@@ -28,15 +29,14 @@ export interface ConnectDependencies {
   now?: () => number;
 }
 
-const SOURCE_ROLE = "source";
+/**
+ * Roles whose imports are parsed. Tests are included so the graph can answer "which tests reach
+ * this module" (Impact tab); ranking metrics that must stay production-only filter them in Analyze.
+ */
+const PARSED_ROLES = new Set(["source", "test"]);
 
 /** The engine label `extractCpgFacts` reports when tree-sitter produced the facts. */
 const TREE_SITTER_ENGINE = "treesitter-v1";
-
-// Extension + index resolution order for JS/TS relative imports (mirrors the parser's
-// resolver, but matched against the DISCOVERED file set — no fs, deterministic).
-const JS_SUFFIXES = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
-const JS_INDEX_SUFFIXES = ["/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.cjs"];
 
 /**
  * Stage 5 — Connect (deterministic). Builds the CODE PROPERTY GRAPH from real syntax: one
@@ -95,7 +95,10 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
         lines: loc[file.path] ?? 0, // real LOC for source; 0 for non-source (documented)
         symbolCount: symbolCountByPath.get(file.path) ?? 0,
       }));
-      const fileSet = new Set(structure.files.map((file) => file.path));
+      const resolver = await createModuleResolver({
+        files: structure.files.map((file) => file.path),
+        read: (path) => deps.readFile(repoPath, path),
+      });
 
       // 2) One tree-sitter pass per source file. Grammars are loaded once (the load is
       //    shared with Inventory); a file whose language has no grammar falls back to regex
@@ -122,7 +125,7 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
       let fallbackFiles = 0;
 
       for (const file of structure.files) {
-        if (file.role !== SOURCE_ROLE) continue;
+        if (!PARSED_ROLES.has(file.role)) continue;
         const content = await deps.readFile(repoPath, file.path);
         if (content === null) continue; // unreadable: contributes a node, no edges
 
@@ -135,31 +138,37 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
         //     inheritance edges resolve through.
         const targetByBinding = new Map<string, string>();
         for (const spec of facts.imports) {
-          if (!spec.source.startsWith(".")) {
+          const resolution = resolver.resolve(file.path, spec, isPython ? "python" : "js");
+          if (resolution.status === "external") {
             external += 1;
             externalModules.add(spec.source);
             continue;
           }
-          const target = isPython
-            ? resolvePythonImport(file.path, spec.source, fileSet)
-            : resolveJsImport(file.path, spec.source, fileSet);
-          if (!target) {
+          if (resolution.status === "unresolved") {
             unresolved += 1;
             unresolvedImports.push({ from: file.path, specifier: spec.source });
             continue;
           }
-          // First import of a binding wins: resolving a later shadowing declaration would
-          // need real scope analysis, and guessing would fabricate an edge.
-          for (const binding of spec.specifiers) {
-            if (!targetByBinding.has(binding)) targetByBinding.set(binding, target);
-          }
-
-          const key = `${file.path} ${target} ${spec.kind} ${spec.source}`;
-          if (edgeKeys.has(key)) continue;
-          edgeKeys.add(key);
           resolved += 1;
-          edges.push({ from: file.path, to: target, kind: spec.kind, specifier: spec.source });
-          richDeps.push(toDependencyEdge(file.path, target, spec, richDeps.length));
+          for (const { target, bindings } of resolution.targets) {
+            // First import of a binding wins: resolving a later shadowing declaration would
+            // need real scope analysis, and guessing would fabricate an edge.
+            for (const binding of bindings) {
+              if (!targetByBinding.has(binding)) targetByBinding.set(binding, target);
+            }
+            const key = `${file.path} ${target} ${spec.kind} ${spec.source}`;
+            if (edgeKeys.has(key)) continue;
+            edgeKeys.add(key);
+            edges.push({
+              from: file.path,
+              to: target,
+              kind: spec.kind,
+              specifier: spec.source,
+              ...(spec.typeOnly ? { typeOnly: true as const } : {}),
+              ...(spec.lazy ? { lazy: true as const } : {}),
+            });
+            richDeps.push(toDependencyEdge(file.path, target, spec, richDeps.length));
+          }
         }
 
         // 2b) Calls + inheritance, resolved through this file's own imports. A reference to
@@ -284,35 +293,10 @@ function addCpgEdge(
   aggregate.set(key, { from, to, kind, symbol, count: 1, line });
 }
 
-// --- Module resolution (against the discovered file set; no fs) --------------
+// --- Edges ------------------------------------------------------------------
 
 /** Import specifiers come from `extractCpgFacts` (tree-sitter, or its regex fallback). */
 type ImportSpec = CpgFacts["imports"][number];
-
-function resolveJsImport(fromFile: string, source: string, fileSet: Set<string>): string | undefined {
-  const base = joinPosix(dirnamePosix(fromFile), source);
-  for (const suffix of JS_SUFFIXES) {
-    const candidate = base + suffix;
-    if (fileSet.has(candidate)) return candidate;
-  }
-  for (const suffix of JS_INDEX_SUFFIXES) {
-    const candidate = base + suffix;
-    if (fileSet.has(candidate)) return candidate;
-  }
-  return undefined;
-}
-
-function resolvePythonImport(fromFile: string, source: string, fileSet: Set<string>): string | undefined {
-  const dots = source.match(/^\.+/)?.[0].length ?? 0;
-  const moduleName = source.slice(dots).replace(/\./g, "/");
-  let directory = dirnamePosix(fromFile);
-  for (let i = 1; i < dots; i += 1) directory = dirnamePosix(directory);
-  const base = moduleName ? joinPosix(directory, moduleName) : directory;
-  for (const candidate of [`${base}.py`, `${base}/__init__.py`]) {
-    if (fileSet.has(candidate)) return candidate;
-  }
-  return undefined;
-}
 
 function toDependencyEdge(from: string, to: string, spec: ImportSpec, index: number): DependencyEdge {
   const dependencyType =
@@ -330,24 +314,6 @@ function toDependencyEdge(from: string, to: string, spec: ImportSpec, index: num
     evidence: spec.source,
     sourceLine: spec.line,
   };
-}
-
-// --- POSIX path helpers (resolve ./ ../ against the discovered keyspace) -----
-
-function dirnamePosix(path: string): string {
-  const slash = path.lastIndexOf("/");
-  return slash === -1 ? "" : path.slice(0, slash);
-}
-
-/** Join a base dir + a relative specifier, resolving `.`/`..` segments. */
-function joinPosix(dir: string, rel: string): string {
-  const segments = dir ? dir.split("/") : [];
-  for (const part of rel.split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") segments.pop();
-    else segments.push(part);
-  }
-  return segments.join("/");
 }
 
 function basename(path: string): string {
