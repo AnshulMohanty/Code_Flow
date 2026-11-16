@@ -58,13 +58,13 @@ repo-relative POSIX path. Cycles count **load-time** edges only: `typeOnly`, `la
 function, and every Java import — the JVM loads classes on first use) and dynamic imports are excluded.
 
 **Parsing** (`packages/parsers`). tree-sitter WASM (`web-tree-sitter` + `@vscode/tree-sitter-wasm`) for
-JavaScript, JSX, TypeScript, TSX, Python, Go, Java and C/C++ (C uses the C++ grammar). Grammars load **per language, on demand**: a
+JavaScript, JSX, TypeScript, TSX, Python, Go, Java, C# and C/C++ (C uses the C++ grammar). Grammars load **per language, on demand**: a
 pipeline asks only for the languages its files need (`grammarsFor`), because grammars range from 0.2 MB
 (Go) to 5.4 MB (C++). A regex parser per language takes over when a grammar fails, when a file is over
 `TREE_SITTER_MAX_BYTES` (2 MB of characters), or when a parse returns null. Raw NUL bytes are replaced by
 spaces before tree-sitter sees them (it stops at the first NUL; positions are unchanged).
 
-**Parse once, walk once, cache by content.** For Go, Java and C/C++, Inventory and Connect read the same
+**Parse once, walk once, cache by content.** For Go, Java, C# and C/C++, Inventory and Connect read the same
 per-file extract: Inventory's is kept (consume-once, `treesitter/extractCache.ts`) and Connect takes it,
 so each file is parsed once per run; each extractor collects all its node types in ONE tree walk
 (`collectByType`). A pluggable `FactsStore` (`parsers/src/factsStore.ts`) keeps every file's parse
@@ -72,7 +72,7 @@ output by (kind, `ANALYZER_VERSION`, language, path, content hash): the CLI back
 `.codeflow/cache`, `impact` with one in-memory store for head and base. The CLI streams `--out` JSON
 (`apps/local-cli/src/jsonOut.ts`) instead of building one giant string.
 
-**Connect runs in two passes**: extract facts from every file, then resolve. Go and Java resolve a name
+**Connect runs in two passes**: extract facts from every file, then resolve. Go, Java and C# resolve a name
 to the file that **declares** it, which needs every file's declarations first. Committed JavaScript
 bundles (webpack / browserify / Parcel runtime signatures) are kept as nodes but not parsed for imports —
 their `require("./_x")` calls address the bundle's own module table.
@@ -85,6 +85,7 @@ their `require("./_x")` calls address the bundle's own module table.
 | Python | relative + absolute, src layouts, submodule imports | `moduleResolver.ts` |
 | Go | import path → package dir via `go.mod`, local `replace`, `go.work`, nested modules; GOPATH-era repos get their checkout prefix **inferred** from their own imports (one winner, ≥2 votes); the edge targets the file declaring the name used (`store.Open`) | `goResolver.ts` |
 | Java | javac's order: own types → single-type imports → **same package (no import)** → on-demand imports; fully qualified uses; indexed by declared `package`, not path (Maven, Gradle, Ant, flat) | `javaResolver.ts` |
+| C# | the compiler's lookup: own types → same and **enclosing namespaces** (no `using`) → nested types of the type and its base classes → `using`s (one written inside a namespace is relative to it), project-level global usings (`global using`, `<Using>` in the .csproj and imported .props/.targets) → aliases; dotted names bind their first part from the innermost namespace outwards. Names carry **generic arity**; `[Test]` is `TestAttribute`; a part of a `partial` type depends on the parts it names. **Projects**: a file sees its own project and its transitive ProjectReferences only — not a same-named type elsewhere, nor source the build takes as a NuGet package or DLL, nor a file no project compiles; its own project's type wins a name clash. A file whose `#if` splits a construct is parsed once per branch | `csharpResolver.ts`, `msbuild.ts` |
 | C/C++ | compiler order: `"x"` beside the includer → ancestors and `include/` dirs (standing in for `-I`) → a path suffix (never for a bare `<x.h>`, which is a system header). Missing `"x.h"` ⇒ external (usually generated). A call reaches the file defining that function. Includes come from the tree **and** a line scan, because the grammar can lose its place in a preprocessor condition | `cResolver.ts` |
 
 **Grounding (enforced in code).** (1) A reading-order step must name a real graph node or it is dropped
@@ -134,7 +135,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | Stages 1–6 are byte-deterministic for `{repo, sha, analyzerVersion}` | The cache is keyed on the SHA; two answers for one key = wrong answers | `packages/config/src/constants.ts` |
 | **Bump `ANALYZER_VERSION` whenever deterministic output changes** (now `1.2.0`) | Invalidates the whole cache without a purge | `constants.ts` |
 | Import accuracy is scored against each language's **own toolchain**, in CI | The resolver once missed 102 of 543 of this repo's imports while every test passed | §4, `.github/workflows/ci.yml` |
-| Resolve to the **declaring file**, not the package (Go, Java) | "What breaks if this file changes" must answer at file granularity | `goResolver.ts`, `javaResolver.ts` |
+| Resolve to the **declaring file**, not the package (Go, Java, C#) | "What breaks if this file changes" must answer at file granularity | `goResolver.ts`, `javaResolver.ts`, `csharpResolver.ts` |
 | Java imports are `lazy` (no load-time cycles) | Java class cycles are legal; flagging them would be noise in every PR | `parsers/src/treesitter/cpg.ts` |
 | `.gitignore` never drops a file git TRACKS (`git ls-files`) | It only governs untracked files; zlib commits its gitignored `zconf.h` | `mapStructure.ts`, both apps' `gitTrackedFiles` |
 | Go same-package references are call edges, not import edges | Go forbids package cycles; file-level same-package edges would invent cycles | `connect.ts` |
@@ -195,6 +196,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | `go-accuracy` | Go vs `go list` on etcd (pinned SHA), precision = 1, recall ≥ 0.99, ≥ 1000 edges |
 | `c-accuracy` | C vs clang 21 with the project's CMake flags on libuv (pinned SHA), same thresholds |
 | `java-accuracy` | Java vs javac on jsoup (pinned SHA), same thresholds |
+| `csharp-accuracy` | C# vs Roslyn (from the .NET 10 SDK) on MediatR (pinned SHA), same thresholds, ≥ 500 edges |
 | `python-accuracy` | Python vs the import system (`importlib` PathFinder) on click (pinned SHA), same thresholds, ≥ 150 edges |
 | `docker-smoke` | Builds and boots the stack, analyses a real repo end to end |
 | `codeql.yml`, `codeflow-impact.yml`, `eval-scored.yml` (manual, keys) | Static analysis; dogfood PR report; scored eval |
@@ -206,11 +208,14 @@ node apps/local-cli/dist/index.js analyze <repo> --no-index --out r.json
 node scripts/graph-accuracy.mjs <repo> r.json        # TS/JS vs tsc
 node scripts/accuracy/go.mjs    <repo> r.json        # Go vs go list   (local go, else Docker golang image)
 node scripts/accuracy/java.mjs  <repo> r.json        # Java vs javac   (local JDK 17+, else Docker temurin)
+node scripts/accuracy/csharp.mjs <repo> r.json       # C# vs Roslyn    (local .NET 10 SDK, else Docker dotnet/sdk:10.0)
 node scripts/accuracy/c.mjs     <repo> r.json [--cmake "-DX=OFF"]   # C/C++ vs clang 21 (Docker; CMake projects)
 node scripts/accuracy/python.mjs <repo> r.json      # Python vs importlib (local python3; nothing is executed)
 ```
 
-`--truth <file>` reuses a saved truth JSON; Go's `--gopath <import path>` scores a GOPATH-era repo.
+`--truth <file>` reuses a saved truth JSON; Go's `--gopath <import path>` scores a GOPATH-era repo; C#'s
+`--save-truth <file>` keeps the truth, and `CSHARP_TRUTH_EXPLAIN=<path part>` prints what each name in that
+file bound to (stderr) — the way to find out why an edge differs.
 
 Scored eval (keys, money): put `packages/eval/results/<dataset>.json` (a full run, with AI stages, at the
 dataset's pinned SHA, in its embedding space — gitignored), then `pnpm --filter @codeflow/eval run
@@ -297,13 +302,15 @@ Each language's graph is compared with **that language's own resolver**, edge by
 | TS/JS | `ts.resolveModuleName` under the nearest tsconfig (`scripts/graph-accuracy.mjs`) | (file, specifier) → file |
 | Go | `go list -deps -test` per module + go/parser (`scripts/accuracy/go-truth.go`) | (file, import) → package directory |
 | Java | javac Compiler Tree API: every source name that resolves to an in-repo type (`scripts/accuracy/JavaTruth.java`) | file → file |
+| C# | Roslyn from the .NET SDK: every `.csproj` compiled as MSBuild would (Compile items, ProjectReferences, global usings, each target framework × Debug/Release), every name bound to an in-repo type → the files declaring that type (`scripts/accuracy/csharp-truth/`) | file → file |
 | C/C++ | CMake `compile_commands.json` + clang 21 direct-per-file include reporting (`scripts/accuracy/c.mjs`) | file → included file |
 | Python | `ast` + `importlib.machinery.PathFinder`, segment by segment, from `src/`, the root, nested projects and the file's first non-package ancestor (`scripts/accuracy/python-truth.py`) | (file, import) → file |
 
 Results (2026-11-16) are in the README. Summary: TS/JS 100% precision, ≥99.76% recall (5 repos);
 Go 100% / 100% on Kubernetes (59,823 edges), Hugo, etcd, etcd v3.3 (GOPATH) and cobra; Java 100% / 100%
 on gson, commons-lang, jsoup, and ≥99.88% on JUnit 4 and Apache Ant (legacy layout); C/C++ 100% / 100%
-on libuv, leveldb, fmt and zlib; Python 100% / 100% on click, httpx and requests, 98.45% / 100% on
+on libuv, leveldb, fmt and zlib; C# 100% recall on MediatR, Serilog, Polly, Newtonsoft.Json and NUnit v2
+(legacy, 59 old-style projects), precision 100% / 99.90% / 99.91% / 99.13% / 99.93%; Python 100% / 100% on click, httpx and requests, 98.45% / 100% on
 flask and 99.97% / 100% on django (9,192 edges).
 
 Known truth-tool artifacts (not CodeFlow errors): Go "extra" edges are files behind build tags a default
@@ -311,7 +318,11 @@ Known truth-tool artifacts (not CodeFlow errors): Go "extra" edges are files beh
 missing library class, javac falls back to a same-package class of the same name (JUnit 4, Ant's
 `MimeMailer`); Ant's test fixtures declare duplicate classes, and one javac task maps them all to the
 first copy. Python: a test that edits `sys.path` at runtime (flask's conftest, one django test) makes
-imports work that no static truth sees — CodeFlow's "extra" edges there are real.
+imports work that no static truth sees — CodeFlow's "extra" edges there are real. C#: CodeFlow reads both
+sides of every `#if`, the compiler only the side a project builds (Newtonsoft.Json's polyfills for
+frameworks no project builds, Polly's Windows-only test target, Serilog's pre-.NET 8 `TimeProvider`); the
+reference build is Linux, so WinForms code does not bind; it cannot read Polly's own InternalsVisibleTo item;
+and "Color Color" (`TestName.Name` where `TestName` is also a property) cannot be told apart without types.
 
 ---
 
@@ -351,7 +362,7 @@ Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an I
 | Phase | Status | What is left |
 |---|---|---|
 | **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
-| **1. Languages** | **Go, Java and C/C++ done**, Python now benchmarked too (above). Entry points also come from the code itself (`main-function` evidence: Go `func main` in `package main`, Java/C# `static void main`, C/C++/Rust `main`, Python `if __name__ == "__main__":`). C# extractor + resolver drafted on branch `wip/csharp` (not built or measured) | C# (finish; truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Follow §3.4. |
+| **1. Languages** | **Go, Java, C# and C/C++ done**, Python benchmarked too (above). C#: 100% recall on 5 repositories against Roslyn, CI on MediatR. Entry points also come from the code itself (`main-function` evidence: Go `func main` in `package main`, Java/C# `static void main`, C/C++/Rust `main`, Python `if __name__ == "__main__":`) | Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Follow §3.4. |
 | **2. Speed & scale** | **Done:** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); incremental analysis — a one-file change re-analyses Kubernetes in 7.8 s; graph identical throughout | Load test: harness built (`scripts/load-test.sh` + `.mjs`, `docker-compose.loadtest.yml`: 24 repos as PR bots, 20 browsing users, 1/2/4 workers). First run: 2 workers → 23/24 jobs in 27.9 s, API reads p95 ≤ 21 ms, 0 errors. **Not yet trustworthy**: `urfave/cli` fails every run (it analyses fine with the CLI, so the cause is the clone/worker path — the script now records each failed job's error), the files-analysed count read 0 (fixed: read from the result), and at 4 workers one `/api/result` request hung 205 s, which also stretched the computed throughput (fixed: 30 s request deadline, slow requests logged with timestamps, throughput from the jobs' own timeline). Re-run before quoting scaling numbers. Speculative prefetch is now opt-in (`SPECULATIVE_PREFETCH`); fan-out/best-of-N were already off. Still open: replace the hosted 25k-file cap with streaming. |
 | **3. Online beats Claude alone** | **Pilot done** (README table, 76 runs, $4.02). Impact questions: + CodeFlow takes half the turns at 40–46% lower cost with equal accuracy; direct questions: a tie. Tuned from the runs: MCP server instructions (CodeFlow adoption 2/4 → 8/8), `listLimit` (MCP gets full lists; the 25-item cap had sent the client searching). `find_usages` added. | Scale the benchmark to large repositories (Kubernetes: Go truth is package-level, so impact questions per package) and more questions per kind; repeat runs to report variance. Ask the owner before spending on it. |
 | **4. Real-problem checks** | **Done.** `codeflow-local tests` (test selection; proven by fault injection on CodeFlow's own suites: 32 faults, 193 failing test files, 0 missed, 80% of the analyzers suite skipped), `check` + `codeflow.rules.json` (CodeFlow's own layering, enforced in CI), `unused`, `impact --quiet` / the action's `quiet` input. History replay (`scripts/replay-history.mjs`): the last 50 commits each of zod, jsoup and Hugo — silent on all 150 (no false alarms); the replay also exposed and fixed a CLI bug (JSON output over 64 KB was cut off when stdout was a pipe) | Run the fault-injection proof on a third-party suite (needs the owner's OK to install and run it, e.g. in a container). Filing upstream issues for real findings is the owner's call. |

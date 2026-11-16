@@ -8,7 +8,7 @@ import { Language as TsLanguage, Parser as TsParser } from "web-tree-sitter";
  * `jsx` deliberately maps onto the JavaScript grammar: tree-sitter-javascript parses JSX
  * natively, so there is no separate jsx grammar to ship.
  */
-export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python" | "go" | "java" | "c" | "cpp";
+export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python" | "go" | "java" | "c" | "cpp" | "csharp";
 
 export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "javascript",
@@ -20,6 +20,7 @@ export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "java",
   "c",
   "cpp",
+  "csharp",
 ];
 
 /** Grammar wasm filename per language (jsx shares the JavaScript grammar). */
@@ -34,6 +35,7 @@ const GRAMMAR_FILE: Record<TreeSitterLanguageId, string> = {
   // C shares the C++ grammar (there is no separate C grammar to ship); it parses C syntax too.
   c: "tree-sitter-cpp.wasm",
   cpp: "tree-sitter-cpp.wasm",
+  csharp: "tree-sitter-c-sharp.wasm",
 };
 
 /**

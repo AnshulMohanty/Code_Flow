@@ -4,10 +4,11 @@
 
 ### The codebase map that proves its answers.
 
-CodeFlow maps how a JavaScript, TypeScript, Python, Go, Java or C/C++ codebase fits together, answers
+CodeFlow maps how a JavaScript, TypeScript, Python, Go, Java, C# or C/C++ codebase fits together, answers
 questions cited to real files and lines, and **checks the code references in anyone's answer** — an AI
 agent's, a PR description's, a reviewer's — against the repository. The graph is scored against each
-language's own toolchain (the TypeScript compiler, `go list`, javac, clang); the checker runs offline,
+language's own toolchain (the TypeScript compiler, `go list`, javac, Roslyn, clang, Python's import
+system); the checker runs offline,
 with no key.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
@@ -31,7 +32,7 @@ with no key.
 
 | | What it gives you | Commands | Measured |
 |---|---|---|---|
-| **Map** | The resolved dependency and call graph of a repository: load-bearing files, cycles, communities, blast radius, entry points, files nothing uses | `analyze`, `unused` | Import graph vs each language's own toolchain on 24 repositories (TS/JS, Go, Java, C/C++, Python): precision 100% on 21, ≥ 98.4% on the other 3 (every difference explained); recall ≥ 99.5% — [tables](#measured-not-asserted-the-import-graph-vs-each-languages-own-toolchain) |
+| **Map** | The resolved dependency and call graph of a repository: load-bearing files, cycles, communities, blast radius, entry points, files nothing uses | `analyze`, `unused` | Import graph vs each language's own toolchain on 29 repositories (TS/JS, Go, Java, C#, C/C++, Python): precision 100% on 22, ≥ 98.4% on the other 7 (every difference explained); recall ≥ 99.5% — [tables](#measured-not-asserted-the-import-graph-vs-each-languages-own-toolchain) |
 | **Check** | In CI, offline: what a change touches, which tests to run, architecture rules, wrong code references in a PR description — and a PR comment only when something needs a human | `impact`, `tests`, `check`, `verify`, the GitHub Action | Test selection by fault injection: 0 of 193 failures missed while skipping 80% of a suite — [details](#check-an-answer-or-a-pr) |
 | **Ask** | Give an agent (Claude Code, Cursor) the graph over MCP, so it asks instead of searching file by file | the MCP server | On "what is affected" questions: half the turns, 40–46% lower cost, same accuracy — [benchmark](#claude-code-alone-vs-claude-code--codeflow) |
 
@@ -127,7 +128,7 @@ For the GOPATH-era repository the import prefix it was checked out under is infe
 imports (`github.com/coreos/etcd`); `go list` ran in GOPATH mode at that path. "Extra" edges —
 CodeFlow has one, `go list` does not — are all files behind build tags (`_windows.go`,
 `//go:build tools`), which a default `go list` skips. CI runs the etcd check and fails below 100%
-precision / 99% recall. Kubernetes (26,558 files) analyses in 34 s on a laptop.
+precision / 99% recall. Kubernetes (26,558 files) analyses in 20.7 s on a laptop.
 
 **Java**, against javac. `scripts/accuracy/JavaTruth.java` runs javac's own attribution (the Compiler
 Tree API) over every source file and records each name that resolves to a type declared in the
@@ -147,6 +148,30 @@ so where a file explicitly imports a library class (`javax.mail.Message`, hamcre
 javac falls back to a same-named class in the file's own package; and Ant's test fixtures declare the
 same class in several directories, which one javac run maps to the first copy. CI runs the jsoup check
 and fails below 100% precision / 99% recall.
+
+**C#**, against Roslyn (the C# compiler). `scripts/accuracy/csharp-truth/` compiles every `.csproj` the
+way MSBuild hands it to the compiler — its Compile items, its project references, its global usings, and
+the preprocessor symbols of every target framework in Debug and Release — and records each name the
+compiler binds to a type declared in the repository. It uses the Roslyn shipped inside the .NET SDK;
+nothing is downloaded from NuGet. CodeFlow reads the same `.csproj` files (references, `<Using>` items,
+which files an old-style project compiles) but never runs MSBuild or the compiler. Measured on
+2026-11-16:
+
+| Repository | Layout | Edges (per Roslyn) | CodeFlow-only | Missed | Precision | Recall |
+|---|---|---:|---:|---:|---:|---:|
+| App-vNext/Polly | 21 projects, multi-target | 6,849 | 6 | 0 | 99.91% | 100% |
+| JamesNK/Newtonsoft.Json | 8 target frameworks, .NET 2.0 → .NET 10 | 5,564 | 49 | 0 | 99.13% | 100% |
+| nunit/nunitv2 | legacy: 59 old-style (2005-era) projects | 4,435 | 3 | 0 | 99.93% | 100% |
+| serilog/serilog | SDK-style | 955 | 1 | 0 | 99.90% | 100% |
+| jbogard/MediatR | SDK-style, 15 projects | 531 | 0 | 0 | 100% | 100% |
+
+CodeFlow reads both sides of every `#if`; the compiler reads only the side a project builds. That is most
+of the CodeFlow-only edges: Newtonsoft.Json's polyfills (`LinqBridge`, `TraceLevel`,
+`SerializationBinder`, …) exist for frameworks none of its projects builds today, Polly has a Windows-only
+test target, and Serilog a `TimeProvider` for pre-.NET 8 builds. The rest: two "Color Color" member
+accesses (a property named like its type, used as `TestName.Name`), an internal class Polly shows its
+tests through its own MSBuild item (which the reference build cannot read), WinForms code a Linux build
+cannot bind, and one NUnit name the reference build does not bind (not traced further). CI runs the MediatR check and fails below 100% precision / 99% recall.
 
 **C/C++**, against clang. `scripts/accuracy/c.mjs` has CMake write `compile_commands.json` — every
 file's real `-I`/`-D` flags — then compiles each translation unit with clang 21, which reports every
@@ -211,8 +236,8 @@ Not everything here is the same kind of thing, and the difference matters more t
 ## Honest limits
 
 - **Language coverage is narrower than "any codebase".** Deep support — symbols, call edges and a
-  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python, Go, Java and C/C++**.
-  C#, Rust and PHP are next; until then they get line counts only, so `find_references`, callers
+  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python, Go, Java, C# and C/C++**.
+  Rust and PHP are next; until then they get line counts only, so `find_references`, callers
   and blast radius return little of use on those repositories. The pipeline degrades gracefully; it
   does not pretend.
 - **The AI stages need your key.** No key means no summary and no Q&A. The map, the metrics, the

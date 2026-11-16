@@ -8,6 +8,7 @@ import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
 import { parseableSource } from "./ast.js";
 import { projectCFamily } from "./cfamily.js";
+import { projectCSharp } from "./csharp.js";
 import { extractFor, SHARED_EXTRACT } from "./cpg.js";
 import { extractKey, rememberExtract } from "./extractCache.js";
 import { projectGo, type GoExtract } from "./go.js";
@@ -43,7 +44,7 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
       const extract = extractFor(language, tree, input.content);
       rememberExtract(extractKey(language, input.path, input.content), extract);
       if (language === "go") return goParsedFile(projectGo(extract as GoExtract), input);
-      const project = language === "java" ? projectJava : projectCFamily;
+      const project = language === "java" ? projectJava : language === "csharp" ? projectCSharp : projectCFamily;
       return typedParsedFile(project(extract as never), input, language);
     }
     return jsLikeParsedFile(tree, input, language);
