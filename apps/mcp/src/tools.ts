@@ -1,6 +1,7 @@
 import {
   createBlastRadiusTool,
   createFindReferencesTool,
+  createFindUsagesTool,
   createGetCallersTool,
   createSearchTool,
   createSymbolSearchTool,
@@ -145,6 +146,19 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
         inputSchema: {
           type: "object",
           properties: { name: { type: "string", description: "Symbol name, exact or partial." } },
+          required: ["name"],
+        },
+      }),
+      fromAgentTool(createFindUsagesTool(), {
+        name: "find_usages",
+        scope: "graph",
+        description:
+          "Where a function, method, class or type is declared, and every RESOLVED place that uses it (call, `new`, " +
+          "extends/implements) with file:line and count. Unlike a text search, a same-named symbol in another module " +
+          "is not mixed in. Use it instead of grepping for a name.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string", description: "Symbol name, e.g. parse, Store, Reader.read." } },
           required: ["name"],
         },
       }),

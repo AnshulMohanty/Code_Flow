@@ -207,7 +207,7 @@ describe("tool surface — a denied tool is ABSENT, not present-and-refusing", (
     // An advertised tool that always refuses wastes a turn every time a model tries it; one that was
     // never advertised is never tried.
     const names = core(["graph"]).listTools().map((tool) => tool.name);
-    expect(names.sort()).toEqual(["find_references", "get_blast_radius", "get_callers", "graph_facts", "symbol_search"]);
+    expect(names.sort()).toEqual(["find_references", "find_usages", "get_blast_radius", "get_callers", "graph_facts", "symbol_search"]);
     expect(names).not.toContain("search_code");
     expect(names).not.toContain("verify_answer");
   });
