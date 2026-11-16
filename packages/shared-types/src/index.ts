@@ -498,7 +498,10 @@ export type EntryPointEvidence =
   | "package-json-main"
   | "package-json-exports"
   | "filename-convention"
-  | "framework";
+  | "framework"
+  /** The code declares a program entry: Go `func main` in `package main`, Java/C# `static void main`,
+   *  C/C++/Rust `main`, Python `if __name__ == "__main__":`. */
+  | "main-function";
 
 /** An entry point detected by Inventory, keyed by repo-relative POSIX `filePath`. */
 export interface InventoryEntryPoint {

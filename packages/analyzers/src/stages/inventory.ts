@@ -111,8 +111,10 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
         ),
       );
 
+      const mainFiles: string[] = [];
       for (const result of results) {
         if (result.kind === "parsed") {
+          if (result.declaresMain) mainFiles.push(result.path);
           loc[result.path] = result.loc;
           lines[result.path] = result.lines;
           for (const symbol of result.symbols) symbols.push(symbol);
@@ -126,7 +128,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
       symbols.sort((a, b) => (a.filePath === b.filePath ? a.line - b.line : a.filePath.localeCompare(b.filePath)));
       unparsedFiles.sort(); // stable under concurrency
 
-      const entryPoints = await detectEntryPoints(repoPath, structure.files, deps.readFile);
+      const entryPoints = await detectEntryPoints(repoPath, structure.files, deps.readFile, mainFiles);
       const projectTypeSignal = deriveProjectTypeSignal(entryPoints);
 
       const inventory: Inventory = {
@@ -172,7 +174,7 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
 // never a stage failure.
 
 type FileParseResult =
-  | { kind: "parsed"; path: string; loc: number; lines: number; symbols: InventorySymbol[] }
+  | { kind: "parsed"; path: string; loc: number; lines: number; symbols: InventorySymbol[]; declaresMain: boolean }
   | { kind: "unparsed"; path: string };
 
 async function parseFile(
@@ -188,7 +190,14 @@ async function parseFile(
     const parsed = registry.parseFile({ path: file.path, content, repoRoot: repoPath });
     const fileSymbols: InventorySymbol[] = [];
     collectSymbols(parsed.symbols, parsed.exports, file, fileSymbols);
-    return { kind: "parsed", path: file.path, loc: parsed.loc, lines: physicalLineCount(content), symbols: fileSymbols };
+    return {
+      kind: "parsed",
+      path: file.path,
+      loc: parsed.loc,
+      lines: physicalLineCount(content),
+      symbols: fileSymbols,
+      declaresMain: declaresMain(file.ext, content),
+    };
   } catch (error) {
     ctx.logger.warn("Inventory: failed to parse file; skipping.", {
       path: file.path,
@@ -324,6 +333,7 @@ async function detectEntryPoints(
   repoPath: string,
   files: RepoFile[],
   readFile: InventoryDependencies["readFile"],
+  mainFiles: readonly string[] = [],
 ): Promise<InventoryEntryPoint[]> {
   const seen = new Set<string>();
   const entries: InventoryEntryPoint[] = [];
@@ -370,10 +380,48 @@ async function detectEntryPoints(
     if (conventionKind) add(file.path, conventionKind, "filename-convention");
   }
 
+  // 3) Programs the CODE declares — what a filename cannot tell (`cmd/kubelet/kubelet.go`, `App.java`).
+  for (const path of mainFiles) add(path, "main", "main-function");
+
   entries.sort((a, b) =>
     a.filePath === b.filePath ? a.evidence.localeCompare(b.evidence) : a.filePath.localeCompare(b.filePath),
   );
   return entries;
+}
+
+// Line patterns for a declared program entry. Applied line by line, and only to lines under 400
+// characters: the input is untrusted source, so no pattern ever sees a minified megabyte line.
+const GO_PACKAGE_MAIN = /^package\s+main\b/;
+const GO_FUNC_MAIN = /^func\s+main\s*\(\s*\)/;
+const JAVA_MAIN = /\bstatic\s+(?:final\s+)?void\s+main\s*\(\s*(?:final\s+)?String\s*(?:\[\s*\]|\.\.\.)/;
+const CSHARP_MAIN = /\bstatic\s+(?:async\s+)?(?:void|int|Task|Task<int>)\s+Main\s*\(/;
+const C_MAIN = /^\s*(?:int|void)\s+main\s*\(/;
+const RUST_MAIN = /^\s*(?:pub\s+)?fn\s+main\s*\(\s*\)/;
+const PY_MAIN = /^if\s+__name__\s*==\s*["']__main__["']\s*:/;
+
+/** Does this file declare a program entry point (in its own language's way)? */
+export function declaresMain(ext: string, content: string): boolean {
+  const lines = content.split(/\r\n|\r|\n/).filter((line) => line.length < 400);
+  const any = (pattern: RegExp) => lines.some((line) => pattern.test(line));
+  switch (ext) {
+    case ".go":
+      return any(GO_PACKAGE_MAIN) && any(GO_FUNC_MAIN);
+    case ".java":
+      return any(JAVA_MAIN);
+    case ".cs":
+      return any(CSHARP_MAIN);
+    case ".c":
+    case ".cc":
+    case ".cpp":
+    case ".cxx":
+      return any(C_MAIN);
+    case ".rs":
+      return any(RUST_MAIN);
+    case ".py":
+      return any(PY_MAIN);
+    default:
+      return false;
+  }
 }
 
 /** Hard evidence only: a package.json `bin` ⇒ this is a CLI. Everything softer is left

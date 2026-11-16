@@ -189,6 +189,31 @@ describe("module resolver — Python", () => {
     expect(r.resolve("src/requests/models.py", { source: "build", specifiers: ["build"] }, "python").status).toBe("external");
   });
 
+  it("a package's __init__ importing its own submodule by absolute name keeps the submodule edge (django.conf)", async () => {
+    const r = await resolverFor({ "django/__init__.py": "", "django/conf/__init__.py": "", "django/conf/global_settings.py": "" });
+    const resolution = r.resolve(
+      "django/conf/__init__.py",
+      { source: "django.conf", specifiers: ["global_settings"], names: ["global_settings"] },
+      "python",
+    );
+    expect(resolution).toEqual({ status: "resolved", targets: [{ target: "django/conf/global_settings.py", bindings: ["global_settings"] }] });
+  });
+
+  it("a module inside a script-directory package imports a module next to that package (django scripts/)", async () => {
+    const r = await resolverFor({
+      "scripts/github.py": "",
+      "scripts/pr_limit/__init__.py": "",
+      "scripts/pr_limit/check_pr.py": "",
+      "src/pkg/__init__.py": "",
+      "src/pkg/core.py": "",
+    });
+    expect(targetOf(r.resolve("scripts/pr_limit/check_pr.py", { source: "github", specifiers: ["github"] }, "python"))).toBe(
+      "scripts/github.py",
+    );
+    // Not visible from a package whose base directory is elsewhere.
+    expect(r.resolve("src/pkg/core.py", { source: "github", specifiers: ["github"] }, "python").status).toBe("external");
+  });
+
   it("never produces a self-edge", async () => {
     const r = await resolverFor(files);
     const resolution = r.resolve(

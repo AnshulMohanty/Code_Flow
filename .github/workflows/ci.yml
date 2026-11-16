@@ -166,6 +166,47 @@ jobs:
             console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
             if (a.javacEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
 
+  # Python imports, scored against Python's own import machinery (importlib PathFinder; nothing from the
+  # repository is executed) on click, pinned.
+  python-accuracy:
+    name: Graph accuracy vs Python's import system (click)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone click at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/click"
+          git -C "$RUNNER_TEMP/click" fetch -q --depth 1 https://github.com/pallets/click.git e38188e9e205005d5af5f9e59df51904c984586a
+          git -C "$RUNNER_TEMP/click" checkout -q FETCH_HEAD
+
+      - name: Score against Python
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/click" --no-index --out "$RUNNER_TEMP/click.json"
+          node scripts/accuracy/python.mjs "$RUNNER_TEMP/click" "$RUNNER_TEMP/click.json" --json > "$RUNNER_TEMP/python-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/python-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
+            if (a.pythonInRepoEdges < 150 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
   # C/C++ includes, scored against clang 21 compiling every translation unit with the project's own
   # CMake flags (compile_commands.json), on libuv, pinned. Runs clang + cmake in a container.
   c-accuracy:

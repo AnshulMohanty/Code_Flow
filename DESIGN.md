@@ -195,6 +195,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | `go-accuracy` | Go vs `go list` on etcd (pinned SHA), precision = 1, recall ≥ 0.99, ≥ 1000 edges |
 | `c-accuracy` | C vs clang 21 with the project's CMake flags on libuv (pinned SHA), same thresholds |
 | `java-accuracy` | Java vs javac on jsoup (pinned SHA), same thresholds |
+| `python-accuracy` | Python vs the import system (`importlib` PathFinder) on click (pinned SHA), same thresholds, ≥ 150 edges |
 | `docker-smoke` | Builds and boots the stack, analyses a real repo end to end |
 | `codeql.yml`, `codeflow-impact.yml`, `eval-scored.yml` (manual, keys) | Static analysis; dogfood PR report; scored eval |
 
@@ -206,6 +207,7 @@ node scripts/graph-accuracy.mjs <repo> r.json        # TS/JS vs tsc
 node scripts/accuracy/go.mjs    <repo> r.json        # Go vs go list   (local go, else Docker golang image)
 node scripts/accuracy/java.mjs  <repo> r.json        # Java vs javac   (local JDK 17+, else Docker temurin)
 node scripts/accuracy/c.mjs     <repo> r.json [--cmake "-DX=OFF"]   # C/C++ vs clang 21 (Docker; CMake projects)
+node scripts/accuracy/python.mjs <repo> r.json      # Python vs importlib (local python3; nothing is executed)
 ```
 
 `--truth <file>` reuses a saved truth JSON; Go's `--gopath <import path>` scores a GOPATH-era repo.
@@ -296,17 +298,20 @@ Each language's graph is compared with **that language's own resolver**, edge by
 | Go | `go list -deps -test` per module + go/parser (`scripts/accuracy/go-truth.go`) | (file, import) → package directory |
 | Java | javac Compiler Tree API: every source name that resolves to an in-repo type (`scripts/accuracy/JavaTruth.java`) | file → file |
 | C/C++ | CMake `compile_commands.json` + clang 21 direct-per-file include reporting (`scripts/accuracy/c.mjs`) | file → included file |
+| Python | `ast` + `importlib.machinery.PathFinder`, segment by segment, from `src/`, the root, nested projects and the file's first non-package ancestor (`scripts/accuracy/python-truth.py`) | (file, import) → file |
 
 Results (2026-11-16) are in the README. Summary: TS/JS 100% precision, ≥99.76% recall (5 repos);
 Go 100% / 100% on Kubernetes (59,823 edges), Hugo, etcd, etcd v3.3 (GOPATH) and cobra; Java 100% / 100%
 on gson, commons-lang, jsoup, and ≥99.88% on JUnit 4 and Apache Ant (legacy layout); C/C++ 100% / 100%
-on libuv, leveldb, fmt and zlib.
+on libuv, leveldb, fmt and zlib; Python 100% / 100% on click, httpx and requests, 98.45% / 100% on
+flask and 99.97% / 100% on django (9,192 edges).
 
 Known truth-tool artifacts (not CodeFlow errors): Go "extra" edges are files behind build tags a default
 `go list` skips. Java: the truth compiles without third-party jars, so where a single-type import names a
 missing library class, javac falls back to a same-package class of the same name (JUnit 4, Ant's
 `MimeMailer`); Ant's test fixtures declare duplicate classes, and one javac task maps them all to the
-first copy. Python has no reference-resolver benchmark yet.
+first copy. Python: a test that edits `sys.path` at runtime (flask's conftest, one django test) makes
+imports work that no static truth sees — CodeFlow's "extra" edges there are real.
 
 ---
 
@@ -346,7 +351,7 @@ Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an I
 | Phase | Status | What is left |
 |---|---|---|
 | **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
-| **1. Languages** | **Go, Java and C/C++ done** (above). C# extractor + resolver drafted on branch `wip/csharp` (not built or measured) | C# (finish; truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`, `int main`). Follow §3.4. |
+| **1. Languages** | **Go, Java and C/C++ done**, Python now benchmarked too (above). Entry points also come from the code itself (`main-function` evidence: Go `func main` in `package main`, Java/C# `static void main`, C/C++/Rust `main`, Python `if __name__ == "__main__":`). C# extractor + resolver drafted on branch `wip/csharp` (not built or measured) | C# (finish; truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Follow §3.4. |
 | **2. Speed & scale** | **Done:** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); incremental analysis — a one-file change re-analyses Kubernetes in 7.8 s; graph identical throughout | Load test: harness built (`scripts/load-test.sh` + `.mjs`, `docker-compose.loadtest.yml`: 24 repos as PR bots, 20 browsing users, 1/2/4 workers). First run: 2 workers → 23/24 jobs in 27.9 s, API reads p95 ≤ 21 ms, 0 errors. **Not yet trustworthy**: `urfave/cli` fails every run (it analyses fine with the CLI, so the cause is the clone/worker path — the script now records each failed job's error), the files-analysed count read 0 (fixed: read from the result), and at 4 workers one `/api/result` request hung 205 s, which also stretched the computed throughput (fixed: 30 s request deadline, slow requests logged with timestamps, throughput from the jobs' own timeline). Re-run before quoting scaling numbers. Speculative prefetch is now opt-in (`SPECULATIVE_PREFETCH`); fan-out/best-of-N were already off. Still open: replace the hosted 25k-file cap with streaming. |
 | **3. Online beats Claude alone** | **Pilot done** (README table, 76 runs, $4.02). Impact questions: + CodeFlow takes half the turns at 40–46% lower cost with equal accuracy; direct questions: a tie. Tuned from the runs: MCP server instructions (CodeFlow adoption 2/4 → 8/8), `listLimit` (MCP gets full lists; the 25-item cap had sent the client searching). `find_usages` added. | Scale the benchmark to large repositories (Kubernetes: Go truth is package-level, so impact questions per package) and more questions per kind; repeat runs to report variance. Ask the owner before spending on it. |
 | **4. Real-problem checks** | **Done.** `codeflow-local tests` (test selection; proven by fault injection on CodeFlow's own suites: 32 faults, 193 failing test files, 0 missed, 80% of the analyzers suite skipped), `check` + `codeflow.rules.json` (CodeFlow's own layering, enforced in CI), `unused`, `impact --quiet` / the action's `quiet` input. History replay (`scripts/replay-history.mjs`): the last 50 commits each of zod, jsoup and Hugo — silent on all 150 (no false alarms); the replay also exposed and fixed a CLI bug (JSON output over 64 KB was cut off when stdout was a pipe) | Run the fault-injection proof on a third-party suite (needs the owner's OK to install and run it, e.g. in a container). Filing upstream issues for real findings is the owner's call. |

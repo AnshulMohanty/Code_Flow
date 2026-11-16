@@ -393,11 +393,15 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
   const resolvePyAbsolute = (fromFile: string, dotted: string): string | undefined => {
     const fromDir = dirname(fromFile);
     const notSelf = (list: string[] | undefined) => list?.filter((path) => path !== fromFile);
-    // Implicit sibling imports only exist for script directories (Python 3 has no implicit
-    // relative imports inside a package) — e.g. pytest test folders without __init__.py.
-    if (!isPackageDir(fromDir)) {
-      const sibling = pyModuleAt(joinPath(fromDir, dotted.replace(/\./g, "/")));
-      if (sibling && sibling !== fromFile) return sibling;
+    // The first directory at or above the file that is not a package is on sys.path when the code runs
+    // (the script's own directory; pytest's rootdir-less prepend mode; `python -m` from there). For a
+    // loose script that is its own directory — pytest folders without __init__.py; for a package it is
+    // the directory holding the package (django's scripts/pr_limit/check_pr.py imports scripts/github.py).
+    let baseDir = fromDir;
+    while (baseDir !== "" && isPackageDir(baseDir)) baseDir = dirname(baseDir);
+    if (!isPackageDir(baseDir)) {
+      const nearby = pyModuleAt(joinPath(baseDir, dotted.replace(/\./g, "/")));
+      if (nearby && nearby !== fromFile) return nearby;
     }
     const rooted = pickNearest(fromFile, notSelf(pyRootIndex.get(dotted)));
     if (rooted) return rooted;
@@ -427,6 +431,12 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
       moduleDir = base;
     } else {
       moduleFile = resolvePyAbsolute(fromFile, moduleName);
+      // A package's `__init__.py` importing ITSELF by name (`from django.conf import global_settings`
+      // inside django/conf/__init__.py): the self match is dropped above, but the import still reaches
+      // the package's SUBMODULES — the self edge is removed below, the submodule edges are real.
+      if (!moduleFile && spec.names && fromFile.endsWith("/__init__.py") && pyRootIndex.get(moduleName)?.includes(fromFile)) {
+        moduleFile = fromFile;
+      }
       if (moduleFile?.endsWith("__init__.py")) moduleDir = dirname(moduleFile);
     }
 

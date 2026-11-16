@@ -9,7 +9,7 @@
  * OUTPUT changes, which is not the same cadence as a release. `ANALYZER_VERSION` in the
  * environment still overrides it for ad-hoc cache namespacing.
  */
-export const ANALYZER_VERSION = "1.2.0";
+export const ANALYZER_VERSION = "1.3.0";
 
 export const DEFAULT_API_PORT = 4000;
 export const DEFAULT_WEB_PORT = 5173;

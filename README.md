@@ -31,7 +31,7 @@ with no key.
 
 | | What it gives you | Commands | Measured |
 |---|---|---|---|
-| **Map** | The resolved dependency and call graph of a repository: load-bearing files, cycles, communities, blast radius, entry points, files nothing uses | `analyze`, `unused` | Import graph vs each language's compiler on 19 repositories (TS/JS, Go, Java, C/C++): precision 100% on 18, 99.88% on the 19th; recall ≥ 99.5% — [tables](#measured-not-asserted-the-import-graph-vs-each-languages-own-toolchain) |
+| **Map** | The resolved dependency and call graph of a repository: load-bearing files, cycles, communities, blast radius, entry points, files nothing uses | `analyze`, `unused` | Import graph vs each language's own toolchain on 24 repositories (TS/JS, Go, Java, C/C++, Python): precision 100% on 21, ≥ 98.4% on the other 3 (every difference explained); recall ≥ 99.5% — [tables](#measured-not-asserted-the-import-graph-vs-each-languages-own-toolchain) |
 | **Check** | In CI, offline: what a change touches, which tests to run, architecture rules, wrong code references in a PR description — and a PR comment only when something needs a human | `impact`, `tests`, `check`, `verify`, the GitHub Action | Test selection by fault injection: 0 of 193 failures missed while skipping 80% of a suite — [details](#check-an-answer-or-a-pr) |
 | **Ask** | Give an agent (Claude Code, Cursor) the graph over MCP, so it asks instead of searching file by file | the MCP server | On "what is affected" questions: half the turns, 40–46% lower cost, same accuracy — [benchmark](#claude-code-alone-vs-claude-code--codeflow) |
 
@@ -164,7 +164,23 @@ Measured on 2026-11-16:
 Includes in `#if` branches a Linux build does not take (`uv/win.h`, `uv/os390.h`) are real edges the
 compiler never opens, so they are reported but not judged. CI runs the libuv check.
 
-Python imports are not benchmarked against a reference resolver yet.
+**Python**, against Python's own import machinery. `scripts/accuracy/python-truth.py` reads each file's
+imports with `ast` (nothing is executed) and locates every name with `importlib.machinery.PathFinder`,
+the finder `import` uses, segment by segment — from `src/`, the repository root, every nested project,
+and the first non-package directory above the file (what pytest and `python -m` put on the path).
+Measured on 2026-11-16:
+
+| Repository | In-repo imports (per Python) | CodeFlow-only | Missed | Precision | Recall |
+|---|---:|---:|---:|---:|---:|
+| django/django | 9,192 | 3 | 0 | 99.97% | 100% |
+| pallets/flask | 190 | 3 | 0 | 98.45% | 100% |
+| pallets/click | 171 | 0 | 0 | 100% | 100% |
+| encode/httpx | 122 | 0 | 0 | 100% | 100% |
+| psf/requests | 108 | 0 | 0 | 100% | 100% |
+
+The "CodeFlow-only" edges are imports that work because a test changes `sys.path` at runtime (flask's
+conftest prepends `tests/test_apps`; a django test inserts its own directory) — real, and invisible to
+any static truth. CI runs the click check.
 
 ---
 
@@ -183,7 +199,7 @@ Not everything here is the same kind of thing, and the difference matters more t
 | Community detection (Louvain) | **Real** | Seeded and canonically relabelled, so two runs of the same graph give the same partition. |
 | Citation grounding | **Real** | Structural — see above. Enforced at the point of production, and shared as one predicate between the app, the eval and the verifier harness. |
 | Hybrid retrieval (BM25 + vector → RRF → rerank → MMR) | **Real** | The refusal floor is compared against the vector arm's raw cosine, before fusion, so "I don't know" stays meaningful. |
-| File-role classification, entry-point detection | **Heuristic** | Pattern-based. Usually right, occasionally not, and never presented as more than a classification. |
+| File-role classification, entry-point detection | **Heuristic** | Pattern-based (paths, manifests, and a declared `main` in the code). Usually right, occasionally not, and never presented as more than a classification. |
 | "Test files that reach it" | **Heuristic** | Import reachability, **not** coverage. Labelled that way in the UI because there is no coverage data. |
 | AI summary, reading order, inferred domains | **Model output** | Grounded and labelled as inference wherever shown. The parser's structural roles sit on a different tab for exactly this reason. |
 | Specialist fan-out over communities, best-of-N | **Experimental** | Flag-gated (`FANOUT_SYNTHESIS`), off by default, and **unproven at real scale** — there is no measurement against a live model showing it produces better output than the single-shot stage. |
