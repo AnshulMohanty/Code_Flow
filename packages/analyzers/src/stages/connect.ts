@@ -1,5 +1,6 @@
 import { buildDependencyGraph } from "@codeflow/graph";
 import { createParserRegistry, extractCpgFacts, grammarsFor, isJavaScriptBundle, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
+import { C_FAMILY_EXTENSIONS } from "./cResolver.js";
 import { createModuleResolver, type GoUse, type ResolverLanguage } from "./moduleResolver.js";
 import type {
   CpgEdge,
@@ -211,7 +212,9 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
         //     a locally-declared name has no cross-file target and is skipped, never guessed.
         //     Go resolves by the NAME used (`store.Open` → the file declaring Open), and a bare
         //     name may live in another file of the same package — Go needs no import for that.
+        //     C/C++ has no import bindings: a plain call reaches the file DEFINING that function.
         const targetOf = (binding: string, symbol: string): string | undefined => {
+          if (language === "c") return symbol === binding ? resolver.samePackage(file.path, symbol) : undefined;
           if (language !== "go") return targetByBinding.get(binding);
           return targetBySymbol.get(symbol) ?? (symbol === binding ? resolver.samePackage(file.path, symbol) : undefined);
         };
@@ -315,6 +318,7 @@ function resolverLanguageOf(file: { language: string; ext: string }): ResolverLa
   if (file.language === "Python" || file.ext === ".py") return "python";
   if (file.ext === ".go") return "go";
   if (file.ext === ".java") return "java";
+  if (C_FAMILY_EXTENSIONS.has(file.ext)) return "c";
   return "js";
 }
 

@@ -4,10 +4,11 @@
 
 ### The codebase map that proves its answers.
 
-CodeFlow maps how a JavaScript, TypeScript, Python, Go or Java codebase fits together, answers
+CodeFlow maps how a JavaScript, TypeScript, Python, Go, Java or C/C++ codebase fits together, answers
 questions cited to real files and lines, and **checks the code references in anyone's answer** — an AI
 agent's, a PR description's, a reviewer's — against the repository. The graph is scored against each
-language's own toolchain (the TypeScript compiler, `go list`, javac); the checker runs offline, with no key.
+language's own toolchain (the TypeScript compiler, `go list`, javac, clang); the checker runs offline,
+with no key.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)
@@ -120,6 +121,22 @@ javac falls back to a same-named class in the file's own package; and Ant's test
 same class in several directories, which one javac run maps to the first copy. CI runs the jsoup check
 and fails below 100% precision / 99% recall.
 
+**C/C++**, against clang. `scripts/accuracy/c.mjs` has CMake write `compile_commands.json` — every
+file's real `-I`/`-D` flags — then compiles each translation unit with clang 21, which reports every
+file it opened and what each of its `#include`s resolved to (include-guarded re-includes too). CodeFlow
+never sees the build flags; it follows the compiler's search order from the repository alone.
+Measured on 2026-11-16:
+
+| Repository | Language | In-repo includes (per clang) | Wrong | Missed | Precision | Recall |
+|---|---|---:|---:|---:|---:|---:|
+| libuv/libuv | C | 510 | 0 | 0 | 100% | 100% |
+| google/leveldb | C++ | 310 | 0 | 0 | 100% | 100% |
+| fmtlib/fmt | C++ | 125 | 0 | 0 | 100% | 100% |
+| madler/zlib | C, legacy | 39 | 0 | 0 | 100% | 100% |
+
+Includes in `#if` branches a Linux build does not take (`uv/win.h`, `uv/os390.h`) are real edges the
+compiler never opens, so they are reported but not judged. CI runs the libuv check.
+
 Python imports are not benchmarked against a reference resolver yet.
 
 ---
@@ -130,7 +147,7 @@ Not everything here is the same kind of thing, and the difference matters more t
 
 | Capability | Kind | What that means |
 |---|---|---|
-| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports, Go modules (`replace`, `go.work`, nested modules, GOPATH-era repos), Java (imports, same-package types, on-demand and static imports, any source layout). Scored against tsc, `go list` and javac above. Committed JS bundles (webpack/browserify/Parcel) are left out rather than reported as hundreds of broken imports. |
+| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports, Go modules (`replace`, `go.work`, nested modules, GOPATH-era repos), Java (imports, same-package types, on-demand and static imports, any source layout), C/C++ (`#include` in the compiler's search order; calls reach the defining file). Scored against tsc, `go list`, javac and clang above. Committed JS bundles (webpack/browserify/Parcel) are left out rather than reported as hundreds of broken imports. |
 | Call graph, centrality, blast radius | **Real** | Computed from parsed source. Deterministic: same commit in, byte-identical numbers out. Key-file ranking counts production imports only, so heavily-tested files do not outrank load-bearing ones. |
 | Import cycles | **Real** | **Load-time** cycles only: `import type`, `if TYPE_CHECKING:`, imports inside function bodies and dynamic `import()` cannot cause an import-order failure and are excluded — on Zod, tRPC and Flask that is the difference between dozens of reported cycles and the true number, zero. |
 | Citation check of arbitrary text | **Real** | Does the file exist, are the cited lines inside it (physical line count), is the named symbol declared there? It proves a reference points at something real — not that the prose around it describes that code correctly. |
@@ -151,8 +168,8 @@ Not everything here is the same kind of thing, and the difference matters more t
 ## Honest limits
 
 - **Language coverage is narrower than "any codebase".** Deep support — symbols, call edges and a
-  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python, Go and Java**. C#,
-  C/C++, Rust and PHP are next; until then they get line counts only, so `find_references`, callers
+  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python, Go, Java and C/C++**.
+  C#, Rust and PHP are next; until then they get line counts only, so `find_references`, callers
   and blast radius return little of use on those repositories. The pipeline degrades gracefully; it
   does not pretend.
 - **The AI stages need your key.** No key means no summary and no Q&A. The map, the metrics, the

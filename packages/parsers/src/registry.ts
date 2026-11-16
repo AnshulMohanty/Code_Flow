@@ -3,6 +3,7 @@ import type { ParsedFile } from "@codeflow/shared-types";
 import { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
 import { grammarsFor } from "./language.js";
 import { genericParser } from "./parsers/genericParser.js";
+import { cParser, cppParser } from "./parsers/cFamilyParser.js";
 import { goParser } from "./parsers/goParser.js";
 import { javaParser } from "./parsers/javaParser.js";
 import { javascriptParser } from "./parsers/javascriptParser.js";
@@ -27,6 +28,8 @@ const DEFAULT_PARSERS = [
   createTreeSitterParser(pythonParser),
   createTreeSitterParser(goParser),
   createTreeSitterParser(javaParser),
+  createTreeSitterParser(cParser),
+  createTreeSitterParser(cppParser),
   genericParser,
 ];
 

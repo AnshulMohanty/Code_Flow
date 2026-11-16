@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -41,4 +42,16 @@ export async function readRepoFile(repoPath: string, relativePath: string): Prom
 function isMissing(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
   return code === "ENOENT" || code === "EISDIR" || code === "ENOTDIR" || code === "ELOOP";
+}
+
+/**
+ * The files git tracks in the clone (`git ls-files`), or null when that fails. Map-structure keeps a
+ * tracked file even when a .gitignore pattern matches it — a fresh clone holds only tracked files.
+ */
+export function gitTrackedFiles(repoPath: string): Promise<ReadonlySet<string> | null> {
+  return new Promise((resolve) => {
+    execFile("git", ["-C", repoPath, "ls-files", "-z"], { maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+      resolve(error ? null : new Set(stdout.split("\u0000").filter(Boolean)));
+    });
+  });
 }

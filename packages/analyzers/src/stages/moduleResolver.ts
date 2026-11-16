@@ -23,15 +23,18 @@
  *
  * Java: see `javaResolver.ts` — imports, same-package and fully qualified uses → the declaring file.
  *
+ * C/C++: see `cResolver.ts` — `#include` in the compiler's search order; calls reach the defining file.
+ *
  * Go: see `goResolver.ts` — import path → package directory (go.mod / replace / go.work, or an
  * inferred GOPATH prefix) → the files declaring the names the importer uses.
  */
 import { createGoResolver, type GoFileFacts, type GoResolver, type GoUse } from "./goResolver.js";
+import { C_FAMILY_EXTENSIONS, createCResolver, type CResolver } from "./cResolver.js";
 import { createJavaResolver, type ImplicitDependency, type JavaFileFacts, type JavaResolver } from "./javaResolver.js";
 
 export type { GoFileFacts, GoUse } from "./goResolver.js";
 export type { ImplicitDependency, JavaFileFacts } from "./javaResolver.js";
-export type ResolverLanguage = "js" | "python" | "go" | "java";
+export type ResolverLanguage = "js" | "python" | "go" | "java" | "c";
 /** What a resolver may need from each file's parse (Go: declarations; Java: types used and declared). */
 export type ResolverFileFacts = GoFileFacts & JavaFileFacts;
 
@@ -43,6 +46,8 @@ export interface ImportSpecLike {
   names?: string[];
   /** Java `import static`. */
   isStatic?: boolean;
+  /** C/C++ `#include <x>`. */
+  system?: boolean;
 }
 
 export interface ResolvedTarget {
@@ -61,7 +66,10 @@ export type ImportResolution =
 export interface ModuleResolver {
   /** `uses` (Go only): the file's `x.Y` references and bare calls, so the edge reaches the declaring file. */
   resolve(fromFile: string, spec: ImportSpecLike, language: ResolverLanguage, uses?: readonly GoUse[]): ImportResolution;
-  /** Go: the file of `fromFile`'s own package declaring `name`. Undefined for other languages. */
+  /**
+   * A name reachable WITHOUT an import: Go — the file of `fromFile`'s own package declaring it;
+   * C/C++ — the file defining that (non-static) function. Undefined for other languages.
+   */
   samePackage(fromFile: string, name: string): string | undefined;
   /** Dependencies the source creates with no import statement (Java: same package, fully qualified). */
   implicit(fromFile: string, language: ResolverLanguage): ImplicitDependency[];
@@ -455,16 +463,23 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
     ? createJavaResolver({ files: input.files, facts: input.facts ?? new Map() })
     : undefined;
 
+  const cFamily: CResolver | undefined = input.files.some((path) => C_FAMILY_EXTENSIONS.has(extensionOf(path)))
+    ? createCResolver({ files: input.files, facts: input.facts ?? new Map() })
+    : undefined;
+
   return {
     implicit(fromFile, language) {
       return language === "java" && java ? java.implicit(fromFile) : [];
     },
     samePackage(fromFile, name) {
-      return fromFile.endsWith(".go") ? go?.samePackage(fromFile, name) : undefined;
+      if (fromFile.endsWith(".go")) return go?.samePackage(fromFile, name);
+      if (C_FAMILY_EXTENSIONS.has(extensionOf(fromFile))) return cFamily?.definitionOf(fromFile, name);
+      return undefined;
     },
     resolve(fromFile, spec, language, uses) {
       if (language === "go") return go ? go.resolve(fromFile, spec, uses ?? []) : { status: "external" };
       if (language === "java") return java ? java.resolve(fromFile, spec) : { status: "external" };
+      if (language === "c") return cFamily ? cFamily.resolve(fromFile, spec) : { status: "external" };
       if (language === "python") return resolvePython(fromFile, spec);
       const resolution = resolveJs(fromFile, spec.source);
       if (resolution.status === "resolved") {
@@ -606,6 +621,12 @@ function dirname(path: string): string {
 function basename(path: string): string {
   const slash = path.lastIndexOf("/");
   return slash === -1 ? path : path.slice(slash + 1);
+}
+
+function extensionOf(path: string): string {
+  const base = basename(path);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot).toLowerCase() : "";
 }
 
 function extname(path: string): string {

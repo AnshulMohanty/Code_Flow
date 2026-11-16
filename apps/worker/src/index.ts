@@ -22,7 +22,7 @@ import { createMongoCacheHandle, createMongoEventLogStore, createMongoWorkerAnal
 import { runAnalysisJob } from "./processors/pipelineJobProcessor.js";
 import { createGitRepoCloner } from "./services/gitRepoCloner.js";
 import { createBullmqProgressPublisher } from "./services/progressPublisher.js";
-import { readRepoFile } from "./services/repoFileReader.js";
+import { gitTrackedFiles, readRepoFile } from "./services/repoFileReader.js";
 import { readRepoDir } from "./services/repoDirectoryWalker.js";
 import { measureRepoSize } from "./services/measureRepoSize.js";
 import { cleanupRepoPath } from "./services/publicRepoCloneService.js";
@@ -278,6 +278,7 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
           publisher: createBullmqProgressPublisher(job),
           readFile: readRepoFile,
           readDir: readRepoDir,
+          trackedFiles: gitTrackedFiles,
           measureRepoSize,
           cleanupRepo: cleanupRepoPath,
           ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),

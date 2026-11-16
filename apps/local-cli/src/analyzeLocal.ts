@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -103,6 +104,15 @@ async function readRepoFile(repoPath: string, relativePath: string): Promise<str
   } catch {
     return null;
   }
+}
+
+/** The files git tracks in `repoPath`, or null when it is not a git checkout (or git is missing). */
+function gitTrackedFiles(repoPath: string): Promise<ReadonlySet<string> | null> {
+  return new Promise((resolve) => {
+    execFile("git", ["-C", repoPath, "ls-files", "-z"], { maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+      resolve(error ? null : new Set(stdout.split("\u0000").filter(Boolean)));
+    });
+  });
 }
 
 /** List the immediate children of a repo-relative directory, in the shape Map-structure wants. */
@@ -214,7 +224,7 @@ export async function analyzeLocal(options: LocalAnalysisOptions): Promise<Local
       },
     },
     createOrientStage({ readFile: readRepoFile, now }),
-    createMapStructureStage({ readDir: readRepoDir, readFile: readRepoFile, now }),
+    createMapStructureStage({ readDir: readRepoDir, readFile: readRepoFile, trackedFiles: gitTrackedFiles, now }),
     createInventoryStage({ readFile: readRepoFile, now }),
     createConnectStage({ readFile: readRepoFile, now }),
     createAnalyzeStage({ now }),

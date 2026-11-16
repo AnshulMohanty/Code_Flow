@@ -130,6 +130,18 @@ describe("map-structure — ignores", () => {
     expect(structure.files.map((f) => f.path)).toEqual(["pkg/test/coverage/coverage.go", "tools/build/build.go"]);
   });
 
+  it("never drops a file git TRACKS, even when .gitignore matches it (zlib's committed zconf.h)", async () => {
+    const tree = makeTree({ "zconf.h": 1, "zlib.h": 1, "build/out.o": 1, "gen/keep.c": 1, "gen/tmp.c": 1 }, "/zconf.h\ngen/\n");
+    const stage = createMapStructureStage({
+      readDir: tree.readDir,
+      readFile: tree.readFile,
+      trackedFiles: async () => new Set(["zconf.h", "zlib.h", "gen/keep.c"]),
+      now: () => 0,
+    });
+    const { partial } = await stage.run(input, ctx());
+    expect(partial.structure!.files.map((f) => f.path)).toEqual(["gen/keep.c", "zconf.h", "zlib.h"]);
+  });
+
   it("respects .gitignore patterns (glob, dir, negation)", async () => {
     const structure = await mapStructure(
       {

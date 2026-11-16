@@ -50,6 +50,8 @@ export interface PipelineJobDependencies {
   readFile: (repoPath: string, relativePath: string) => Promise<string | null>;
   /** Lists immediate children of a repo-relative dir for Map-structure's tree walk. */
   readDir: (repoPath: string, relativeDir: string) => Promise<WalkEntry[]>;
+  /** `git ls-files` of the clone: a tracked file is never dropped by a .gitignore pattern. */
+  trackedFiles?: (repoPath: string) => Promise<ReadonlySet<string> | null>;
   /** Guard 1 — measures the cloned tree so Ingest can enforce the repo-size cap. */
   measureRepoSize?: (repoPath: string) => Promise<{ fileCount: number; totalBytes: number }>;
   /** Guard 5 — global daily LLM-spend ceiling, passed to the AI stages via ctx.budget. */
@@ -279,7 +281,12 @@ export async function runAnalysisJob(
     const stages: PipelineStage[] = [
       createIngestStage({ cloner, measureRepoSize: deps.measureRepoSize, now }),
       createOrientStage({ readFile: deps.readFile, now }),
-      createMapStructureStage({ readDir: deps.readDir, readFile: deps.readFile, now }),
+      createMapStructureStage({
+        readDir: deps.readDir,
+        readFile: deps.readFile,
+        ...(deps.trackedFiles ? { trackedFiles: deps.trackedFiles } : {}),
+        now,
+      }),
       createInventoryStage({ readFile: deps.readFile, now }),
       createConnectStage({ readFile: deps.readFile, now }),
       createAnalyzeStage({ now }),

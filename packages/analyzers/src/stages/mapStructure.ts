@@ -28,6 +28,12 @@ export interface MapStructureDependencies {
   readDir(repoPath: string, relativeDir: string): Promise<WalkEntry[]>;
   readFile(repoPath: string, relativePath: string): Promise<string | null>;
   now?: () => number;
+  /**
+   * The files git tracks (`git ls-files`), or null when the tree is not a git checkout. `.gitignore`
+   * only governs UNTRACKED files: a committed file matching a pattern is still part of the repository
+   * (zlib commits `zconf.h` while ignoring `/zconf.h`), so a tracked file is never dropped.
+   */
+  trackedFiles?(repoPath: string): Promise<ReadonlySet<string> | null>;
 }
 
 // Directory names we never descend into or classify (build output, vendored deps, VCS,
@@ -86,7 +92,8 @@ export function createMapStructureStage(deps: MapStructureDependencies): Pipelin
       }
 
       const ignoreRules = parseGitignore(await deps.readFile(repoPath, ".gitignore"));
-      const files = await walk(repoPath, deps.readDir, ignoreRules);
+      const tracked = (await deps.trackedFiles?.(repoPath)) ?? null;
+      const files = await walk(repoPath, deps.readDir, ignoreRules, tracked);
       files.sort((a, b) => a.path.localeCompare(b.path)); // deterministic order
 
       const layout = detectLayout(files);
@@ -128,25 +135,34 @@ async function walk(
   repoPath: string,
   readDir: MapStructureDependencies["readDir"],
   ignoreRules: IgnoreRule[],
+  tracked: ReadonlySet<string> | null,
 ): Promise<RepoFile[]> {
   const files: RepoFile[] = [];
+  const trackedDirs = new Set<string>();
+  for (const path of tracked ?? []) {
+    for (let slash = path.lastIndexOf("/"); slash > 0; slash = path.lastIndexOf("/", slash - 1)) trackedDirs.add(path.slice(0, slash));
+  }
 
-  async function descend(relativeDir: string, listed?: WalkEntry[]): Promise<void> {
+  // `ignoredAbove`: an ancestor directory matched .gitignore and was entered only because it holds
+  // tracked files — inside it, only tracked files are kept.
+  async function descend(relativeDir: string, listed?: WalkEntry[], ignoredAbove = false): Promise<void> {
     const entries = listed ?? (await readDir(repoPath, relativeDir));
     for (const entry of entries) {
       if (entry.type === "dir") {
         if (HARD_IGNORE_DIRS.has(entry.name)) continue;
-        if (isIgnored(entry.path, true, ignoreRules)) continue;
+        const ignored = ignoredAbove || isIgnored(entry.path, true, ignoreRules);
+        if (ignored && !trackedDirs.has(entry.path)) continue;
         if (SOFT_IGNORE_DIRS.has(entry.name)) {
           const children = await readDir(repoPath, entry.path);
           if (!children.some((child) => child.type === "file" && child.name.endsWith(".go"))) continue;
-          await descend(entry.path, children);
+          await descend(entry.path, children, ignored);
           continue;
         }
-        await descend(entry.path);
+        await descend(entry.path, undefined, ignored);
         continue;
       }
-      if (isIgnored(entry.path, false, ignoreRules)) continue;
+      const ignored = ignoredAbove || isIgnored(entry.path, false, ignoreRules);
+      if (ignored && !tracked?.has(entry.path)) continue;
       const ext = extensionOf(entry.name);
       files.push({
         path: entry.path,
@@ -196,7 +212,8 @@ const DOC_EXTS = new Set([".md", ".mdx", ".rst", ".adoc"]);
 const SOURCE_EXTS = new Set([
   ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".py", ".go", ".rs", ".java", ".kt", ".kts", ".rb", ".php",
-  ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".swift", ".scala",
+  ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".ipp", ".inl", ".tcc",
+  ".cs", ".swift", ".scala",
   ".m", ".mm", ".vue", ".svelte", ".sh", ".bash", ".sql", ".r", ".lua", ".dart",
   ".ex", ".exs", ".clj", ".hs", ".ml", ".pl",
 ]);
@@ -265,7 +282,8 @@ const LANGUAGE_BY_EXT: Record<string, string> = {
   ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
   ".py": "Python", ".go": "Go", ".rs": "Rust", ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin",
   ".rb": "Ruby", ".php": "PHP", ".cs": "C#", ".swift": "Swift", ".scala": "Scala",
-  ".c": "C", ".h": "C", ".cc": "C++", ".cpp": "C++", ".cxx": "C++", ".hpp": "C++",
+  ".c": "C", ".h": "C", ".cc": "C++", ".cpp": "C++", ".cxx": "C++", ".c++": "C++", ".hpp": "C++",
+  ".hh": "C++", ".hxx": "C++", ".h++": "C++", ".ipp": "C++", ".inl": "C++", ".tcc": "C++",
   ".vue": "Vue", ".svelte": "Svelte", ".sh": "Shell", ".bash": "Shell", ".sql": "SQL",
   ".md": "Markdown", ".mdx": "Markdown", ".rst": "reStructuredText",
   ".json": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML", ".html": "HTML", ".css": "CSS",

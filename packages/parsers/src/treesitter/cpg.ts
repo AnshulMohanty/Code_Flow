@@ -8,12 +8,14 @@ import {
   parseStaticImportLine,
   scanGoImports,
   scanJavaImports,
+  scanCIncludes,
   splitAliasSegments,
 } from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { calleeName, calleeTail, field, namedChildrenOf, parseableSource, startLine, stringValue } from "./ast.js";
 import { extractGoFacts } from "./go.js";
+import { extractCFamilyFacts } from "./cfamily.js";
 import { extractJavaFacts } from "./java.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
@@ -43,6 +45,8 @@ export interface CpgImport {
   lazy?: boolean;
   /** Java `import static`. */
   isStatic?: boolean;
+  /** C/C++ `#include <x>`: searched only on the include path, never the including file's directory. */
+  system?: boolean;
 }
 
 /** A call site, recorded by the ROOT local binding it goes through. */
@@ -158,6 +162,7 @@ export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): C
           if (lang === "python") return pythonFacts(tree);
           if (lang === "go") return goFacts(tree);
           if (lang === "java") return javaFacts(tree);
+          if (lang === "c" || lang === "cpp") return cFamilyFacts(tree, input.content);
           return jsLikeFacts(tree);
         } finally {
           tree.delete();
@@ -583,6 +588,42 @@ function javaFacts(tree: Tree): CpgFacts {
   };
 }
 
+// ── C / C++ ───────────────────────────────────────────────────────────────────────────
+
+function cFamilyFacts(tree: Tree, content: string): CpgFacts {
+  const extract = extractCFamilyFacts(tree);
+  // `#include` is a line-level preprocessor directive, and the C++ grammar can lose its place in a
+  // preprocessor condition (`#if FMT_HAS_INCLUDE(<version>)` reads `<version>` as a template argument
+  // and swallows the next includes — fmt's format-test.cc). The line scan is the backstop; a line the
+  // tree places inside a comment is not an include.
+  const seen = new Set(extract.includes.map((entry) => entry.line));
+  for (const entry of scanCIncludes(content)) {
+    if (seen.has(entry.line)) continue;
+    const text = content.split(/\r\n|\r|\n/, entry.line)[entry.line - 1] ?? "";
+    const node = tree.rootNode.descendantForPosition({ row: entry.line - 1, column: Math.max(0, text.indexOf("#")) });
+    if (node?.type === "comment") continue;
+    extract.includes.push(entry);
+  }
+  extract.includes.sort((a, b) => a.line - b.line);
+  return {
+    imports: extract.includes.map((entry) => ({
+      source: entry.path,
+      specifiers: [],
+      kind: "import" as const,
+      line: entry.line,
+      ...(entry.system ? { system: true } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: [],
+    engine: TREE_SITTER_PARSER_VERSION,
+    // Non-static function DEFINITIONS: C's one flat namespace, what a call by name can reach.
+    declarations: extract.functions
+      .filter((fn) => !fn.isStatic && !fn.qualifiedName.includes("::"))
+      .map((fn) => ({ name: fn.name, line: fn.line })),
+  };
+}
+
 // ── Regex fallback (imports + re-exports only) ────────────────────────────────────────
 
 /**
@@ -593,6 +634,12 @@ function javaFacts(tree: Tree): CpgFacts {
  */
 function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFacts {
   const facts: CpgFacts = { imports: [], calls: [], inheritance: [], routes: [], engine: PARSER_VERSION };
+  if (language === "c" || language === "cpp") {
+    for (const entry of scanCIncludes(input.content)) {
+      facts.imports.push({ source: entry.path, specifiers: [], kind: "import", line: entry.line, ...(entry.system ? { system: true } : {}) });
+    }
+    return facts;
+  }
   if (language === "java") {
     for (const entry of scanJavaImports(input.content)) {
       facts.imports.push({

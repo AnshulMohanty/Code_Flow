@@ -25,6 +25,8 @@ const LANG_BY_EXT: Record<string, string> = {
   ".py": "Python",
   ".go": "Go",
   ".java": "Java",
+  ".c": "C",
+  ".h": "C",
   ".json": "JSON",
   ".md": "Markdown",
 };
@@ -460,5 +462,25 @@ describe("connect — Java", () => {
     expect(graph.resolution.externalModules).toEqual(["java.util.List"]);
     const calls = graph.cpgEdges!.map(({ from, to, symbol }) => [from.split("/").pop(), to.split("/").pop(), symbol]);
     expect(calls).toEqual(expect.arrayContaining([["App.java", "Strings.java", "Strings.trim"]]));
+  });
+});
+
+describe("connect — C", () => {
+  it("includes follow the compiler's search order; calls reach the defining file", async () => {
+    const graph = await connect([
+      { path: "include/lib.h", content: "#pragma once\nint parse(const char *s);\n" },
+      { path: "src/parse.c", content: '#include "lib.h"\nint parse(const char *s) { return 0; }\n' },
+      { path: "src/main.c", content: '#include <stdio.h>\n#include "lib.h"\n#include "config.h"\nint main(void) { return parse("x"); }\n' },
+    ]);
+    expect(graph.edges.map(({ from, to }) => [from, to])).toEqual(
+      expect.arrayContaining([
+        ["src/parse.c", "include/lib.h"],
+        ["src/main.c", "include/lib.h"],
+      ]),
+    );
+    expect(graph.edges).toHaveLength(2);
+    expect(graph.resolution.externalModules).toEqual(["config.h", "stdio.h"]);
+    const calls = graph.cpgEdges!.map(({ from, to, symbol }) => [from, to, symbol]);
+    expect(calls).toEqual([["src/main.c", "src/parse.c", "parse"]]);
   });
 });

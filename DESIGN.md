@@ -57,7 +57,7 @@ repo-relative POSIX path. Cycles count **load-time** edges only: `typeOnly`, `la
 function, and every Java import — the JVM loads classes on first use) and dynamic imports are excluded.
 
 **Parsing** (`packages/parsers`). tree-sitter WASM (`web-tree-sitter` + `@vscode/tree-sitter-wasm`) for
-JavaScript, JSX, TypeScript, TSX, Python, Go and Java. Grammars load **per language, on demand**: a
+JavaScript, JSX, TypeScript, TSX, Python, Go, Java and C/C++ (C uses the C++ grammar). Grammars load **per language, on demand**: a
 pipeline asks only for the languages its files need (`grammarsFor`), because grammars range from 0.2 MB
 (Go) to 5.4 MB (C++). A regex parser per language takes over when a grammar fails, when a file is over
 `TREE_SITTER_MAX_BYTES` (2 MB of characters), or when a parse returns null. Raw NUL bytes are replaced by
@@ -76,6 +76,7 @@ their `require("./_x")` calls address the bundle's own module table.
 | Python | relative + absolute, src layouts, submodule imports | `moduleResolver.ts` |
 | Go | import path → package dir via `go.mod`, local `replace`, `go.work`, nested modules; GOPATH-era repos get their checkout prefix **inferred** from their own imports (one winner, ≥2 votes); the edge targets the file declaring the name used (`store.Open`) | `goResolver.ts` |
 | Java | javac's order: own types → single-type imports → **same package (no import)** → on-demand imports; fully qualified uses; indexed by declared `package`, not path (Maven, Gradle, Ant, flat) | `javaResolver.ts` |
+| C/C++ | compiler order: `"x"` beside the includer → ancestors and `include/` dirs (standing in for `-I`) → a path suffix (never for a bare `<x.h>`, which is a system header). Missing `"x.h"` ⇒ external (usually generated). A call reaches the file defining that function. Includes come from the tree **and** a line scan, because the grammar can lose its place in a preprocessor condition | `cResolver.ts` |
 
 **Grounding (enforced in code).** (1) A reading-order step must name a real graph node or it is dropped
 (`stages/synthesize.ts`). (2) A RAG chunk's line range must lie inside its file (`stages/rag.ts`).
@@ -126,6 +127,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | Import accuracy is scored against each language's **own toolchain**, in CI | The resolver once missed 102 of 543 of this repo's imports while every test passed | §4, `.github/workflows/ci.yml` |
 | Resolve to the **declaring file**, not the package (Go, Java) | "What breaks if this file changes" must answer at file granularity | `goResolver.ts`, `javaResolver.ts` |
 | Java imports are `lazy` (no load-time cycles) | Java class cycles are legal; flagging them would be noise in every PR | `parsers/src/treesitter/cpg.ts` |
+| `.gitignore` never drops a file git TRACKS (`git ls-files`) | It only governs untracked files; zlib commits its gitignored `zconf.h` | `mapStructure.ts`, both apps' `gitTrackedFiles` |
 | Go same-package references are call edges, not import edges | Go forbids package cycles; file-level same-package edges would invent cycles | `connect.ts` |
 | Grammars load per language, on demand | 25× size spread; a Go repo must not pay for C++ | `parsers/src/treesitter/runtime.ts` |
 | Louvain is seeded (xorshift32, seed 1, sorted ids, canonical relabel) | Plain Louvain gives a different partition each run | `packages/graph/src/communities.ts` |
@@ -153,7 +155,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | Date | Change |
 |---|---|
 | 2026-11-16 | Import resolver rewritten and scored against tsc (0% → 100% of Zod's `.js`→`.ts` imports). Docker worker fixed (it exited on boot; jobs stayed queued). Load-time-only cycles. Tests parsed. Entry points filled. `verify`, `impact`, `verify_citations`, GitHub Action. (PR #4) |
-| 2026-11-16 | Go (scored vs `go list`), Java (scored vs javac), lazy grammars, two-pass connect, bundle skipping, NUL handling. Symlink containment in both file readers; `TRUST_PROXY_HOPS`. TypeScript 6: `baseUrl` removed, every tsconfig `paths` made config-relative. Upstream `legacy/`, `card/` and their tests removed; the old docs folded into this file. Dead clone-time discovery code (and its no-op `CODEFLOW_MAX_FILES`) removed. `ANALYZER_VERSION` 1.2.0. |
+| 2026-11-16 | Go (scored vs `go list`), Java (scored vs javac), C/C++ (scored vs clang), tracked files never dropped by `.gitignore`, lazy grammars, two-pass connect, bundle skipping, NUL handling. Symlink containment in both file readers; `TRUST_PROXY_HOPS`. TypeScript 6: `baseUrl` removed, every tsconfig `paths` made config-relative. Upstream `legacy/`, `card/` and their tests removed; the old docs folded into this file. Dead clone-time discovery code (and its no-op `CODEFLOW_MAX_FILES`) removed. `ANALYZER_VERSION` 1.2.0. |
 
 ---
 
@@ -176,6 +178,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | repo hygiene | No raw control bytes in source |
 | graph accuracy vs tsc (self) | TS/JS precision = 1, recall ≥ 0.99 on this repo |
 | `go-accuracy` | Go vs `go list` on etcd (pinned SHA), precision = 1, recall ≥ 0.99, ≥ 1000 edges |
+| `c-accuracy` | C vs clang 21 with the project's CMake flags on libuv (pinned SHA), same thresholds |
 | `java-accuracy` | Java vs javac on jsoup (pinned SHA), same thresholds |
 | `docker-smoke` | Builds and boots the stack, analyses a real repo end to end |
 | `codeql.yml`, `codeflow-impact.yml`, `eval-scored.yml` (manual, keys) | Static analysis; dogfood PR report; scored eval |
@@ -187,6 +190,7 @@ node apps/local-cli/dist/index.js analyze <repo> --no-index --out r.json
 node scripts/graph-accuracy.mjs <repo> r.json        # TS/JS vs tsc
 node scripts/accuracy/go.mjs    <repo> r.json        # Go vs go list   (local go, else Docker golang image)
 node scripts/accuracy/java.mjs  <repo> r.json        # Java vs javac   (local JDK 17+, else Docker temurin)
+node scripts/accuracy/c.mjs     <repo> r.json [--cmake "-DX=OFF"]   # C/C++ vs clang 21 (Docker; CMake projects)
 ```
 
 `--truth <file>` reuses a saved truth JSON; Go's `--gopath <import path>` scores a GOPATH-era repo.
@@ -276,10 +280,12 @@ Each language's graph is compared with **that language's own resolver**, edge by
 | TS/JS | `ts.resolveModuleName` under the nearest tsconfig (`scripts/graph-accuracy.mjs`) | (file, specifier) → file |
 | Go | `go list -deps -test` per module + go/parser (`scripts/accuracy/go-truth.go`) | (file, import) → package directory |
 | Java | javac Compiler Tree API: every source name that resolves to an in-repo type (`scripts/accuracy/JavaTruth.java`) | file → file |
+| C/C++ | CMake `compile_commands.json` + clang 21 direct-per-file include reporting (`scripts/accuracy/c.mjs`) | file → included file |
 
 Results (2026-11-16) are in the README. Summary: TS/JS 100% precision, ≥99.76% recall (5 repos);
 Go 100% / 100% on Kubernetes (59,823 edges), Hugo, etcd, etcd v3.3 (GOPATH) and cobra; Java 100% / 100%
-on gson, commons-lang, jsoup, and ≥99.88% on JUnit 4 and Apache Ant (legacy layout).
+on gson, commons-lang, jsoup, and ≥99.88% on JUnit 4 and Apache Ant (legacy layout); C/C++ 100% / 100%
+on libuv, leveldb, fmt and zlib.
 
 Known truth-tool artifacts (not CodeFlow errors): Go "extra" edges are files behind build tags a default
 `go list` skips. Java: the truth compiles without third-party jars, so where a single-type import names a
@@ -325,7 +331,7 @@ Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an I
 | Phase | Status | What is left |
 |---|---|---|
 | **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
-| **1. Languages** | **Go done, Java done** (above) | C/C++ (truth: the compiler's include list, `clang -MM` / `compile_commands.json`), C# (truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`). Follow §3.4. |
+| **1. Languages** | **Go, Java and C/C++ done** (above) | C# (truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`, `int main`). Follow §3.4. |
 | **2. Speed & scale** | Baseline measured: Kubernetes (26,558 files) analyses in 34 s with **1.95 GB peak memory** | Incremental analysis (per-file facts cached by content hash); cut peak memory; replace the hard 25k-file cap with streaming; load-test harness on the Docker stack (simulated users asking, bots opening PRs, large repos in parallel) reporting p50/p95/p99, throughput, queue wait, memory; scale 1 → 2 → 4 workers; prove or switch off arena / best-of-N / speculative prefetch |
 | **3. Online beats Claude alone** | — | MCP tools tuned for agents; function-level chunks; benchmark Claude alone vs Claude + CodeFlow (5 big repos × 20 questions: time, tokens, tool calls, wrong citations) |
 | **4. Real-problem checks** | `impact` exists | Test selection proven on real commit history; architecture rules file in CI; dead-code report; quiet PR comment; replay OSS PR history and file real issues |

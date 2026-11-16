@@ -243,3 +243,21 @@ export function scanJavaImports(content: string): JavaImportLine[] {
   });
   return out;
 }
+
+/** C/C++ `#include` lines — the fallback when the grammar is unavailable. */
+export interface CIncludeLine {
+  path: string;
+  system: boolean;
+  line: number;
+}
+
+const C_INCLUDE = /^\s*#\s*include\s*([<"])([^>"\n]+)[>"]/;
+
+export function scanCIncludes(content: string): CIncludeLine[] {
+  const out: CIncludeLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = C_INCLUDE.exec(text);
+    if (match) out.push({ path: match[2].trim(), system: match[1] === "<", line: index + 1 });
+  });
+  return out;
+}

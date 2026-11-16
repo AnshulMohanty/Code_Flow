@@ -7,6 +7,7 @@ import { TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
 import { parseableSource } from "./ast.js";
+import { extractCFamily } from "./cfamily.js";
 import { extractGo } from "./go.js";
 import { extractJava } from "./java.js";
 import { extractJsLike } from "./jsLike.js";
@@ -37,6 +38,7 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
     if (language === "python") return pythonParsedFile(tree, input);
     if (language === "go") return goParsedFile(tree, input);
     if (language === "java") return typedParsedFile(tree, input, "java", extractJava);
+    if (language === "c" || language === "cpp") return typedParsedFile(tree, input, language, extractCFamily);
     return jsLikeParsedFile(tree, input, language);
   } finally {
     // The tree lives in the wasm heap — releasing it is not optional on a big repo.

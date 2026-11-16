@@ -160,6 +160,43 @@ jobs:
             console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
             if (a.javacEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
 
+  # C/C++ includes, scored against clang 21 compiling every translation unit with the project's own
+  # CMake flags (compile_commands.json), on libuv, pinned. Runs clang + cmake in a container.
+  c-accuracy:
+    name: Graph accuracy vs clang (libuv)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone libuv at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/libuv"
+          git -C "$RUNNER_TEMP/libuv" fetch -q --depth 1 https://github.com/libuv/libuv.git ded7ccfc8a92912983ff7bd38a345c5bd0430291
+          git -C "$RUNNER_TEMP/libuv" checkout -q FETCH_HEAD
+
+      - name: Score against clang
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/libuv" --no-index --out "$RUNNER_TEMP/libuv.json"
+          node scripts/accuracy/c.mjs "$RUNNER_TEMP/libuv" "$RUNNER_TEMP/libuv.json" --json > "$RUNNER_TEMP/c-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/c-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.clangInRepoIncludes < 400 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
   # Builds the three images AND runs a real analysis through the composed stack. Building alone
   # was green while the worker exited 0 on boot and no job was ever consumed. Clones one small
   # public repository; no secrets (the AI stages run against a placeholder key and must degrade).
