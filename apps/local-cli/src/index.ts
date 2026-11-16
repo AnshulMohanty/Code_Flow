@@ -408,37 +408,12 @@ async function main(): Promise<number> {
 }
 
 /**
- * Run only when INVOKED, not when imported.
+ * Run only when invoked, not when imported (a test importing `parseArgs` must not run `main()`).
  *
- * Without this guard, a test importing `parseArgs` from here would execute `main()` as a side effect
- * of the import — which is exactly what happened the first time, and it surfaced as
- * "process.exit unexpectedly called with 1" rather than as anything that named the cause.
- *
- * THE SEPARATOR IS NORMALISED FIRST, and that is not a nicety. `process.argv[1]` uses the PLATFORM
- * separator, so on Windows this path is delimited by backslashes — and the original pattern's
- * character class matched only a forward slash. The guard was therefore ALWAYS FALSE on Windows, and
- * `codeflow-local` exited 0 with NO OUTPUT on every Windows machine: not an error, not a usage
- * message, nothing. A silent no-op is the worst way for an entrypoint guard to fail, because nothing
- * looks wrong — and it is invisible to a POSIX-only CI.
- *
- * THE FIRST FIX FOR THAT WAS ITSELF PLATFORM-DEPENDENT, which is the more interesting bug. It split on
- * `path.sep`, and `path.sep` describes the HOST, not the string: on Linux it is "/", so a Windows-style
- * argv path passed straight through with its backslashes intact. The result was a normaliser that
- * worked only where normalisation was already unnecessary — green on a Windows laptop, red on the
- * Linux CI runner. The normalisation is now unconditional (see `normalizeEntryPath`), so the guard
- * reads the string it was given instead of inferring anything from the platform underneath it.
- *
- * Built with `new RegExp` over a normalised path rather than a literal, so the pattern needs no
- * escape sequences at all and cannot regress into the same class of bug.
- *
- * THREE ENTRYPOINTS, because there are three ways this file legitimately becomes `argv[1]`:
- *   - `src/index.ts`   — `pnpm dev:local`, via tsx
- *   - `dist/index.js`  — the tsc output, inside the workspace
- *   - `codeflow-local.mjs` — the PUBLISHED bundle, which is what `npx codeflow-local` runs
- *
- * The third was missed on the first pass and the symptom was identical to the Windows bug above:
- * the bundle ran, matched nothing, and exited 0 in silence. Anything narrower than this ships a CLI
- * that works everywhere except where users actually run it.
+ * `argv[1]` is normalised to forward slashes unconditionally (`normalizeEntryPath`): matching only "/"
+ * made the guard always false on Windows, and splitting on `path.sep` describes the host, not the
+ * string. Either way the CLI exited 0 with no output. Three files can be `argv[1]`: `src/index.ts`
+ * (tsx), `dist/index.js` (tsc) and the published `codeflow-local.mjs` bundle that `npx` runs.
  */
 const ENTRY_PATTERN = new RegExp("(?:local-cli/(?:dist|src)/index[.](?:js|ts)|codeflow-local(?:[.]mjs)?)$");
 

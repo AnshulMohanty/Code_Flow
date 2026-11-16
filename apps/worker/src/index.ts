@@ -280,6 +280,8 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
           readDir: readRepoDir,
           trackedFiles: gitTrackedFiles,
           measureRepoSize,
+          ...(env.maxRepoFiles ? { maxRepoFiles: env.maxRepoFiles } : {}),
+          ...(env.maxRepoBytes ? { maxRepoBytes: env.maxRepoBytes } : {}),
           cleanupRepo: cleanupRepoPath,
           ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
           fanOutSynthesis: env.fanOutSynthesis,

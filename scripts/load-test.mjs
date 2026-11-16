@@ -32,6 +32,7 @@ const REPOS = [
   "spf13/cobra", "gorilla/mux", "urfave/cli", "spf13/viper", "go-chi/chi",
   "jhy/jsoup", "google/gson", "square/javapoet",
   "madler/zlib", "libuv/libuv", "fmtlib/fmt", "google/leveldb",
+  "jbogard/MediatR", "serilog/serilog",
   "jamiebuilds/the-super-tiny-compiler", "colinhacks/zod",
 ];
 

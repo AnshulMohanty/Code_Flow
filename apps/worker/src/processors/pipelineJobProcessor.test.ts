@@ -305,6 +305,26 @@ describe("runAnalysisJob", () => {
     expect(updates.at(-1)).toMatchObject({ status: "failed", runStatus: "failed" });
     expect(received.at(-1)).toEqual({ kind: "done", jobId: "job-1", status: "failed" });
   });
+
+  it("MAX_REPO_FILES: a clone over the worker's cap is refused before parsing, nothing persisted", async () => {
+    const { service, updates } = fakeService(null);
+    const measureRepoSize = vi.fn(async () => ({ fileCount: 5001, totalBytes: 1024 }));
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      measureRepoSize,
+      maxRepoFiles: 5000,
+      now: makeClock(),
+    });
+
+    expect(measureRepoSize).toHaveBeenCalledOnce();
+    expect(outcome.status).toBe("failed");
+    expect(service.saveAnalysis).not.toHaveBeenCalled();
+    expect(updates.at(-1)).toMatchObject({ status: "failed", runStatus: "failed", runStatusReason: "repo-too-large" });
+  });
 });
 
 // Orient reader / Map-structure walker that find nothing → empty-but-valid slices

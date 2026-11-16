@@ -54,6 +54,9 @@ export interface PipelineJobDependencies {
   trackedFiles?: (repoPath: string) => Promise<ReadonlySet<string> | null>;
   /** Guard 1 — measures the cloned tree so Ingest can enforce the repo-size cap. */
   measureRepoSize?: (repoPath: string) => Promise<{ fileCount: number; totalBytes: number }>;
+  /** Guard 1 caps (default: MAX_FILES / MAX_BYTES). Size them to the worker's memory — see .env.example. */
+  maxRepoFiles?: number;
+  maxRepoBytes?: number;
   /** Guard 5 — global daily LLM-spend ceiling, passed to the AI stages via ctx.budget. */
   budget?: BudgetHandle;
   /** SSE replay buffer (#20): every emitted ProgressEvent + the terminal done is appended
@@ -281,7 +284,13 @@ export async function runAnalysisJob(
 
   try {
     const stages: PipelineStage[] = [
-      createIngestStage({ cloner, measureRepoSize: deps.measureRepoSize, now }),
+      createIngestStage({
+        cloner,
+        measureRepoSize: deps.measureRepoSize,
+        now,
+        ...(deps.maxRepoFiles ? { maxFiles: deps.maxRepoFiles } : {}),
+        ...(deps.maxRepoBytes ? { maxBytes: deps.maxRepoBytes } : {}),
+      }),
       createOrientStage({ readFile: deps.readFile, now }),
       createMapStructureStage({
         readDir: deps.readDir,

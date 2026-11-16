@@ -26,41 +26,16 @@ import {
 import type { AnalysisResult, PipelineInput, PipelineStage } from "@codeflow/shared-types";
 
 /**
- * LOCAL-FIRST ANALYSIS (V3-P5 task 4) — on-device, keyless, ZERO CODE EGRESS.
+ * Local analysis: on-device, keyless, no code leaves the machine. Parsing is tree-sitter WASM, embedding
+ * is `createLocalEmbeddingClient` (feature hashing), the index is a JSON file (`createFileVectorStore`),
+ * retrieval is the same `hybridSearch` as hosted — the same stages and grounding, so a local and a
+ * hosted analysis cannot disagree about the code.
  *
- * WHAT MAKES THE EGRESS CLAIM CHECKABLE RATHER THAN ASSERTED. Every component on this path is
- * in-process:
- *   - parsing is `web-tree-sitter` WASM (already in from V3-P1, and the reason V3-P1 chose WASM over
- *     the native bindings was precisely so it could run here);
- *   - embedding is `createLocalEmbeddingClient` — feature hashing, no provider (see
- *     `localEmbedding.ts` for what that does and does not buy, and why an ONNX MiniLM was rejected);
- *   - the index is `createFileVectorStore` — a JSON file on disk (LanceDB probed and rejected: 656 MB
- *     and it drags `onnxruntime-node` back in);
- *   - retrieval is the SAME `hybridSearch` the hosted path uses.
- * WHAT THAT CLAIM IS, EXACTLY — because the first version of this comment overstated it and the
- * zero-egress test is what caught that. It said there was "no HTTP client anywhere in this module's
- * import graph". There is: importing `@codeflow/analyzers` for the stages pulls in that package's
- * BARREL, which re-exports `llmClient.ts` and `embeddingClient.ts`, and both call `fetch`.
- *
- * Nothing leaks, and the accurate statement is stronger than the loose one because it is checkable
- * at two levels:
- *   - This module NEVER REFERENCES a provider constructor. Reachability through a barrel is not use;
- *     nothing here can construct a client, so nothing here can call one.
- *   - The PUBLISHED BUNDLE contains no `fetch` call, no provider client and no provider hostname at
- *     all — Rollup drops them as unreferenced. That is the artifact a user installs, it is
- *     deliberately not minified, and anyone can grep the file they downloaded to confirm it.
- * Both are asserted in `__tests__/zeroEgress.test.ts`, including an exact list of the two reachable
- * fetch-capable modules, so a third cannot appear quietly.
- *
- * THE SYNTHESIZE STAGE IS ABSENT, deliberately. It needs an LLM, and there is no keyless local one —
- * so rather than degrade it into something that looks like a summary and is not, the local run stops
- * at a complete deterministic analysis plus a searchable index. That is genuinely useful (the graph,
- * the metrics, the communities, and Q&A retrieval all work offline) and it is honest about the one
- * thing it cannot do.
- *
- * IT SHARES THE CORE PACKAGES rather than reimplementing them: the same stages, the same graph, the
- * same chunker, the same grounding. So a local analysis and a hosted one cannot disagree about what
- * the code says — the only differences are the embedder and the store, both behind interfaces.
+ * "No egress", precisely: `@codeflow/analyzers`' barrel makes two fetch-capable modules REACHABLE, but
+ * nothing here constructs a provider client, and the published bundle contains no `fetch` call and no
+ * provider hostname (Rollup drops them). `__tests__/zeroEgress.test.ts` asserts both, with the exact list
+ * of reachable modules. Synthesize is absent on purpose: there is no keyless local LLM, and a fake
+ * summary would be worse than none.
  */
 
 export interface LocalAnalysisOptions {

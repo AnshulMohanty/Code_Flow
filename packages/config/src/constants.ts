@@ -21,8 +21,10 @@ export const DEFAULT_LOCAL_API_PORT = 3001;
 // hermetically). They are constants (not env) so the guard behaviour is deterministic
 // and testable; P7 may promote the ones worth operator control to env.
 
-// Guard 1 — repo-size cap (Ingest, authoritative post-clone).
-/** Max number of files in a cloned repo before it is rejected as too large. */
+// Guard 1 — repo-size cap (Ingest, authoritative post-clone). The worker can override both per
+// deployment (MAX_REPO_FILES / MAX_REPO_BYTES), because memory is what bounds them: measured with the
+// CLI, an analysis needs about 150 MiB + 30 KiB per file (Kubernetes, 26,595 files: 890 MiB peak).
+/** Max number of files in a cloned repo before it is rejected as too large (≈ 900 MiB per job). */
 export const MAX_FILES = 25_000;
 /** Max total bytes of a cloned repo before it is rejected as too large. */
 export const MAX_BYTES = 512 * 1024 * 1024; // 512 MB

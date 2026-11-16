@@ -1,43 +1,15 @@
 import { tokenizeCode } from "./tokenize.js";
 
 /**
- * THE KEYLESS LOCAL EMBEDDER (V3-P5 task 4).
+ * The keyless local embedder: feature hashing over `tokenizeCode` tokens, L2-normalised. Deterministic
+ * (no RNG, no clock), so an index built today is searchable tomorrow.
  *
- * WHAT THE ORIGINAL PLAN ASKED FOR: "int8 MiniLM local embeddings". WHAT SHIPS: a deterministic
- * bag-of-words embedder over the shared code tokenizer. That is a real difference and it is stated
- * here rather than buried, because the model NAME is the part a reader would otherwise assume.
- *
- * WHY. A MiniLM needs an inference runtime, and both routes were probed and rejected on evidence:
- *   - `onnxruntime-node` — 211 MB, prebuilt NAPI binaries for six platforms, a postinstall that
- *     downloads more from a Nuget feed (V3-P2's reranker probe).
- *   - `@huggingface/transformers` — pulls the above, plus `sharp` (V3-P2).
- *   - `@lancedb/lancedb` — 656 MB and drags `onnxruntime-node` back in (V3-P5 task 4's probe).
- *   - `onnxruntime-web` is WASM-clean and the right runtime, but a transformer needs a WordPiece
- *     tokenizer and the JS tokenizers are themselves native NAPI packages.
- * For a CLI whose entire selling point is running on a laptop with no toolchain, a 200 MB native
- * download is not a detail — it is the opposite of the feature.
- *
- * WHAT THIS IS, precisely. Feature hashing: each token from `tokenizeCode` is hashed to a dimension
- * and increments it, then the vector is L2-normalised so cosine is a genuine angle and a long chunk
- * is not penalised. It captures LEXICAL overlap — shared identifiers, shared path words, shared
- * signature terms — and it does NOT capture semantic similarity: it cannot tell that "authenticate"
- * and "login" are related, which a MiniLM can.
- *
- * WHY IT IS STILL WORTH SHIPPING. Three reasons, all checkable:
- *   1. It is genuinely KEYLESS and OFFLINE — the local-first claim ("zero code egress") is provable
- *      rather than asserted, because there is no client, no socket and no protocol.
- *   2. On code specifically, lexical overlap is a much stronger signal than on prose: developers
- *      search for identifiers. V3-P2 measured this — the same embedder took enrichment's recall@3
- *      from 0.500 to 1.000 on the A/B corpus.
- *   3. It composes with V3-P2's BM25 arm and the enrichment header, which is exactly where its
- *      weakness is covered: `hybridSearch` fuses it with a lexical index, and enrichment puts the
- *      class name and path words into the text it sees.
- *
- * The honest upgrade path is one file: implement `EmbeddingClient` over `onnxruntime-web` plus a JS
- * WordPiece, and the local CLI changes nothing. Named in DESIGN.md.
- *
- * DETERMINISTIC AND STABLE ACROSS PROCESSES: no RNG, no clock, a fixed hash — so an index built
- * today is still searchable tomorrow, which a random projection would not be.
+ * It is NOT MiniLM. Every MiniLM runtime probed needed a large native download (onnxruntime-node
+ * 211 MB, @lancedb/lancedb 656 MB, native tokenizers for onnxruntime-web), which defeats a CLI that
+ * runs on a bare laptop. What it captures is LEXICAL overlap — shared identifiers and path words — not
+ * meaning ("authenticate" vs "login"). On code that is a strong signal (it took enrichment's recall@3
+ * from 0.500 to 1.000 in V3-P2), and `hybridSearch` pairs it with BM25. Upgrade path: an
+ * `EmbeddingClient` over onnxruntime-web + a JS WordPiece; nothing else changes.
  */
 
 /** The `EmbeddingClient` shape, restated locally so this package needs no analyzers dependency

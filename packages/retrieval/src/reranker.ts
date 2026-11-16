@@ -2,39 +2,15 @@ import type { RerankCandidate, RerankResult, Reranker } from "./contracts.js";
 import { tokenizeCode } from "./tokenize.js";
 
 /**
- * Rerankers (V3-P2, task 3).
+ * Rerankers. No model ships: every in-process cross-encoder runtime probed was native or huge
+ * (onnxruntime-node 211 MB with a downloading postinstall; @huggingface/transformers adds sharp;
+ * fastembed needs a native tokenizer), and onnxruntime-web — the right, WASM-clean runtime — still
+ * needs a WordPiece/BPE tokenizer that only exists natively in JS today.
  *
- * THE DEPENDENCY PROBE, and why no model ships here. The brief asked for a keyless, in-process,
- * CPU cross-encoder that runs in the pruned `node:20-slim` image with no native toolchain —
- * probed with the same discipline V3-P1 used before adopting `web-tree-sitter`. Every candidate
- * was installed and inspected, and every one was rejected:
- *
- *   - `onnxruntime-node@1.24.3` — installed: **211 MB**, shipping prebuilt NAPI `.node` plus
- *     `.so`/`.dll`/`.dylib` for six platforms, AND a `postinstall` (`node ./script/install`,
- *     with `adm-zip` + `global-agent` as dependencies) that downloads further binaries from a
- *     Nuget feed. No node-gyp compile, so it clears that bar — but a 211 MB, network-at-install,
- *     platform-specific artefact for a reranker is not a trade worth making in an image that
- *     currently ships nothing native at all.
- *   - `@huggingface/transformers@4.2.0` — depends on the above, and additionally on `sharp`
- *     (native image processing, irrelevant to text reranking).
- *   - `fastembed@2.1.0` — depends on `@anush008/tokenizers`, a native Rust NAPI binding.
- *   - `onnxruntime-web@1.29.0` — the one WASM-clean runtime (no install script, no native
- *     binaries), and the exact shape of the `web-tree-sitter` answer. It is the right runtime.
- *     What it cannot supply is a TOKENIZER: a cross-encoder needs WordPiece/BPE, and the
- *     available JS tokenizers are themselves NAPI packages. Writing one is a real task, not a
- *     line of glue, so it belongs to P5 with a named path rather than to a rushed P2.
- *
- * WHAT SHIPS INSTEAD. `createLexicalOverlapReranker` — genuinely in-process, keyless,
- * zero-dependency and deterministic. It is NOT a cross-encoder and does not pretend to be:
- * `kind: "deterministic"` says so in the data, so a report can distinguish a real rerank from
- * this one. What it does is a real improvement over the fused order for the case that matters
- * most in code search — a candidate that literally contains the query's identifiers should
- * outrank one that merely sits near it in vector space.
- *
- * AND THE REAL ONE IS READY TO DROP IN. `createCrossEncoderReranker` takes an injected
- * `CrossEncoderSession`, so the model integration is a matter of supplying a session, the
- * hermetic suite tests the adapter with a fake, and nothing in this package depends on a
- * runtime. Downloading weights and running a live model is in the deferred bucket.
+ * `createLexicalOverlapReranker` is what runs: keyless, deterministic, and labelled `kind:
+ * "deterministic"` so a report never mistakes it for a cross-encoder. It lifts candidates that contain
+ * the query's identifiers above ones that are merely near in vector space. `createCrossEncoderReranker`
+ * takes an injected `CrossEncoderSession`, so a real model drops in without touching this package.
  */
 
 /** The deterministic reranker's id — pinned so a report or a trace can name it. */

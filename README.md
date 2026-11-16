@@ -364,9 +364,10 @@ npx codeflow-local analyze .              # graph, metrics, cycles, communities 
 npx codeflow-local ask . "where are retries handled?"
 ```
 
-Parsing is tree-sitter WASM, the embedder is in-process, and the index is a file on disk — there is
-no HTTP client, no socket and no provider key anywhere in that module's import graph, which is a
-property you can verify by reading the imports rather than trusting this sentence.
+Parsing is tree-sitter WASM, the embedder is in-process, and the index is a file on disk. No provider
+client is ever constructed on this path, and the published bundle contains no `fetch` call and no
+provider hostname — `apps/local-cli/src/__tests__/zeroEgress.test.ts` checks both, and you can grep
+the file you installed.
 
 It stops at a complete deterministic analysis plus a searchable index. **There is no AI summary**:
 synthesis needs a model and there is no keyless local one, so rather than degrade into something that
@@ -386,6 +387,20 @@ Kubernetes (26,558 files) on an Apple M5 laptop, Node 26:
 
 The graph is identical across all four — checked edge for edge. `impact` analyses the head and the
 base of a PR in one process and parses every untouched file once.
+
+**Under load** (the Docker stack, `scripts/load-test.sh`): 26 public repositories covering every supported
+language are submitted at once, each from its own client IP as PR bots would, while 20 simulated users poll job
+status, open results and hit `/health`. Every job is a real clone and analysis (a fresh cache
+namespace per run). Measured on 2026-11-16 on the same laptop, Docker Desktop:
+
+| Workers | Jobs done | All jobs finished in | Throughput | Job end-to-end p50 / p95 | API p95 (reads) | Slowest request | Errors |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 26/26 | 58.5 s | 26.7 jobs/min | 25.7 s / 56.9 s | ≤ 50 ms | 76 ms | 0 / 8,487 |
+| 2 | 26/26 | 29.7 s | 52.5 jobs/min | 14.8 s / 26.9 s | ≤ 33 ms | 115 ms | 0 / 4,529 |
+| 4 | 26/26 | 17.1 s | 91.1 jobs/min | 7.6 s / 14.8 s | ≤ 42 ms | 103 ms | 0 / 2,533 |
+
+Throughput scales 1.97x at 2 workers and 3.4x at 4 (the 4-worker run is short enough that the slowest
+repositories set its end). A worker running its default two jobs peaked at 499 MiB.
 
 ---
 
@@ -506,6 +521,7 @@ what breaks without each one. For the Docker run above, the only thing you must 
 | `CORS_ORIGINS` | — | Comma-separated browser origins. Until it is set the browser gets CORS errors against a healthy API. |
 | `TRUST_PROXY_HOPS` | `0` | Reverse proxies in front of the API (Render: `1`). Without it every visitor shares the proxy's IP, so the per-IP rate limit becomes one global bucket. |
 | `RUN_WORKER_IN_PROCESS` | `false` | Runs the worker inside the API — one service instead of two, for a free tier. |
+| `MAX_REPO_FILES` / `MAX_REPO_BYTES` | `25000` / 512 MB | Largest clone the worker accepts. Size it to memory: an analysis needs about 150 MiB + 30 KiB per file (measured: Kubernetes, 26,595 files, 890 MiB), times `WORKER_CONCURRENCY`. |
 | `LLM_PRICING` | — | JSON model→price. Unset ⇒ `usd: null` with the models named. |
 | `FANOUT_SYNTHESIS` | `false` | The experimental specialist fan-out. Also the only thing that fills the Domains tab. |
 

@@ -1,37 +1,12 @@
 /**
- * BOOT-TIME WARM-UP — process-lifetime warm caches (V3-P5 task 1).
+ * Boot-time warm-up: a registry of process-lifetime resources initialised once at boot and reused by
+ * every job in the process (not a pool of anything). What is cold on a process's first job:
+ * tree-sitter WASM grammars, provider clients (and provider selection), and the retrieval schema
+ * (`CREATE EXTENSION` / `CREATE TABLE`). Warming them up front stops the first job paying for them.
  *
- * RENAMED FROM "persistent warm worker pool", which is what the original plan called it and what this module
- * never was. Nothing here pools processes or workers. The behaviour is unchanged — this is the same
- * registry, still gating /ready — and only the name was wrong. A name that overstates the mechanism
- * survives into a README, then into a conversation where somebody asks how the pool is sized.
- *
- * WHAT IS ACTUALLY COLD IN THIS CODEBASE — measured, not guessed at. Three things cost real time on
- * the first job of a process and nothing on every job after:
- *
- *   1. **tree-sitter WASM grammars.** `initTreeSitter()` loads and instantiates five `.wasm`
- *      grammars; V3-P1 made it idempotent and cached, which means the cost is paid once — by
- *      whichever unlucky job arrives first. That job is slower than every subsequent one for a
- *      reason that has nothing to do with the repository being analysed.
- *   2. **Provider clients.** Constructed from env, cheap individually, but constructing them
- *      per-job also means resolving provider selection per-job.
- *   3. **Retrieval stores / schema.** `createRetrievalStores` runs `CREATE EXTENSION` /
- *      `CREATE TABLE` on first use. Idempotent, and still a round trip nobody should pay inside a
- *      request.
- *
- * So what this is, precisely: a registry of PROCESS-LIFETIME resources initialised once at boot and
- * reused by every job in that process. Not a pool of processes — one worker process runs jobs at
- * BullMQ concurrency — and not a pool of anything else. "Boot-time warm-up" is the whole mechanism.
- *
- * THE HH_Goa PATTERN, and why `warmedUp` is on `/health` rather than assumed: a container that
- * accepts traffic before its caches are warm serves its first users a latency that looks like a bug.
- * Exposing readiness separately from liveness lets an orchestrator hold traffic back until the
- * process is genuinely ready, and lets a ping-to-prevent-cold-sleep hook (task 5) verify it stayed
- * that way.
- *
- * DETERMINISM: warming changes only TIMING. Every task here is idempotent and produces no slice, so
- * a warm process and a cold one produce byte-identical results — asserted by the fact that no task
- * may return a value that anything reads.
+ * `warmedUp` is exposed on /health and gates /ready, so an orchestrator holds traffic until the process
+ * is warm. Warming changes only timing: tasks are idempotent and return nothing anything reads, so a
+ * warm and a cold process produce byte-identical results.
  */
 
 export type WarmupTaskStatus = "pending" | "running" | "warm" | "failed" | "skipped";

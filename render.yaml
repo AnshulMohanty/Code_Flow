@@ -98,11 +98,14 @@ services:
           type: keyvalue
           name: codeflow-keyvalue
           property: connectionString
-      # Jobs per instance. 2 is the default in apps/worker/src/config/scaling.ts and the ceiling
-      # is 8; past that, scale OUT. Autoscale on queue depth from /metrics, never on CPU — this
-      # process is idle-looking while it waits on a provider call, which is most of a run.
+      # Jobs per instance (default 2, ceiling 8; past that, scale OUT on queue depth from /metrics,
+      # never on CPU). Sized for `starter` (512 MB): the load test measured a worker running two small
+      # jobs at 499 MiB, and a job needs about 150 MiB + 30 KiB per file. So one job at a time and a
+      # 5,000-file cap here. On `standard` (2 GB) use 2 jobs and MAX_REPO_FILES 25000.
       - key: WORKER_CONCURRENCY
-        value: "2"
+        value: "1"
+      - key: MAX_REPO_FILES
+        value: "5000"
 
   # ── Web (static SPA) ────────────────────────────────────────────────────────────────────────
   - type: web

@@ -66,6 +66,10 @@ services:
       # concurrency to 1 and logs both facts at boot.
       - key: RUN_WORKER_IN_PROCESS
         value: "true"
+      # API (≈ 110–150 MiB under load) and worker share 512 MB here; a job needs about 150 MiB + 30 KiB
+      # per file (measured), so refuse clones over 3,000 files rather than run out of memory mid-job.
+      - key: MAX_REPO_FILES
+        value: "3000"
       # PORT is assigned by Render and read by apps/api/src/config/port.ts. API_PORT is deliberately
       # NOT set: it takes precedence, so setting it would bind a port the proxy is not routing to.
       - key: POSTGRES_URL
