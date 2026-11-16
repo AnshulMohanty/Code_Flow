@@ -31,16 +31,22 @@
     "@codeflow/shared-types": "workspace:*",
     "vite": "^5.4.11"
   },
-  "description": "Analyse a repository entirely on your machine — dependency graph, metrics and grounded search. No API key, no network, no code leaves the device.",
+  "description": "Map, check and query a codebase on your machine: a dependency graph scored against each language's own compiler (TS/JS, Python, Go, Java, C/C++), PR impact, test selection, architecture rules and a code-citation checker. No API key, no network.",
   "license": "MIT",
   "keywords": [
     "code-analysis",
     "dependency-graph",
+    "impact-analysis",
+    "test-selection",
+    "architecture",
+    "monorepo",
     "tree-sitter",
+    "typescript",
+    "go",
+    "java",
+    "cpp",
     "offline",
-    "cli",
-    "codebase",
-    "onboarding"
+    "cli"
   ],
   "repository": {
     "type": "git",

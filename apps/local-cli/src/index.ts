@@ -468,12 +468,22 @@ export function isDirectInvocation(argvPath: string | undefined): boolean {
 
 const invokedDirectly = isDirectInvocation(process.argv[1]);
 
+/**
+ * Exit only after stdout has DRAINED. Writes to a pipe are asynchronous in Node; `process.exit` right
+ * after a large `console.log` drops whatever is still buffered — past the 64 KB pipe buffer, the JSON a
+ * consumer reads (`impact --format json | jq`, a CI step) was silently cut off. A write's callback fires
+ * once everything written before it has been flushed.
+ */
+function exitAfterFlush(code: number): void {
+  process.stdout.write("", () => process.exit(code));
+}
+
 if (invokedDirectly) {
   main()
-    .then((code) => process.exit(code))
+    .then(exitAfterFlush)
     .catch((error: unknown) => {
       console.error(`codeflow-local failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(1);
+      exitAfterFlush(1);
     });
 }
 

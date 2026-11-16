@@ -27,9 +27,36 @@ with no key.
 
 ---
 
-## What it is
+## Map · Check · Ask
 
-Give CodeFlow a repository and it runs an **8-stage pipeline** — streamed to the browser as it
+| | What it gives you | Commands | Measured |
+|---|---|---|---|
+| **Map** | The resolved dependency and call graph of a repository: load-bearing files, cycles, communities, blast radius, entry points, files nothing uses | `analyze`, `unused` | Import graph vs each language's compiler on 19 repositories (TS/JS, Go, Java, C/C++): precision 100% on 18, 99.88% on the 19th; recall ≥ 99.5% — [tables](#measured-not-asserted-the-import-graph-vs-each-languages-own-toolchain) |
+| **Check** | In CI, offline: what a change touches, which tests to run, architecture rules, wrong code references in a PR description — and a PR comment only when something needs a human | `impact`, `tests`, `check`, `verify`, the GitHub Action | Test selection by fault injection: 0 of 193 failures missed while skipping 80% of a suite — [details](#check-an-answer-or-a-pr) |
+| **Ask** | Give an agent (Claude Code, Cursor) the graph over MCP, so it asks instead of searching file by file | the MCP server | On "what is affected" questions: half the turns, 40–46% lower cost, same accuracy — [benchmark](#claude-code-alone-vs-claude-code--codeflow) |
+
+```bash
+# From a checkout (pnpm install && pnpm --filter "codeflow-local..." build); `npx codeflow-local` once published.
+CF="node apps/local-cli/dist/index.js"
+$CF analyze /path/to/repo                       # the map, offline, in seconds (Kubernetes: 21 s)
+$CF impact  /path/to/repo --base main           # what this branch touches
+$CF tests   /path/to/repo --base main | xargs npx vitest run   # run only the tests it can affect
+$CF check   /path/to/repo                       # architecture rules from codeflow.rules.json
+```
+
+Ask, from Claude Code: analyse once, then register the server (graph and verifier tools, no key):
+
+```bash
+$CF analyze /path/to/repo --no-index --out /path/to/repo/.codeflow/result.json
+claude mcp add codeflow -e CODEFLOW_MCP_RESULT=/path/to/repo/.codeflow/result.json \
+  -e CODEFLOW_MCP_SCOPES=graph,verify -- node /path/to/Code_Flow/apps/mcp/dist/index.js
+```
+
+---
+
+## The hosted pipeline
+
+Give CodeFlow a repository URL and it runs an **8-stage pipeline** — streamed to the browser as it
 happens — that turns source into a map you can interrogate.
 
 | # | Stage | What it produces | Needs a key? |
@@ -369,8 +396,34 @@ npx codeflow-local impact . --base main --format markdown   # a PR comment
 npx codeflow-local impact . --base main --fail-on new-cycle,broken-import
 ```
 
-**3. On every pull request** — one comment, updated in place, plus a check of the references written in
-the PR description:
+**Run only the tests a change can affect.** `codeflow-local tests . --base main` prints the test files
+whose import closure reaches a changed file (plus changed tests, and Go package tests). A change the
+graph cannot trace — `package.json`, a lockfile, a config, CI — selects every test and says why.
+Proven by fault injection (`scripts/test-selection-eval.mjs`): break a source file so it throws on
+load, run the **whole** suite through the real runner, and check every failing test was selected.
+On CodeFlow's own suites, measured 2026-11-16:
+
+| Suite | Faults injected | Failing test files observed | Missed | Test files skipped (mean) |
+|---|---:|---:|---:|---:|
+| `packages/analyzers` (25 test files) | 20 | 91 | **0** | 80% |
+| `packages/parsers` (14 test files) | 12 | 102 | **0** | 39% |
+
+**Keep architecture boundaries.** A committed `codeflow.rules.json` (`"from": "apps/web/**", "forbid":
+"apps/worker/**"`) is checked on the resolved graph by `codeflow-local check` and, for a PR's changed
+files, by `impact --fail-on rule` — so an import through a workspace package name or alias is caught,
+which a text search for the path misses. This repository's own layering is a rules file, enforced in CI.
+
+**Find files nothing uses.** `codeflow-local unused` lists source files that nothing imports, includes or
+calls — conservatively (JS/TS, Python, C/C++ headers; entry points, convention files and scripts a
+`package.json` runs are excluded). A list to review, not to delete blindly.
+
+**3. On every pull request** — and **quiet by default**: it comments only for a new cycle, a broken
+import, a rule violation, an untested change to a file 5+ files depend on, or a wrong reference in the
+PR description, and updates its earlier comment once those are fixed. Replayed over real history
+(`scripts/replay-history.mjs`: the same `impact` the action runs, on each of the last 50 commits of
+zod, jsoup and Hugo — 150 commits, all of which passed those projects' own CI), it would have stayed
+silent on all 150: no false alarms. What it catches is shown by the fault-injection runs above and the
+fixture tests; healthy history simply has nothing to catch.
 
 ```yaml
 # .github/workflows/codeflow.yml
@@ -384,14 +437,15 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: AnshulMohanty/Code_Flow@main
         with:
-          fail-on: new-cycle,broken-import,wrong-citation   # optional
+          fail-on: new-cycle,broken-import,rule,wrong-citation   # optional
+          # quiet: "false"   # comment on every push instead
 ```
 
 **For coding agents**, the MCP server's `verify` scope adds `verify_citations` (check a draft answer
 before showing it) next to `verify_answer` (grade a structured claim such as "who calls X").
 
-> `codeflow-local` is not on npm yet. Until it is, run it from a checkout:
-> `pnpm --filter "codeflow-local..." build && node apps/local-cli/dist/index.js <command>`.
+> `codeflow-local` is not on npm yet — `.github/workflows/release.yml` publishes it on a `v*` tag. Until
+> then, run it from a checkout: `pnpm --filter "codeflow-local..." build && node apps/local-cli/dist/index.js <command>`.
 > The GitHub Action builds it from source in the job.
 
 ---

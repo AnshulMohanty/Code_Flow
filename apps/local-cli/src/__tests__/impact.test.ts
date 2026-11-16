@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { analyzeLocal } from "../analyzeLocal.js";
 import type { AnalysisResult } from "@codeflow/shared-types";
@@ -115,6 +116,22 @@ describe("test selection", () => {
       },
     } as unknown as AnalysisResult;
     expect(selectTests(head, [{ path: "store/open.go", status: "modified" }]).tests).toEqual(["api/server_test.go", "store/open_test.go"]);
+  });
+});
+
+describe("the shipped CLI over a pipe", () => {
+  it("delivers a large JSON report whole — it exits only after stdout drains", () => {
+    // 3,000 file paths make a report far past the 64 KB pipe buffer. `process.exit` right after the
+    // write used to cut it off mid-JSON whenever stdout was a pipe (\`impact --format json | jq\`).
+    const bundle = fileURLToPath(new URL("../../bundle/codeflow-local.mjs", import.meta.url));
+    const files = Array.from({ length: 3000 }, (_, i) => `src/generated/file-${i}.ts`).join(",");
+    const run = spawnSync(process.execPath, [bundle, "impact", repo, "--files", files, "--format", "json"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    expect(run.status).toBe(0);
+    expect(run.stdout.length).toBeGreaterThan(256 * 1024);
+    expect(JSON.parse(run.stdout).files).toHaveLength(3000);
   });
 });
 
