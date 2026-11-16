@@ -1,8 +1,10 @@
 name: CodeFlow PR impact
 description: >-
   Deterministic pull-request impact report — dependents, entry points, tests that reach the change,
-  new import cycles, imports that resolve to nothing — plus a check that every code reference in the
-  PR description points at a real file, line and symbol. No API key, no model, nothing leaves the runner.
+  new import cycles, imports that resolve to nothing, architecture-rule violations (codeflow.rules.json)
+  — plus a check that every code reference in the PR description points at a real file, line and
+  symbol. Quiet by default: it comments only when something needs a human. No API key, no model,
+  nothing leaves the runner.
 author: CodeFlow
 branding:
   icon: git-pull-request
@@ -14,11 +16,18 @@ inputs:
     required: false
     default: ""
   fail-on:
-    description: "Comma-separated conditions that fail the step: new-cycle, broken-import, untested, wrong-citation."
+    description: "Comma-separated conditions that fail the step: new-cycle, broken-import, rule, untested, wrong-citation."
     required: false
     default: ""
   comment:
     description: "Post (and keep updating) one PR comment with the report. Needs `pull-requests: write`."
+    required: false
+    default: "true"
+  quiet:
+    description: >-
+      Comment only when something needs a human: a new cycle, a broken import, a rule violation, an
+      untested change to a file 5+ files depend on, or a wrong reference in the PR description. A
+      previous comment is updated to say the issues are gone. "false" comments on every push.
     required: false
     default: "true"
   verify-description:
@@ -62,6 +71,7 @@ runs:
         PR_BODY: ${{ github.event.pull_request.body }}
         FAIL_ON: ${{ inputs.fail-on }}
         VERIFY_DESCRIPTION: ${{ inputs.verify-description }}
+        QUIET: ${{ inputs.quiet }}
       run: |
         set -u
         OUT="$RUNNER_TEMP/codeflow-report.md"
@@ -72,7 +82,9 @@ runs:
         fi
         IMPACT_FAIL_ON=$(printf '%s' "$FAIL_ON" | tr ',' '\n' | grep -v '^wrong-citation$' | paste -sd, - || true)
         set +e
-        node "$CLI" impact "$REPO_DIR" --base "$BASE" --format markdown \
+        QUIET_FLAG=""
+        if [ "$QUIET" = "true" ]; then QUIET_FLAG="--quiet"; fi
+        node "$CLI" impact "$REPO_DIR" --base "$BASE" --format markdown $QUIET_FLAG \
           --link-base "https://github.com/$REPO/blob/$HEAD_SHA" \
           ${IMPACT_FAIL_ON:+--fail-on "$IMPACT_FAIL_ON"} > "$OUT"
         IMPACT_EXIT=$?
@@ -80,11 +92,18 @@ runs:
         if [ "$VERIFY_DESCRIPTION" = "true" ] && [ -n "${PR_BODY:-}" ]; then
           VERIFY_OUT=$(printf '%s' "$PR_BODY" | node "$CLI" verify "$REPO_DIR" - --format markdown)
           VERIFY_EXIT=$?
-          if ! printf '%s' "$VERIFY_OUT" | grep -q '^No code references'; then
+          # Quiet mode keeps only a description with a WRONG reference; otherwise any references found.
+          if ! printf '%s' "$VERIFY_OUT" | grep -q '^No code references' && { [ "$QUIET" != "true" ] || [ "$VERIFY_EXIT" != "0" ]; }; then
             printf '\n\n### Code references in the PR description\n\n%s\n' "$VERIFY_OUT" >> "$OUT"
           fi
         fi
         set -e
+        if [ -s "$OUT" ] && grep -q '[^[:space:]]' "$OUT"; then
+          echo "notable=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "notable=false" >> "$GITHUB_OUTPUT"
+          printf '✅ **CodeFlow:** nothing in this change needs attention — no new cycle, broken import or rule violation.\n' > "$OUT"
+        fi
         printf '<!-- codeflow-impact -->\n' >> "$OUT"
         cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
         echo "path=$OUT" >> "$GITHUB_OUTPUT"
@@ -99,6 +118,7 @@ runs:
       continue-on-error: true # a fork PR's token is read-only; the job summary still has the report
       env:
         REPORT_PATH: ${{ steps.report.outputs.path }}
+        NOTABLE: ${{ steps.report.outputs.notable }}
       with:
         script: |
           const fs = require("fs");
@@ -107,6 +127,8 @@ runs:
           const issue_number = context.payload.pull_request.number;
           const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
           const mine = comments.find((c) => c.body && c.body.includes("<!-- codeflow-impact -->"));
+          // Nothing notable: never start a thread — but do clear an earlier warning that is now fixed.
+          if (process.env.NOTABLE === "false" && !mine) return;
           if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
           else await github.rest.issues.createComment({ owner, repo, issue_number, body });
 

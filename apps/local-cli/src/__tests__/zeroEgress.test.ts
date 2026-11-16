@@ -261,8 +261,9 @@ describe("codeflow-local sends nothing anywhere", () => {
 describe("the CLI source tree has no surprises", () => {
   it("contains only the modules it is supposed to", async () => {
     const files = (await readdir(CLI_ROOT)).filter((name) => name.endsWith(".ts"));
-    // factsCache.ts (the incremental parse cache) and jsonOut.ts (streamed --out) touch only fs and crypto.
-    expect(files.sort()).toEqual(["analyzeLocal.ts", "factsCache.ts", "impact.ts", "index.ts", "jsonOut.ts"]);
+    // factsCache.ts (incremental parse cache), jsonOut.ts (streamed --out), rules.ts (reads codeflow.rules.json)
+    // and unused.ts (pure) touch only fs and crypto.
+    expect(files.sort()).toEqual(["analyzeLocal.ts", "factsCache.ts", "impact.ts", "index.ts", "jsonOut.ts", "rules.ts", "unused.ts"]);
   });
 
   it("spawns only local git (read-only subcommands) and tar — never anything that can fetch", async () => {

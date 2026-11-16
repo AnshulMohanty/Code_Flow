@@ -18,4 +18,4 @@ jobs:
 
       - uses: ./
         with:
-          fail-on: new-cycle,broken-import
+          fail-on: new-cycle,broken-import,rule

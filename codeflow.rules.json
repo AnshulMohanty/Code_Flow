@@ -1,0 +1,39 @@
+{
+  "rules": [
+    {
+      "name": "packages never depend on apps",
+      "from": "packages/**",
+      "forbid": "apps/**"
+    },
+    {
+      "name": "the base layer (shared-types, config) depends on nothing above it",
+      "from": ["packages/shared-types/**", "packages/config/**"],
+      "forbid": [
+        "packages/parsers/**",
+        "packages/graph/**",
+        "packages/retrieval/**",
+        "packages/memory/**",
+        "packages/analyzers/**",
+        "packages/agents/**",
+        "packages/arena/**",
+        "packages/observability/**",
+        "packages/eval/**"
+      ]
+    },
+    {
+      "name": "retrieval and memory depend only on the base layer (drivers are injected)",
+      "from": ["packages/retrieval/**", "packages/memory/**"],
+      "forbid": ["packages/parsers/**", "packages/graph/**", "packages/analyzers/**", "packages/agents/**", "packages/arena/**", "packages/eval/**"]
+    },
+    {
+      "name": "the web app never reaches server-side code",
+      "from": "apps/web/**",
+      "forbid": ["apps/api/**", "apps/worker/**", "apps/mcp/**", "apps/local-cli/**", "packages/analyzers/**", "packages/agents/**", "packages/memory/**", "packages/observability/**"]
+    },
+    {
+      "name": "the offline CLI never depends on the hosted apps",
+      "from": "apps/local-cli/**",
+      "forbid": ["apps/api/**", "apps/worker/**", "apps/mcp/**", "apps/web/**"]
+    }
+  ]
+}

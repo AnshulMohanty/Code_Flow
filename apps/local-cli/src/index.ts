@@ -11,10 +11,13 @@ import {
   computeImpact,
   defaultBase,
   renderImpactMarkdown,
+  isNotable,
   renderImpactText,
   selectTests,
   type ChangedFile,
 } from "./impact.js";
+import { checkRules, loadRules, RULES_FILE } from "./rules.js";
+import { filesRunByPackageJson, findUnreferenced } from "./unused.js";
 
 /**
  * `codeflow-local` — the LOCAL-FIRST CLI (V3-P5 task 4).
@@ -97,7 +100,20 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
       --files a,b         use this file list instead of git
       --format F          text (default) | markdown (PR comment) | json
       --link-base URL     markdown only: prefix for file links (e.g. https://github.com/o/r/blob/SHA)
-      --fail-on LIST      exit 1 on: new-cycle, broken-import, untested (comma-separated)
+      --fail-on LIST      exit 1 on: new-cycle, broken-import, rule, untested (comma-separated)
+      --quiet             print nothing unless there is a new cycle, a broken import, a rule
+                          violation, or an untested change to a file 5+ files depend on
+
+  codeflow-local check <repo-path> [--json]
+      Architecture rules from codeflow.rules.json, checked against the resolved graph:
+        { "rules": [ { "name": "web never imports the worker",
+                       "from": "apps/web/**", "forbid": "apps/worker/**", "except": [] } ] }
+      Exit code 1 on any violation. \`impact\` checks the same rules on a PR's changed files.
+
+  codeflow-local unused <repo-path> [--json]
+      Source files nothing in the repository imports, includes or calls (JS/TS, Python, C/C++
+      headers), excluding entry points and files tools load by convention. A list to review —
+      a dynamically loaded file is invisible to a static graph.
 
   codeflow-local tests <repo-path> [--base REF | --files a,b] [--json]
       The test files a change set can affect, one per line — for \`vitest run $(...)\`, \`go test\`,
@@ -299,9 +315,22 @@ async function main(): Promise<number> {
         console.error(`impact: could not analyse base ${base} (${error instanceof Error ? error.message : String(error)}); new-cycle check skipped.`);
       }
     }
-    const report = computeImpact(head.result, changed, { ...(base ? { base } : {}), ...(baseResult ? { baseResult } : {}) });
+    const { rules, errors: ruleErrors } = await loadRules(root);
+    if (ruleErrors.length) {
+      for (const error of ruleErrors) console.error(`impact: ${error}`);
+      return 1;
+    }
+    const report = computeImpact(head.result, changed, {
+      ...(base ? { base } : {}),
+      ...(baseResult ? { baseResult } : {}),
+      rules,
+    });
     const format = typeof flags.format === "string" ? flags.format : "text";
-    if (format === "json") console.log(JSON.stringify(report, null, 2));
+    // --quiet: say nothing unless something needs a human (see isNotable). A bot that always talks gets muted.
+    const silent = flags.quiet === true && !isNotable(report);
+    if (silent) {
+      if (format === "json") console.log(JSON.stringify({ notable: false }));
+    } else if (format === "json") console.log(JSON.stringify(report, null, 2));
     else if (format === "markdown") {
       console.log(renderImpactMarkdown(report, typeof flags["link-base"] === "string" ? { linkBase: flags["link-base"].replace(/\/$/, "") } : {}));
     } else console.log(renderImpactText(report));
@@ -310,8 +339,67 @@ async function main(): Promise<number> {
     const failed =
       (failOn.has("new-cycle") && (report.newCycles?.length ?? 0) > 0) ||
       (failOn.has("broken-import") && report.brokenImports.length > 0) ||
+      (failOn.has("rule") && report.ruleViolations.length > 0) ||
       (failOn.has("untested") && report.untested.length > 0);
     return failed ? 1 : 0;
+  }
+
+  if (command === "check") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("check needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    const { rules, errors } = await loadRules(root);
+    if (errors.length) {
+      for (const error of errors) console.error(`check: ${error}`);
+      return 1;
+    }
+    if (!rules.length) {
+      console.error(`check: no rules — add a ${RULES_FILE} at the repository root (see \`codeflow-local help\`).`);
+      return 1;
+    }
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const violations = checkRules(head.result, rules);
+    if (flags.json === true) console.log(JSON.stringify({ rules: rules.length, violations }, null, 2));
+    else {
+      console.log(`${rules.length} rule(s), ${violations.length} violation(s)`);
+      for (const violation of violations) console.log(`  ${violation.rule}: ${violation.from} → ${violation.to}  (${violation.specifier})`);
+    }
+    return violations.length ? 1 : 0;
+  }
+
+  if (command === "unused") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("unused needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const nodeIds = (head.result.graph?.nodes ?? []).map((node) => node.id);
+    const manifests: Array<{ path: string; json: Record<string, unknown> }> = [];
+    for (const id of nodeIds.filter((file) => file === "package.json" || file.endsWith("/package.json"))) {
+      try {
+        manifests.push({ path: id, json: JSON.parse(await readFile(path.join(root, id), "utf8")) as Record<string, unknown> });
+      } catch {
+        // An unreadable manifest names nothing; the report just cannot use it.
+      }
+    }
+    const { files, judged } = findUnreferenced(head.result, filesRunByPackageJson(manifests, new Set(nodeIds)));
+    if (flags.json === true) console.log(JSON.stringify({ judged, unreferenced: files }, null, 2));
+    else {
+      console.log(`${files.length} of ${judged} judged source file(s) are imported, included or called by nothing in the repository:`);
+      for (const file of files) console.log(`  ${file.path}  (${file.lines} lines)`);
+      console.log(
+        "\nCheck before deleting: a computed dynamic import, a plugin loaded by name, or a file another repository " +
+          "imports is invisible to a static graph. Java/C#/Go and C/C++ source files are not judged per file.",
+      );
+    }
+    return 0;
   }
 
   console.error(`Unknown command "${command}".\n`);

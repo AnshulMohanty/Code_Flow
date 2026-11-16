@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AnalysisResult } from "@codeflow/shared-types";
+import { checkRules, type ArchitectureRule, type RuleViolation } from "./rules.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -50,7 +51,22 @@ export interface ImpactReport {
   cyclesTouched: string[][];
   /** Imports written in changed files that resolve to nothing in the repository. */
   brokenImports: Array<{ from: string; specifier: string }>;
+  /** Architecture-rule violations on edges leaving the changed files (`codeflow.rules.json`). */
+  ruleViolations: RuleViolation[];
   totalSourceFiles: number;
+}
+
+/** Transitive production dependents at which an untested change counts as risky. */
+export const RISKY_DEPENDENTS = 5;
+
+/**
+ * Does this report need a human? A PR bot that comments on every push gets muted. It speaks only for
+ * a new cycle, a broken import, a broken architecture rule, or an UNTESTED change to a file other code
+ * depends on — never for "you changed 3 files".
+ */
+export function isNotable(report: ImpactReport): boolean {
+  if ((report.newCycles?.length ?? 0) > 0 || report.brokenImports.length > 0 || report.ruleViolations.length > 0) return true;
+  return report.files.some((file) => report.untested.includes(file.path) && file.transitiveDependents >= RISKY_DEPENDENTS);
 }
 
 const IMPORT_PARSED_LANGUAGES = new Set(["TypeScript", "JavaScript", "Python", "Go", "Java", "C", "C++"]);
@@ -208,7 +224,7 @@ export async function checkoutToTemp(repoPath: string, ref: string): Promise<{ d
 export function computeImpact(
   head: AnalysisResult,
   changed: ChangedFile[],
-  options: { base?: string; baseResult?: AnalysisResult } = {},
+  options: { base?: string; baseResult?: AnalysisResult; rules?: readonly ArchitectureRule[] } = {},
 ): ImpactReport {
   const nodes = head.graph?.nodes ?? [];
   const roleOf = new Map(nodes.map((node) => [node.id, node.layer] as const));
@@ -291,6 +307,7 @@ export function computeImpact(
     newCycles: baseCycleKeys ? headCycles.filter((cycle) => !baseCycleKeys.has(cycleKey(cycle))) : null,
     cyclesTouched: headCycles.filter((cycle) => cycle.some((id) => changedSet.has(id))),
     brokenImports: (head.graph?.resolution.unresolvedImports ?? []).filter((entry) => changedSet.has(entry.from)),
+    ruleViolations: options.rules?.length ? checkRules(head, options.rules, changedSet) : [],
     totalSourceFiles: nodes.filter((node) => node.layer === "source").length,
   };
 }
@@ -313,13 +330,14 @@ export function renderImpactMarkdown(report: ImpactReport, options: { linkBase?:
   const flags: string[] = [];
   if (report.newCycles && report.newCycles.length) flags.push(`❌ **${report.newCycles.length} new import cycle(s)**`);
   if (report.brokenImports.length) flags.push(`❌ **${report.brokenImports.length} import(s) that resolve to nothing**`);
+  if (report.ruleViolations.length) flags.push(`❌ **${report.ruleViolations.length} architecture rule violation(s)**`);
   if (report.untested.length) flags.push(`⚠️ ${report.untested.length} changed source file(s) no test reaches`);
   out.push(
     `**${report.changed.length}** file(s) changed (${sourceChanged} source) · **${report.blastRadius.length}** other production file(s) depend on them · ` +
       `**${report.entryPointsAffected.length}** entry point(s) affected · **${report.testsReaching.length}** test file(s) reach the change` +
       (report.base ? ` · base \`${report.base}\`` : ""),
   );
-  out.push("", flags.length ? flags.join(" · ") : "✅ No new cycles, no broken imports.", "");
+  out.push("", flags.length ? flags.join(" · ") : "✅ No new cycles, no broken imports, no rule violations.", "");
 
   const ranked = report.files.filter((file) => file.role !== undefined);
   if (ranked.length) {
@@ -344,6 +362,13 @@ export function renderImpactMarkdown(report: ImpactReport, options: { linkBase?:
   if (report.brokenImports.length) {
     out.push("<details open><summary><b>Imports that resolve to nothing</b></summary>", "");
     for (const entry of report.brokenImports.slice(0, LIST_CAP)) out.push(`- ${link(entry.from)} imports \`${entry.specifier}\``);
+    out.push("", "</details>", "");
+  }
+  if (report.ruleViolations.length) {
+    out.push("<details open><summary><b>Architecture rule violations</b> (<code>codeflow.rules.json</code>)</summary>", "");
+    for (const violation of report.ruleViolations.slice(0, LIST_CAP)) {
+      out.push(`- **${violation.rule}** — ${link(violation.from)} depends on ${link(violation.to)} (\`${violation.specifier}\`)`);
+    }
     out.push("", "</details>", "");
   }
   if (report.entryPointsAffected.length) {
@@ -377,6 +402,7 @@ export function renderImpactText(report: ImpactReport): string {
   out.push(`tests reaching: ${report.testsReaching.length} test file(s)`);
   out.push(`new cycles:     ${report.newCycles === null ? "base not analysed" : report.newCycles.length}`);
   out.push(`broken imports: ${report.brokenImports.length}`);
+  out.push(`rule breaks:    ${report.ruleViolations.length}`);
   out.push("");
   for (const file of report.files) {
     if (file.role === undefined) {
@@ -391,6 +417,7 @@ export function renderImpactText(report: ImpactReport): string {
   }
   for (const cycle of report.newCycles ?? []) out.push(`NEW CYCLE: ${[...cycle, cycle[0]].join(" → ")}`);
   for (const entry of report.brokenImports) out.push(`BROKEN IMPORT: ${entry.from} imports "${entry.specifier}"`);
+  for (const violation of report.ruleViolations) out.push(`RULE "${violation.rule}": ${violation.from} → ${violation.to}`);
   for (const file of report.untested) out.push(`UNTESTED: ${file}`);
   return out.join("\n");
 }

@@ -62,6 +62,12 @@ jobs:
       - name: Repo hygiene (no raw control bytes in source)
         run: node --test tests/source-hygiene.test.mjs
 
+      # This repository's own layering (codeflow.rules.json: packages never import apps, the base layer
+      # depends on nothing above it, the web app never reaches server code, ...), enforced on the
+      # resolved graph — so an import through a workspace package name is caught too.
+      - name: Architecture rules (self)
+        run: node apps/local-cli/dist/index.js check .
+
       # The import graph, scored against the TypeScript compiler's own module resolution on this
       # repository. Precision must be exact and recall ≥ 99%: the resolver once mapped 102 of 543
       # of this repo's own imports (every `./x.js` → `x.ts` was missed) while every test passed.
