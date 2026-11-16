@@ -261,3 +261,30 @@ export function scanCIncludes(content: string): CIncludeLine[] {
   });
   return out;
 }
+
+/** C# `using` directives and namespaces by line — the fallback when the grammar is unavailable. */
+export interface CSharpUsingLine {
+  target: string;
+  kind: "namespace" | "static" | "alias";
+  alias?: string;
+  global: boolean;
+  line: number;
+}
+
+const CS_USING = /^\s*(global\s+)?using\s+(static\s+)?(?:([A-Za-z_]\w*)\s*=\s*)?([A-Za-z_][\w.]*)\s*;/;
+
+export function scanCSharpUsings(content: string): CSharpUsingLine[] {
+  const out: CSharpUsingLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = CS_USING.exec(text);
+    if (!match) return;
+    out.push({
+      target: match[4],
+      kind: match[3] ? "alias" : match[2] ? "static" : "namespace",
+      ...(match[3] ? { alias: match[3] } : {}),
+      global: Boolean(match[1]),
+      line: index + 1,
+    });
+  });
+  return out;
+}

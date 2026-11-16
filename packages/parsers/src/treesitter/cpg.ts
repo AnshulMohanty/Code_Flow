@@ -9,6 +9,7 @@ import {
   scanGoImports,
   scanJavaImports,
   scanCIncludes,
+  scanCSharpUsings,
   splitAliasSegments,
 } from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
@@ -18,6 +19,7 @@ import { throughFactsStore } from "../factsStore.js";
 import { extractKey, takeExtract } from "./extractCache.js";
 import { extractGoFacts, type GoExtract } from "./go.js";
 import { extractCFamilyFacts, type CFamilyExtract } from "./cfamily.js";
+import { extractCSharpFacts, type CSharpExtract } from "./csharp.js";
 import { extractJavaFacts, type JavaExtract } from "./java.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
@@ -49,6 +51,10 @@ export interface CpgImport {
   isStatic?: boolean;
   /** C/C++ `#include <x>`: searched only on the include path, never the including file's directory. */
   system?: boolean;
+  /** C# `using J = X.Y;` → "J". */
+  alias?: string;
+  /** C# `global using` — applies to every file of the project. */
+  global?: boolean;
 }
 
 /** A call site, recorded by the ROOT local binding it goes through. */
@@ -113,6 +119,8 @@ export interface CpgFacts {
   qualifiedRefs?: string[];
   /** Java: names in the extends/implements clauses of top-level types (nested types do not shadow them). */
   headerRefs?: string[];
+  /** C#: the namespaces this file declares (types here see their own and every enclosing namespace). */
+  namespaces?: string[];
 }
 
 /** `export … from "x"` is reported through `imports` with kind `reexport`. */
@@ -183,18 +191,20 @@ function computeCpgFacts(input: ParseFileInput, lang: LanguageId): CpgFacts {
 }
 
 /** Languages whose Inventory symbols and Connect facts come from ONE extract (so one parse). */
-export const SHARED_EXTRACT = new Set<string>(["go", "java", "c", "cpp"]);
+export const SHARED_EXTRACT = new Set<string>(["go", "java", "c", "cpp", "csharp"]);
 
 /** The raw extract for a shared-extract language — what `parseTreeSitterFile` caches for Connect. */
 export function extractFor(language: string, tree: Tree, content: string): unknown {
   if (language === "go") return extractGoFacts(tree);
   if (language === "java") return extractJavaFacts(tree);
+  if (language === "csharp") return extractCSharpFacts(tree);
   return extractCFamilyFacts(tree, content);
 }
 
 function factsFromExtract(language: string, extract: unknown): CpgFacts {
   if (language === "go") return goFacts(extract as GoExtract);
   if (language === "java") return javaFacts(extract as JavaExtract);
+  if (language === "csharp") return csharpFacts(extract as CSharpExtract);
   return cFamilyFacts(extract as CFamilyExtract);
 }
 
@@ -611,6 +621,36 @@ function javaFacts(extract: JavaExtract): CpgFacts {
   };
 }
 
+// ── C# ────────────────────────────────────────────────────────────────────────────────
+
+function csharpFacts(extract: CSharpExtract): CpgFacts {
+  return {
+    imports: extract.usings.map((entry) => ({
+      source: entry.target,
+      specifiers: entry.alias ? [entry.alias] : [],
+      kind: "import" as const,
+      line: entry.line,
+      // The CLR loads a type on first use: a type cycle is legal, never a load-time failure.
+      lazy: true,
+      ...(entry.kind === "static" ? { isStatic: true } : {}),
+      ...(entry.alias ? { alias: entry.alias } : {}),
+      ...(entry.global ? { global: true } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    namespaces: extract.namespaces,
+    // Top-level types, fully qualified: what other files can reach by namespace.
+    declarations: extract.types
+      .filter((type) => !type.outer)
+      .map((type) => ({ name: type.namespace ? `${type.namespace}.${type.name}` : type.name, line: type.line })),
+    typeRefs: extract.typeRefs,
+    localTypes: extract.localTypes,
+    qualifiedRefs: extract.qualifiedRefs,
+  };
+}
+
 // ── C / C++ ───────────────────────────────────────────────────────────────────────────
 
 function cFamilyFacts(extract: CFamilyExtract): CpgFacts {
@@ -643,6 +683,23 @@ function cFamilyFacts(extract: CFamilyExtract): CpgFacts {
  */
 function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFacts {
   const facts: CpgFacts = { imports: [], calls: [], inheritance: [], routes: [], engine: PARSER_VERSION };
+  if (language === "csharp") {
+    for (const entry of scanCSharpUsings(input.content)) {
+      facts.imports.push({
+        source: entry.target,
+        specifiers: entry.alias ? [entry.alias] : [],
+        kind: "import",
+        line: entry.line,
+        lazy: true,
+        ...(entry.kind === "static" ? { isStatic: true } : {}),
+        ...(entry.alias ? { alias: entry.alias } : {}),
+        ...(entry.global ? { global: true } : {}),
+      });
+    }
+    const namespace = /^\s*namespace\s+([\w.]+)/m.exec(input.content)?.[1];
+    if (namespace) facts.namespaces = [namespace];
+    return facts;
+  }
   if (language === "c" || language === "cpp") {
     for (const entry of scanCIncludes(input.content)) {
       facts.imports.push({ source: entry.path, specifiers: [], kind: "import", line: entry.line, ...(entry.system ? { system: true } : {}) });

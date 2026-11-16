@@ -205,7 +205,7 @@ export interface AnalysisResult {
   cost?: CostBreakdown;
 }
 
-export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "go" | "java" | "c" | "cpp" | "generic" | "unknown";
+export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "go" | "java" | "c" | "cpp" | "csharp" | "generic" | "unknown";
 
 export type ParserConfidence = number;
 

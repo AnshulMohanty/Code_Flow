@@ -14,6 +14,7 @@ export { genericParser } from "./parsers/genericParser.js";
 export { goParser } from "./parsers/goParser.js";
 export { javaParser } from "./parsers/javaParser.js";
 export { cParser, cppParser } from "./parsers/cFamilyParser.js";
+export { csharpParser } from "./parsers/csharpParser.js";
 export { javascriptParser } from "./parsers/javascriptParser.js";
 export { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 export { pythonParser } from "./parsers/pythonParser.js";

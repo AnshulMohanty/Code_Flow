@@ -10,6 +10,7 @@ const LANGUAGE_BY_EXTENSION: Record<string, LanguageId> = {
   ".py": "python",
   ".go": "go",
   ".java": "java",
+  ".cs": "csharp",
   ".c": "c",
   ".h": "c",
   ".cc": "cpp",

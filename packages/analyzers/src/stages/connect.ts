@@ -193,8 +193,9 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
           }
         }
 
-        // 2a') Dependencies with no import statement: Java's same-package and fully qualified
-        //      uses. The JVM loads classes on first use, so these never form a load-time cycle.
+        // 2a') Dependencies with no import statement: Java's same-package and C#'s same/enclosing-
+        //      namespace and fully qualified uses. The JVM and the CLR load types on first use, so
+        //      these never form a load-time cycle.
         for (const dependency of resolver.implicit(file.path, language)) {
           for (const binding of dependency.bindings) {
             if (!targetByBinding.has(binding)) targetByBinding.set(binding, dependency.target);
@@ -318,6 +319,7 @@ function resolverLanguageOf(file: { language: string; ext: string }): ResolverLa
   if (file.language === "Python" || file.ext === ".py") return "python";
   if (file.ext === ".go") return "go";
   if (file.ext === ".java") return "java";
+  if (file.ext === ".cs") return "csharp";
   if (C_FAMILY_EXTENSIONS.has(file.ext)) return "c";
   return "js";
 }

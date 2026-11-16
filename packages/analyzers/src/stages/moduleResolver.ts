@@ -23,6 +23,8 @@
  *
  * Java: see `javaResolver.ts` — imports, same-package and fully qualified uses → the declaring file.
  *
+ * C#: see `csharpResolver.ts` — `using` directives, same/enclosing namespaces, global usings, partials.
+ *
  * C/C++: see `cResolver.ts` — `#include` in the compiler's search order; calls reach the defining file.
  *
  * Go: see `goResolver.ts` — import path → package directory (go.mod / replace / go.work, or an
@@ -30,13 +32,14 @@
  */
 import { createGoResolver, type GoFileFacts, type GoResolver, type GoUse } from "./goResolver.js";
 import { C_FAMILY_EXTENSIONS, createCResolver, type CResolver } from "./cResolver.js";
+import { createCSharpResolver, type CSharpFileFacts, type CSharpResolver } from "./csharpResolver.js";
 import { createJavaResolver, type ImplicitDependency, type JavaFileFacts, type JavaResolver } from "./javaResolver.js";
 
 export type { GoFileFacts, GoUse } from "./goResolver.js";
 export type { ImplicitDependency, JavaFileFacts } from "./javaResolver.js";
-export type ResolverLanguage = "js" | "python" | "go" | "java" | "c";
-/** What a resolver may need from each file's parse (Go: declarations; Java: types used and declared). */
-export type ResolverFileFacts = GoFileFacts & JavaFileFacts;
+export type ResolverLanguage = "js" | "python" | "go" | "java" | "c" | "csharp";
+/** What a resolver may need from each file's parse (Go: declarations; Java/C#: types used and declared). */
+export type ResolverFileFacts = GoFileFacts & JavaFileFacts & CSharpFileFacts;
 
 export interface ImportSpecLike {
   source: string;
@@ -48,6 +51,9 @@ export interface ImportSpecLike {
   isStatic?: boolean;
   /** C/C++ `#include <x>`. */
   system?: boolean;
+  /** C# alias (`using J = X.Y;`) and `global using`. */
+  alias?: string;
+  global?: boolean;
 }
 
 export interface ResolvedTarget {
@@ -467,9 +473,15 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
     ? createCResolver({ files: input.files, facts: input.facts ?? new Map() })
     : undefined;
 
+  const csharp: CSharpResolver | undefined = input.files.some((path) => path.endsWith(".cs"))
+    ? createCSharpResolver({ files: input.files, facts: input.facts ?? new Map() })
+    : undefined;
+
   return {
     implicit(fromFile, language) {
-      return language === "java" && java ? java.implicit(fromFile) : [];
+      if (language === "java" && java) return java.implicit(fromFile);
+      if (language === "csharp" && csharp) return csharp.implicit(fromFile);
+      return [];
     },
     samePackage(fromFile, name) {
       if (fromFile.endsWith(".go")) return go?.samePackage(fromFile, name);
@@ -480,6 +492,7 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
       if (language === "go") return go ? go.resolve(fromFile, spec, uses ?? []) : { status: "external" };
       if (language === "java") return java ? java.resolve(fromFile, spec) : { status: "external" };
       if (language === "c") return cFamily ? cFamily.resolve(fromFile, spec) : { status: "external" };
+      if (language === "csharp") return csharp ? csharp.resolve(fromFile, spec) : { status: "external" };
       if (language === "python") return resolvePython(fromFile, spec);
       const resolution = resolveJs(fromFile, spec.source);
       if (resolution.status === "resolved") {
