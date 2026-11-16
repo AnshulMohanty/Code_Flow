@@ -7,6 +7,7 @@ const LANGUAGE_BY_EXTENSION: Record<string, LanguageId> = {
   ".jsx": "jsx",
   ".mjs": "javascript",
   ".py": "python",
+  ".go": "go",
   ".ts": "typescript",
   ".tsx": "tsx",
 };

@@ -4,10 +4,10 @@
 
 ### The codebase map that proves its answers.
 
-CodeFlow maps how a JavaScript, TypeScript or Python codebase fits together, answers questions cited
-to real files and lines, and **checks the code references in anyone's answer** — an AI agent's, a PR
-description's, a reviewer's — against the repository. The graph is scored against the TypeScript
-compiler; the checker runs offline, with no key.
+CodeFlow maps how a JavaScript, TypeScript, Python or Go codebase fits together, answers questions
+cited to real files and lines, and **checks the code references in anyone's answer** — an AI agent's,
+a PR description's, a reviewer's — against the repository. The graph is scored against each
+language's own toolchain (the TypeScript compiler, `go list`); the checker runs offline, with no key.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)
@@ -60,7 +60,9 @@ The same check is available for text CodeFlow did **not** write: `codeflow-local
 `verify_citations` MCP tool and the GitHub Action take any prose and mark every `path:line`, GitHub
 link and named symbol as verified, unverifiable or wrong. See [Check an answer or a PR](#check-an-answer-or-a-pr).
 
-### Measured, not asserted: the import graph vs the TypeScript compiler
+### Measured, not asserted: the import graph vs each language's own toolchain
+
+**TypeScript / JavaScript**, against the TypeScript compiler.
 
 `scripts/graph-accuracy.mjs` resolves every import in a repository with `ts.resolveModuleName` under
 the nearest `tsconfig` — what `tsc` itself does — and compares each one with CodeFlow's edge for the
@@ -77,8 +79,29 @@ same `(file, specifier)`. Measured on 2026-11-16 at each repository's default-br
 The four misses are imports written inside `declare module "…" { … }` blocks. CodeFlow additionally
 maps workspace-package imports (`@acme/ui`) to their **source** files, which tsc can only resolve to a
 built `dist/`; those are reported as "extra" by the script rather than counted either way. CI runs the
-same check on this repository and fails below 100% precision / 99% recall. Python imports are not
-benchmarked against a reference resolver yet.
+same check on this repository and fails below 100% precision / 99% recall.
+
+**Go**, against the Go toolchain. `scripts/accuracy/go.mjs` asks `go list -deps -test` — in every
+module, with each repository's own `replace`, `go.work` and vendoring — which directory every import
+resolves to, and compares it with CodeFlow's edge. CodeFlow points a Go import at the file that
+declares what is used (`store.Open` → the file declaring `Open`), so an edge agrees when its target
+is in the directory `go list` chose. Measured on 2026-11-16:
+
+| Repository | Layout | In-repo imports (per `go list`) | Wrong | Missed | Precision | Recall |
+|---|---|---:|---:|---:|---:|---:|
+| kubernetes/kubernetes | 40 modules, staging + `replace` | 59,823 | 0 | 0 | 100% | 100% |
+| gohugoio/hugo | 4 modules | 2,222 | 0 | 0 | 100% | 100% |
+| etcd-io/etcd | 14 modules, `go.work` | 2,124 | 0 | 0 | 100% | 100% |
+| etcd-io/etcd v3.3.27 | GOPATH era, no `go.mod` | 1,262 | 0 | 0 | 100% | 100% |
+| spf13/cobra | 1 module | 7 | 0 | 0 | 100% | 100% |
+
+For the GOPATH-era repository the import prefix it was checked out under is inferred from its own
+imports (`github.com/coreos/etcd`); `go list` ran in GOPATH mode at that path. "Extra" edges —
+CodeFlow has one, `go list` does not — are all files behind build tags (`_windows.go`,
+`//go:build tools`), which a default `go list` skips. CI runs the etcd check and fails below 100%
+precision / 99% recall. Kubernetes (26,558 files) analyses in 34 s on a laptop.
+
+Python imports are not benchmarked against a reference resolver yet.
 
 ---
 
@@ -88,12 +111,12 @@ Not everything here is the same kind of thing, and the difference matters more t
 
 | Capability | Kind | What that means |
 |---|---|---|
-| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports. Scored against tsc above. |
+| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports, Go modules (`replace`, `go.work`, nested modules, GOPATH-era repos). Scored against tsc and `go list` above. Committed JS bundles (webpack/browserify/Parcel) are left out rather than reported as hundreds of broken imports. |
 | Call graph, centrality, blast radius | **Real** | Computed from parsed source. Deterministic: same commit in, byte-identical numbers out. Key-file ranking counts production imports only, so heavily-tested files do not outrank load-bearing ones. |
 | Import cycles | **Real** | **Load-time** cycles only: `import type`, `if TYPE_CHECKING:`, imports inside function bodies and dynamic `import()` cannot cause an import-order failure and are excluded — on Zod, tRPC and Flask that is the difference between dozens of reported cycles and the true number, zero. |
 | Citation check of arbitrary text | **Real** | Does the file exist, are the cited lines inside it (physical line count), is the named symbol declared there? It proves a reference points at something real — not that the prose around it describes that code correctly. |
 | PR impact (`impact`, GitHub Action) | **Real** | Dependents, entry points, tests that reach the change, new load-time cycles and imports that resolve to nothing — from the import graph of both sides of the diff. |
-| Symbol extraction (JS/TS/JSX/TSX/Python) | **Real** | tree-sitter WASM. Measured against authored ground truth in `packages/eval`. |
+| Symbol extraction (JS/TS/JSX/TSX/Python/Go) | **Real** | tree-sitter WASM. JS/TS/Python measured against authored ground truth in `packages/eval`. |
 | Community detection (Louvain) | **Real** | Seeded and canonically relabelled, so two runs of the same graph give the same partition. |
 | Citation grounding | **Real** | Structural — see above. Enforced at the point of production, and shared as one predicate between the app, the eval and the verifier harness. |
 | Hybrid retrieval (BM25 + vector → RRF → rerank → MMR) | **Real** | The refusal floor is compared against the vector arm's raw cosine, before fusion, so "I don't know" stays meaningful. |
@@ -107,10 +130,11 @@ Not everything here is the same kind of thing, and the difference matters more t
 
 ## Honest limits
 
-- **Language coverage is narrower than "any codebase".** tree-sitter covers **JavaScript,
-  TypeScript, JSX, TSX and Python**. Everything else gets regex import-scanning and line counts —
-  no symbols, no call edges — so `find_references`, callers and blast radius return little of use
-  on a Go, Rust, Java or C# repository. The pipeline degrades gracefully; it does not pretend.
+- **Language coverage is narrower than "any codebase".** Deep support — symbols, call edges and a
+  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python and Go**. Java, C#,
+  C/C++, Rust and PHP are next; until then they get line counts only, so `find_references`, callers
+  and blast radius return little of use on those repositories. The pipeline degrades gracefully; it
+  does not pretend.
 - **The AI stages need your key.** No key means no summary and no Q&A. The map, the metrics, the
   cycles and the communities all still work.
 - **The fan-out is opt-in.** It is 5N+1 provider calls where the single-shot stage is 1. With it

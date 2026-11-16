@@ -83,20 +83,12 @@ export interface LocalAnalysisResult {
   warnings: string[];
 }
 
-/** Directories never worth walking. Same spirit as the hosted walker's ignores. */
-const SKIP_DIRS = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "build",
-  "coverage",
-  ".next",
-  ".turbo",
-  ".codeflow",
-  "__pycache__",
-  ".venv",
-  "venv",
-]);
+/**
+ * Directories never listed: this tool's own index, plus heavy trees Map-structure hard-ignores
+ * anyway. Ambiguous names (`build`, `out`, `coverage`) are NOT here — Map-structure decides those
+ * by content (a Go package named `coverage` is source), and a second list would overrule it.
+ */
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".next", ".turbo", ".codeflow", "__pycache__", ".venv", "venv"]);
 
 /** Read a repo-relative file. Returns null when unreadable — a single bad file is not a failure. */
 async function readRepoFile(repoPath: string, relativePath: string): Promise<string | null> {

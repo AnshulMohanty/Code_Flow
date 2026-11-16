@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { ParsedFile } from "@codeflow/shared-types";
 import { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
 import { genericParser } from "./parsers/genericParser.js";
+import { goParser } from "./parsers/goParser.js";
 import { javascriptParser } from "./parsers/javascriptParser.js";
 import { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 import { pythonParser } from "./parsers/pythonParser.js";
@@ -22,6 +23,7 @@ const DEFAULT_PARSERS = [
   createTreeSitterParser(typescriptParser),
   createTreeSitterParser(tsxParser),
   createTreeSitterParser(pythonParser),
+  createTreeSitterParser(goParser),
   genericParser,
 ];
 

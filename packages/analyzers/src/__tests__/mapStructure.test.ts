@@ -119,6 +119,17 @@ describe("map-structure — ignores", () => {
     expect(structure.files.map((f) => f.path)).toEqual(["src/index.ts"]);
   });
 
+  it("keeps a build/out/coverage directory that is a Go package (Kubernetes' pkg/test/coverage)", async () => {
+    const structure = await mapStructure({
+      "pkg/test/coverage/coverage.go": 1,
+      "tools/build/build.go": 1,
+      "coverage/lcov.info": 1,
+      "coverage/lcov-report/index.html": 1,
+      "web/build/main.js": 1,
+    });
+    expect(structure.files.map((f) => f.path)).toEqual(["pkg/test/coverage/coverage.go", "tools/build/build.go"]);
+  });
+
   it("respects .gitignore patterns (glob, dir, negation)", async () => {
     const structure = await mapStructure(
       {

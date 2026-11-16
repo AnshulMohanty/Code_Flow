@@ -8,7 +8,7 @@ import { Language as TsLanguage, Parser as TsParser } from "web-tree-sitter";
  * `jsx` deliberately maps onto the JavaScript grammar: tree-sitter-javascript parses JSX
  * natively, so there is no separate jsx grammar to ship.
  */
-export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python";
+export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python" | "go";
 
 export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "javascript",
@@ -16,6 +16,7 @@ export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "typescript",
   "tsx",
   "python",
+  "go",
 ];
 
 /** Grammar wasm filename per language (jsx shares the JavaScript grammar). */
@@ -25,6 +26,7 @@ const GRAMMAR_FILE: Record<TreeSitterLanguageId, string> = {
   typescript: "tree-sitter-typescript.wasm",
   tsx: "tree-sitter-tsx.wasm",
   python: "tree-sitter-python.wasm",
+  go: "tree-sitter-go.wasm",
 };
 
 /**

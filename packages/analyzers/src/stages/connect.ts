@@ -1,6 +1,6 @@
 import { buildDependencyGraph } from "@codeflow/graph";
-import { createParserRegistry, extractCpgFacts, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
-import { createModuleResolver } from "./moduleResolver.js";
+import { createParserRegistry, extractCpgFacts, isJavaScriptBundle, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
+import { createModuleResolver, type GoUse, type ResolverLanguage } from "./moduleResolver.js";
 import type {
   CpgEdge,
   CpgProvenance,
@@ -34,6 +34,9 @@ export interface ConnectDependencies {
  * this module" (Impact tab); ranking metrics that must stay production-only filter them in Analyze.
  */
 const PARSED_ROLES = new Set(["source", "test"]);
+
+/** Plain-JavaScript extensions a committed bundle can have (TypeScript is never a bundle). */
+const JS_BUNDLE_EXTS = new Set([".js", ".cjs", ".mjs"]);
 
 /** The engine label `extractCpgFacts` reports when tree-sitter produced the facts. */
 const TREE_SITTER_ENGINE = "treesitter-v1";
@@ -95,21 +98,41 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
         lines: loc[file.path] ?? 0, // real LOC for source; 0 for non-source (documented)
         symbolCount: symbolCountByPath.get(file.path) ?? 0,
       }));
-      const resolver = await createModuleResolver({
-        files: structure.files.map((file) => file.path),
-        read: (path) => deps.readFile(repoPath, path),
-      });
-
-      // 2) One tree-sitter pass per source file. Grammars are loaded once (the load is
-      //    shared with Inventory); a file whose language has no grammar falls back to regex
-      //    import extraction, so DEPENDENCY coverage never regresses — only the enrichment
-      //    (calls / inheritance / routes) is lost, and `graph.cpg` records that honestly.
+      // 2) One tree-sitter pass per source file, BEFORE any resolution: Go resolves an import to
+      //    the file declaring the name it uses, which needs every file's declarations first.
+      //    Grammars are loaded once (shared with Inventory); a file whose language has no grammar
+      //    falls back to regex import extraction, so DEPENDENCY coverage never regresses — only
+      //    the enrichment (calls / inheritance / routes) is lost, and `graph.cpg` records that.
       const treeSitter = await registry.ready();
       if (!treeSitter.ready) {
         ctx.logger.warn("Connect: no tree-sitter grammar loaded; the CPG will hold imports only.", {
           failed: treeSitter.failed.map((entry) => entry.language),
         });
       }
+
+      let treeSitterFiles = 0;
+      let fallbackFiles = 0;
+      let bundledFiles = 0;
+      const parsed: Array<{ file: (typeof structure.files)[number]; facts: CpgFacts }> = [];
+      for (const file of structure.files) {
+        if (!PARSED_ROLES.has(file.role)) continue;
+        const content = await deps.readFile(repoPath, file.path);
+        if (content === null) continue; // unreadable: contributes a node, no edges
+        if (JS_BUNDLE_EXTS.has(file.ext) && isJavaScriptBundle(content)) {
+          bundledFiles += 1; // a node, but its requires address the bundle's own module table
+          continue;
+        }
+        const facts = extractCpgFacts({ path: file.path, content });
+        if (facts.engine === TREE_SITTER_ENGINE) treeSitterFiles += 1;
+        else fallbackFiles += 1;
+        parsed.push({ file, facts });
+      }
+
+      const resolver = await createModuleResolver({
+        files: structure.files.map((file) => file.path),
+        read: (path) => deps.readFile(repoPath, path),
+        facts: new Map(parsed.map(({ file, facts }) => [file.path, facts])),
+      });
 
       const edges: RepoDependencyEdge[] = [];
       const richDeps: DependencyEdge[] = []; // fed to @codeflow/graph
@@ -121,24 +144,17 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
       let resolved = 0;
       let external = 0;
       let unresolved = 0;
-      let treeSitterFiles = 0;
-      let fallbackFiles = 0;
 
-      for (const file of structure.files) {
-        if (!PARSED_ROLES.has(file.role)) continue;
-        const content = await deps.readFile(repoPath, file.path);
-        if (content === null) continue; // unreadable: contributes a node, no edges
-
-        const isPython = file.language === "Python" || file.ext === ".py";
-        const facts = extractCpgFacts({ path: file.path, content });
-        if (facts.engine === TREE_SITTER_ENGINE) treeSitterFiles += 1;
-        else fallbackFiles += 1;
+      for (const { file, facts } of parsed) {
+        const language = resolverLanguageOf(file);
+        const uses = language === "go" ? goUses(facts) : undefined;
 
         // 2a) Dependency edges, plus the local-binding -> target-file map that the call and
         //     inheritance edges resolve through.
         const targetByBinding = new Map<string, string>();
+        const targetBySymbol = new Map<string, string>();
         for (const spec of facts.imports) {
-          const resolution = resolver.resolve(file.path, spec, isPython ? "python" : "js");
+          const resolution = resolver.resolve(file.path, spec, language, uses);
           if (resolution.status === "external") {
             external += 1;
             externalModules.add(spec.source);
@@ -150,11 +166,14 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
             continue;
           }
           resolved += 1;
-          for (const { target, bindings } of resolution.targets) {
+          for (const { target, bindings, symbols } of resolution.targets) {
             // First import of a binding wins: resolving a later shadowing declaration would
             // need real scope analysis, and guessing would fabricate an edge.
             for (const binding of bindings) {
               if (!targetByBinding.has(binding)) targetByBinding.set(binding, target);
+            }
+            for (const symbol of symbols ?? []) {
+              if (!targetBySymbol.has(symbol)) targetBySymbol.set(symbol, target);
             }
             const key = `${file.path} ${target} ${spec.kind} ${spec.source}`;
             if (edgeKeys.has(key)) continue;
@@ -173,14 +192,20 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
 
         // 2b) Calls + inheritance, resolved through this file's own imports. A reference to
         //     a locally-declared name has no cross-file target and is skipped, never guessed.
+        //     Go resolves by the NAME used (`store.Open` → the file declaring Open), and a bare
+        //     name may live in another file of the same package — Go needs no import for that.
+        const targetOf = (binding: string, symbol: string): string | undefined => {
+          if (language !== "go") return targetByBinding.get(binding);
+          return targetBySymbol.get(symbol) ?? (symbol === binding ? resolver.samePackage(file.path, symbol) : undefined);
+        };
         for (const call of facts.calls) {
-          addCpgEdge(cpgAggregate, file.path, targetByBinding.get(call.binding), "call", call.symbol, call.line);
+          addCpgEdge(cpgAggregate, file.path, targetOf(call.binding, call.symbol), "call", call.symbol, call.line);
         }
         for (const relation of facts.inheritance) {
           addCpgEdge(
             cpgAggregate,
             file.path,
-            targetByBinding.get(relation.binding),
+            targetOf(relation.binding, relation.symbol),
             relation.kind,
             relation.symbol,
             relation.line,
@@ -229,7 +254,12 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
           a.method.localeCompare(b.method) ||
           a.line - b.line,
       );
-      const cpg: CpgProvenance = { treeSitterFiles, fallbackFiles, enriched: treeSitterFiles > 0 };
+      const cpg: CpgProvenance = {
+        treeSitterFiles,
+        fallbackFiles,
+        enriched: treeSitterFiles > 0,
+        ...(bundledFiles ? { bundledFiles } : {}),
+      };
       const graph: RepoGraph = { nodes, edges, resolution, cpgEdges, routes, cpg };
 
       const event: ProgressEvent = {
@@ -260,6 +290,21 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
       return { partial: { graph }, event };
     },
   };
+}
+
+// --- Language routing ---------------------------------------------------------
+
+function resolverLanguageOf(file: { language: string; ext: string }): ResolverLanguage {
+  if (file.language === "Python" || file.ext === ".py") return "python";
+  if (file.ext === ".go") return "go";
+  return "js";
+}
+
+/** Every name a Go file uses through a possible binding: `x.Y` references, plus bare calls (dot imports). */
+function goUses(facts: CpgFacts): GoUse[] {
+  const uses: GoUse[] = facts.references ? [...facts.references] : [];
+  for (const call of facts.calls) if (call.binding === call.symbol) uses.push(call);
+  return uses;
 }
 
 // --- CPG aggregation --------------------------------------------------------

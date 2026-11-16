@@ -40,15 +40,12 @@ const HARD_IGNORE_DIRS = new Set([
   "bower_components",
   "vendor",
   "dist",
-  "build",
-  "out",
   "target",
   ".next",
   ".nuxt",
   ".svelte-kit",
   ".turbo",
   ".cache",
-  "coverage",
   ".venv",
   "venv",
   "__pycache__",
@@ -59,6 +56,13 @@ const HARD_IGNORE_DIRS = new Set([
   ".idea",
   ".vscode",
 ]);
+
+/**
+ * Output-directory names that are ALSO real package names in Go (`go/build`, Kubernetes'
+ * `pkg/test/coverage`). Skipped like the hard list, unless the directory directly holds Go
+ * source: a Go package always does, generated output never does.
+ */
+const SOFT_IGNORE_DIRS = new Set(["build", "out", "coverage"]);
 
 /**
  * Stage 3 — Map-structure (deterministic). Discovers the full file tree, classifies
@@ -127,12 +131,18 @@ async function walk(
 ): Promise<RepoFile[]> {
   const files: RepoFile[] = [];
 
-  async function descend(relativeDir: string): Promise<void> {
-    const entries = await readDir(repoPath, relativeDir);
+  async function descend(relativeDir: string, listed?: WalkEntry[]): Promise<void> {
+    const entries = listed ?? (await readDir(repoPath, relativeDir));
     for (const entry of entries) {
       if (entry.type === "dir") {
         if (HARD_IGNORE_DIRS.has(entry.name)) continue;
         if (isIgnored(entry.path, true, ignoreRules)) continue;
+        if (SOFT_IGNORE_DIRS.has(entry.name)) {
+          const children = await readDir(repoPath, entry.path);
+          if (!children.some((child) => child.type === "file" && child.name.endsWith(".go"))) continue;
+          await descend(entry.path, children);
+          continue;
+        }
         await descend(entry.path);
         continue;
       }

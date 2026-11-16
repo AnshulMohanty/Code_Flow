@@ -6,11 +6,13 @@ import {
   PY_FROM_IMPORT_LINE,
   PY_IMPORT_LINE,
   parseStaticImportLine,
+  scanGoImports,
   splitAliasSegments,
 } from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { calleeName, calleeTail, field, namedChildrenOf, startLine, stringValue } from "./ast.js";
+import { extractGoFacts } from "./go.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
 /**
@@ -53,6 +55,12 @@ export interface CpgInheritance {
   line: number;
 }
 
+/** A top-level declaration (Go): what an importer's `pkg.Name` can point at. */
+export interface CpgDeclaration {
+  name: string;
+  line: number;
+}
+
 export interface CpgRoute {
   method: HttpRouteMethod;
   path: string;
@@ -73,6 +81,14 @@ export interface CpgFacts {
   routes: CpgRoute[];
   /** `treesitter-v1` ⇒ calls/inheritance/routes are real. `parser-v1` ⇒ imports only. */
   engine: string;
+  /**
+   * Go only. A Go import names a package (a directory), so resolving it to the FILES it really
+   * depends on needs the package name, the top-level declarations, and every `x.Y` reference
+   * (calls, types, values) — not just call sites.
+   */
+  packageName?: string;
+  declarations?: CpgDeclaration[];
+  references?: CpgCall[];
 }
 
 /** `export … from "x"` is reported through `imports` with kind `reexport`. */
@@ -121,7 +137,9 @@ export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): C
       const tree = parser.parse(input.content);
       if (tree) {
         try {
-          return lang === "python" ? pythonFacts(tree) : jsLikeFacts(tree);
+          if (lang === "python") return pythonFacts(tree);
+          if (lang === "go") return goFacts(tree);
+          return jsLikeFacts(tree);
         } finally {
           tree.delete();
         }
@@ -496,6 +514,29 @@ const PY_ROUTE_METHODS_BY_LABEL: Record<string, HttpRouteMethod> = {
   HEAD: "HEAD",
 };
 
+// ── Go ────────────────────────────────────────────────────────────────────────────────
+
+function goFacts(tree: Tree): CpgFacts {
+  const extract = extractGoFacts(tree);
+  return {
+    // `specifiers` carries the explicit name only (alias, `.` or `_`); the default binding is
+    // the TARGET package's name, which only the resolver knows.
+    imports: extract.imports.map((entry) => ({
+      source: entry.source,
+      specifiers: entry.name ? [entry.name] : [],
+      kind: "import" as const,
+      line: entry.line,
+    })),
+    calls: extract.calls,
+    inheritance: extract.embeds.map((embed) => ({ ...embed, kind: "extends" as const })),
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    ...(extract.packageName ? { packageName: extract.packageName } : {}),
+    declarations: extract.declarations.map((decl) => ({ name: decl.name, line: decl.line })),
+    references: extract.references,
+  };
+}
+
 // ── Regex fallback (imports + re-exports only) ────────────────────────────────────────
 
 /**
@@ -506,6 +547,12 @@ const PY_ROUTE_METHODS_BY_LABEL: Record<string, HttpRouteMethod> = {
  */
 function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFacts {
   const facts: CpgFacts = { imports: [], calls: [], inheritance: [], routes: [], engine: PARSER_VERSION };
+  if (language === "go") {
+    for (const entry of scanGoImports(input.content)) {
+      facts.imports.push({ source: entry.source, specifiers: entry.name ? [entry.name] : [], kind: "import", line: entry.line });
+    }
+    return facts;
+  }
   const isPython = language === "python";
   const lines = input.content.split(/\r\n|\r|\n/);
 

@@ -6,6 +6,7 @@ import type { ParseFileInput, ParserAdapter } from "../types.js";
 import { TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
+import { extractGo } from "./go.js";
 import { extractJsLike } from "./jsLike.js";
 import { extractPython } from "./python.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
@@ -31,9 +32,9 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
   const tree = parser.parse(input.content);
   if (!tree) return null;
   try {
-    return language === "python"
-      ? pythonParsedFile(tree, input)
-      : jsLikeParsedFile(tree, input, language);
+    if (language === "python") return pythonParsedFile(tree, input);
+    if (language === "go") return goParsedFile(tree, input);
+    return jsLikeParsedFile(tree, input, language);
   } finally {
     // The tree lives in the wasm heap — releasing it is not optional on a big repo.
     tree.delete();
@@ -71,6 +72,23 @@ function pythonParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
     exports: [],
     symbols: extract.symbols,
     dependencies: extract.imports.map((parsedImport, index) => toPythonDependency(input.path, parsedImport, index)),
+    warnings: [],
+    parserVersion: TREE_SITTER_PARSER_VERSION,
+  };
+}
+
+/** Go import paths name packages; they resolve in Connect, against go.mod and the repo's directories. */
+function goParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
+  const extract = extractGo(tree);
+  return {
+    path: input.path,
+    language: "go",
+    extension: extensionOf(input.path),
+    loc: countLoc(input.content),
+    imports: extract.imports,
+    exports: extract.exports,
+    symbols: extract.symbols,
+    dependencies: extract.imports.map((parsedImport, index) => toDependency(input.path, parsedImport, index)),
     warnings: [],
     parserVersion: TREE_SITTER_PARSER_VERSION,
   };

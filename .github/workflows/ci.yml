@@ -74,6 +74,50 @@ jobs:
             console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
             if (a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
 
+  # The Go import graph, scored against the Go toolchain's own resolution (`go list -deps -test`)
+  # on a real multi-module repository (14 modules, go.work), pinned to a commit. Precision must be
+  # exact and recall ≥ 99%. Clones one public repository and downloads its modules; no secrets.
+  go-accuracy:
+    name: Graph accuracy vs go list (etcd)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone etcd at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/etcd"
+          git -C "$RUNNER_TEMP/etcd" fetch -q --depth 1 https://github.com/etcd-io/etcd.git f577f0d80fc58210a94aee6e09aebf6b2ad96165
+          git -C "$RUNNER_TEMP/etcd" checkout -q FETCH_HEAD
+
+      - name: Score against go list
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/etcd" --no-index --out "$RUNNER_TEMP/etcd.json"
+          node scripts/accuracy/go.mjs "$RUNNER_TEMP/etcd" "$RUNNER_TEMP/etcd.json" --json > "$RUNNER_TEMP/go-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/go-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.goInRepoEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
   # Builds the three images AND runs a real analysis through the composed stack. Building alone
   # was green while the worker exited 0 on boot and no job was ever consumed. Clones one small
   # public repository; no secrets (the AI stages run against a placeholder key and must degrade).

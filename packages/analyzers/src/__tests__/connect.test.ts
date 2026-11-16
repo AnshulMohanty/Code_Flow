@@ -23,6 +23,7 @@ const LANG_BY_EXT: Record<string, string> = {
   ".tsx": "TypeScript",
   ".js": "JavaScript",
   ".py": "Python",
+  ".go": "Go",
   ".json": "JSON",
   ".md": "Markdown",
 };
@@ -358,5 +359,76 @@ describe("connect — completeness & resilience", () => {
     const ctx = ctxFor([]);
     const noRepo: PipelineContext = { ...ctx, repoPath: undefined };
     await expect(stage.run(input, noRepo)).rejects.toThrow(/repoPath/);
+  });
+});
+
+describe("connect — Go", () => {
+  const GO_REPO: FileSpec[] = [
+    { path: "go.mod", content: "module github.com/acme/app\n\ngo 1.22\n", role: "config" },
+    {
+      path: "cmd/app/main.go",
+      content: `package main
+
+import (
+	"fmt"
+
+	"github.com/acme/app/store"
+)
+
+func main() { s := store.Open(); fmt.Println(s); run() }
+`,
+    },
+    { path: "cmd/app/run.go", content: "package main\n\nfunc run() {}\n" },
+    { path: "store/store.go", content: "package store\n\ntype Store struct{}\n" },
+    { path: "store/open.go", content: "package store\n\nfunc Open() *Store { return &Store{} }\n" },
+    {
+      path: "store/open_test.go",
+      content: "package store_test\n\nimport (\n\t\"testing\"\n\t\"github.com/acme/app/store\"\n)\n\nfunc TestOpen(t *testing.T) { store.Open() }\n",
+      role: "test",
+    },
+    { path: "store/gone.go", content: 'package store\n\nimport "github.com/acme/app/missing"\n\nvar _ = missing.X\n' },
+  ];
+
+  it("resolves through go.mod to the declaring file, keeps stdlib external and flags a broken import", async () => {
+    const graph = await connect(GO_REPO);
+    expect(graph.edges).toEqual(
+      expect.arrayContaining([
+        { from: "cmd/app/main.go", to: "store/open.go", kind: "import", specifier: "github.com/acme/app/store" },
+        { from: "store/open_test.go", to: "store/open.go", kind: "import", specifier: "github.com/acme/app/store" },
+      ]),
+    );
+    expect(graph.edges).toHaveLength(2);
+    expect(graph.resolution.externalModules).toEqual(["fmt", "testing"]);
+    expect(graph.resolution.unresolvedImports).toEqual([{ from: "store/gone.go", specifier: "github.com/acme/app/missing" }]);
+  });
+
+  it("call edges reach the declaring file, including same-package calls that need no import", async () => {
+    const graph = await connect(GO_REPO);
+    const calls = graph.cpgEdges!.filter((edge) => edge.kind === "call").map(({ from, to, symbol }) => [from, to, symbol]);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        ["cmd/app/main.go", "store/open.go", "store.Open"],
+        ["cmd/app/main.go", "cmd/app/run.go", "run"],
+      ]),
+    );
+    // `fmt.Println` is external, and the composite literal in open.go is not a call — no edge is invented.
+    expect(calls.some(([, to]) => to === "store/store.go")).toBe(false);
+  });
+});
+
+describe("connect — committed bundles", () => {
+  it("leaves a browserify/webpack bundle out of the graph instead of reporting its internal requires as broken", async () => {
+    const graph = await connect([
+      { path: "src/app.js", content: "const live = require('../vendor-ish/livereload.js');" },
+      {
+        path: "vendor-ish/livereload.js",
+        content:
+          '(function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);var a=new Error("Cannot find module \'"+i+"\'");throw a.code="MODULE_NOT_FOUND",a}}}}})()\nvar wks = require("./_wks");\n',
+      },
+      { path: "public/app.bundle.js", content: "var m = __webpack_require__(12); require('./_internal');" },
+    ]);
+    expect(graph.edges).toEqual([{ from: "src/app.js", to: "vendor-ish/livereload.js", kind: "require", specifier: "../vendor-ish/livereload.js" }]);
+    expect(graph.resolution.unresolvedImports).toEqual([]);
+    expect(graph.cpg?.bundledFiles).toBe(2);
   });
 });

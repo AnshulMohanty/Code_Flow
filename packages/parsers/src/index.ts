@@ -4,13 +4,17 @@ export { isSupportedSourceFile, shouldExcludePath } from "./filesystem/fileFilte
 export { resolvePythonImport, resolveRelativeImport } from "./resolution/importResolver.js";
 export { createParserRegistry, parseRepository, ParserRegistry } from "./registry.js";
 export { genericParser } from "./parsers/genericParser.js";
+export { goParser } from "./parsers/goParser.js";
 export { javascriptParser } from "./parsers/javascriptParser.js";
 export { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 export { pythonParser } from "./parsers/pythonParser.js";
 export { createTreeSitterParser, parseTreeSitterFile } from "./treesitter/parseTreeSitter.js";
 export { extractCpgFacts } from "./treesitter/cpg.js";
+export { isGoExported } from "./treesitter/go.js";
+export { isJavaScriptBundle } from "./utils/importScan.js";
 export type {
   CpgCall,
+  CpgDeclaration,
   CpgFacts,
   CpgImport,
   CpgInheritance,

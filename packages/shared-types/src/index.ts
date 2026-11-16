@@ -205,7 +205,7 @@ export interface AnalysisResult {
   cost?: CostBreakdown;
 }
 
-export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "generic" | "unknown";
+export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "go" | "generic" | "unknown";
 
 export type ParserConfidence = number;
 
@@ -684,6 +684,12 @@ export interface CpgProvenance {
   fallbackFiles: number;
   /** True when at least one file was parsed by tree-sitter. */
   enriched: boolean;
+  /**
+   * Committed JavaScript BUNDLES (webpack / browserify / Parcel output) left out of the graph:
+   * their `require("./_x")` calls address modules inside the bundle, not files in the repo, and
+   * would surface as hundreds of fake broken imports. Absent when there were none.
+   */
+  bundledFiles?: number;
 }
 
 // ── Analyze slice (stage 6) ──────────────────────────────────────────────────

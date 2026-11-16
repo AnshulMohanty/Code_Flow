@@ -163,3 +163,63 @@ function readImportClause(raw: string | null): string | null {
   if (!endsWithWhitespace(specifiers)) return null; // the `\s+` before `from`
   return specifiers.trim();
 }
+
+/**
+ * Go imports by line scanning — the fallback when the Go grammar is unavailable. Handles the
+ * single form (`import "x"`, `import alias "x"`) and the grouped form (`import ( … )`), with
+ * interpreted or raw string paths. Comments after a spec are ignored.
+ */
+export interface GoImportLine {
+  source: string;
+  name?: string;
+  line: number;
+}
+
+const GO_SPEC = /^(?:([A-Za-z_][\w]*|\.)\s+)?(?:"([^"\\]+)"|`([^`]+)`)/;
+
+export function scanGoImports(content: string): GoImportLine[] {
+  const imports: GoImportLine[] = [];
+  let inBlock = false;
+  const lines = content.split(/\r\n|\r|\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (inBlock) {
+      if (trimmed.startsWith(")")) {
+        inBlock = false;
+        continue;
+      }
+      pushGoSpec(trimmed, index + 1, imports);
+      continue;
+    }
+    if (!trimmed.startsWith("import")) continue;
+    const rest = trimmed.slice("import".length).trim();
+    if (rest.startsWith("(")) {
+      const inline = rest.slice(1).trim();
+      if (inline && !inline.startsWith(")")) pushGoSpec(inline, index + 1, imports);
+      inBlock = !inline.includes(")");
+    } else if (/^\s/.test(trimmed.slice("import".length))) {
+      pushGoSpec(rest, index + 1, imports);
+    }
+  }
+  return imports;
+}
+
+function pushGoSpec(text: string, line: number, out: GoImportLine[]): void {
+  const match = GO_SPEC.exec(text);
+  if (!match) return;
+  const source = match[2] ?? match[3];
+  out.push({ source, ...(match[1] ? { name: match[1] } : {}), line });
+}
+
+/**
+ * True for a committed JavaScript BUNDLE — the output of webpack, browserify or Parcel. Its
+ * `require()` calls resolve against a module table inside the file, so reading them as repo
+ * imports invents broken edges. Detected by each bundler's runtime signature, which hand-written
+ * code does not contain.
+ */
+export function isJavaScriptBundle(content: string): boolean {
+  if (content.includes("__webpack_require__") || content.includes("parcelRequire")) return true;
+  // browserify's prelude: `var c="function"==typeof require&&require; … "MODULE_NOT_FOUND"`.
+  const head = content.slice(0, 4096);
+  return head.includes("MODULE_NOT_FOUND") && /typeof require\s*&&\s*require/.test(head);
+}

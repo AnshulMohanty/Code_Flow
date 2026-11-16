@@ -20,7 +20,14 @@
  *   - absolute (`import pkg.mod`, `from pkg import mod`) — matched against package roots (the parent
  *     of the top-most `__init__.py` chain, plus the repo root and `src/`), then same-directory
  *     siblings, then a unique ≥2-segment suffix (namespace packages). Unmatched ⇒ external.
+ *
+ * Go: see `goResolver.ts` — import path → package directory (go.mod / replace / go.work, or an
+ * inferred GOPATH prefix) → the files declaring the names the importer uses.
  */
+import { createGoResolver, type GoFileFacts, type GoResolver, type GoUse } from "./goResolver.js";
+
+export type { GoFileFacts, GoUse } from "./goResolver.js";
+export type ResolverLanguage = "js" | "python" | "go";
 
 export interface ImportSpecLike {
   source: string;
@@ -34,6 +41,8 @@ export interface ResolvedTarget {
   target: string;
   /** The local bindings that refer to this target (call/inheritance edges resolve through them). */
   bindings: string[];
+  /** Qualified names this target declares for the importer (`store.Open`) — Go only, for precise call edges. */
+  symbols?: string[];
 }
 
 export type ImportResolution =
@@ -42,7 +51,10 @@ export type ImportResolution =
   | { status: "unresolved" };
 
 export interface ModuleResolver {
-  resolve(fromFile: string, spec: ImportSpecLike, language: "js" | "python"): ImportResolution;
+  /** `uses` (Go only): the file's `x.Y` references and bare calls, so the edge reaches the declaring file. */
+  resolve(fromFile: string, spec: ImportSpecLike, language: ResolverLanguage, uses?: readonly GoUse[]): ImportResolution;
+  /** Go: the file of `fromFile`'s own package declaring `name`. Undefined for other languages. */
+  samePackage(fromFile: string, name: string): string | undefined;
 }
 
 export interface ModuleResolverInput {
@@ -50,6 +62,8 @@ export interface ModuleResolverInput {
   files: readonly string[];
   /** Reads a repo-relative file; null when unreadable. Only manifests are requested. */
   read(path: string): Promise<string | null>;
+  /** Per-file parse facts. Go needs them: a package's declarations decide which file an import reaches. */
+  facts?: ReadonlyMap<string, GoFileFacts>;
 }
 
 // `.d.ts` last: a declaration file is a real target only when no implementation exists beside it
@@ -423,8 +437,16 @@ export async function createModuleResolver(input: ModuleResolverInput): Promise<
     return dots > 0 ? { status: "unresolved" } : { status: "external" };
   };
 
+  const go: GoResolver | undefined = input.files.some((path) => path.endsWith(".go"))
+    ? await createGoResolver({ files: input.files, read: input.read, facts: input.facts ?? new Map() })
+    : undefined;
+
   return {
-    resolve(fromFile, spec, language) {
+    samePackage(fromFile, name) {
+      return fromFile.endsWith(".go") ? go?.samePackage(fromFile, name) : undefined;
+    },
+    resolve(fromFile, spec, language, uses) {
+      if (language === "go") return go ? go.resolve(fromFile, spec, uses ?? []) : { status: "external" };
       if (language === "python") return resolvePython(fromFile, spec);
       const resolution = resolveJs(fromFile, spec.source);
       if (resolution.status === "resolved") {
