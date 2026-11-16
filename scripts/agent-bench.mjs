@@ -9,6 +9,8 @@
  *
  *   dependents     "Which files directly depend on T?"   truth: the compiler's reverse edges of T
  *   dependencies   "Which files does F directly depend on?"  truth: the compiler's edges from F
+ *   impact         "If F changes, what could be affected?"   truth: the reverse TRANSITIVE closure of F
+ *                  over the compiler's edges — the question a text search can only answer hop by hop
  *
  * Graded per answer: precision and recall of the repo files named, and INVENTED paths (named, but not
  * in the repository). Measured per run: wall time, turns, input/output tokens, cost — read from
@@ -19,7 +21,7 @@
  *
  * USAGE
  *   node scripts/agent-bench.mjs --repo <path> --result <analysis.json> --truth <truth.json>
- *        [--questions 6] [--model sonnet] [--arms claude,codeflow] [--out dir] [--dry-run]
+ *        [--questions 6] [--kinds dependents,dependencies] [--model sonnet] [--arms claude,codeflow] [--out dir] [--dry-run]
  */
 import { execFile } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -36,6 +38,7 @@ const truthPath = path.resolve(arg("--truth"));
 const QUESTIONS = Number(arg("--questions", "6"));
 const MODEL = arg("--model", "sonnet");
 const ARMS = arg("--arms", "claude,codeflow").split(",");
+const KINDS = arg("--kinds", "dependents,dependencies").split(",");
 const OUT = path.resolve(arg("--out", path.join(repo, ".codeflow", "agent-bench")));
 const DRY = process.argv.includes("--dry-run");
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -53,16 +56,40 @@ if (truth.edges) {
 } else {
   throw new Error("unsupported truth file: expected a Java (`edges`) or C/C++ (`includes`) truth");
 }
+/** C/C++ truth records `#include` edges only, so C questions must ask about includes — nothing wider. */
+const INCLUDES = Boolean(truth.includes);
 const reverse = new Map();
 for (const [from, targets] of forward) for (const to of targets) (reverse.get(to) ?? reverse.set(to, new Set()).get(to)).add(from);
+
+/**
+ * Files the truth can speak about. A C build compiles one platform: a file it never opened (a
+ * Windows-only `src/win/*.c` in a Linux build) may truly include the header, but the compiler cannot
+ * confirm it — such a name is UNJUDGED, not wrong. Java's truth compiles every file.
+ */
+const judgeable = new Set([...forward.keys(), ...[...forward.values()].flatMap((set) => [...set])]);
 
 const result = JSON.parse(readFileSync(resultPath, "utf8"));
 const repoFiles = new Set((result.graph?.nodes ?? []).map((node) => node.id));
 
 // ── Questions: deterministic picks of mid-sized answers (3–12 files) ─────────────────────────────
-function pick(map, kind, count) {
+/** Reverse transitive closure: every file that reaches `file` over the compiler's edges. */
+function affectedBy(file) {
+  const seen = new Set();
+  const queue = [file];
+  while (queue.length) {
+    for (const dependent of reverse.get(queue.pop()) ?? []) {
+      if (dependent !== file && !seen.has(dependent)) {
+        seen.add(dependent);
+        queue.push(dependent);
+      }
+    }
+  }
+  return seen;
+}
+
+function pick(map, kind, count, min = 3, max = 12) {
   const candidates = [...map]
-    .filter(([file, set]) => repoFiles.has(file) && set.size >= 3 && set.size <= 12)
+    .filter(([file, set]) => repoFiles.has(file) && set.size >= min && set.size <= max)
     .sort((a, b) => a[0].localeCompare(b[0]));
   const chosen = [];
   // Even spacing through the sorted list: deterministic, and not all from one directory.
@@ -72,13 +99,35 @@ function pick(map, kind, count) {
     kind,
     file,
     truth: [...set].sort(),
-    prompt:
-      kind === "dependents"
-        ? `In this repository, which files directly depend on \`${file}\` — they include or import it, or use a type, function or macro declared in it? Answer with a bullet list of repo-relative file paths only, nothing else.`
-        : `In this repository, which other repository files does \`${file}\` directly depend on — files it includes or imports, or whose types, functions or macros it uses? Answer with a bullet list of repo-relative file paths only, nothing else.`,
+    prompt: INCLUDES ? includePrompt(kind, file) : usePrompt(kind, file),
   }));
 }
-const questions = [...pick(reverse, "dependents", Math.ceil(QUESTIONS / 2)), ...pick(forward, "dependencies", Math.floor(QUESTIONS / 2))];
+
+/** C/C++: the compiler truth is the #include graph, so the question is exactly that. */
+function includePrompt(kind, file) {
+  const tail = "Answer with a bullet list of repo-relative file paths only, nothing else.";
+  if (kind === "dependents") return `In this repository, which files directly \`#include\` \`${file}\`? Only files whose own \`#include\` line resolves to it. ${tail}`;
+  if (kind === "impact") return `In this repository, which files \`#include\` \`${file}\` directly OR INDIRECTLY (through other headers that include it)? ${tail}`;
+  return `In this repository, which repository files does \`${file}\` directly \`#include\`? Resolve each of its own \`#include\` lines to the repository file it names; do not follow includes further. ${tail}`;
+}
+
+/** Java (and other languages whose truth is name resolution): a dependency is any use. */
+function usePrompt(kind, file) {
+  return kind === "dependents"
+        ? `In this repository, which files directly depend on \`${file}\` — they include or import it, or use a type, function or macro declared in it? Answer with a bullet list of repo-relative file paths only, nothing else.`
+        : kind === "impact"
+          ? `In this repository, if \`${file}\` changes, which files could be affected — every file that depends on it directly OR INDIRECTLY (through other files that depend on it)? Answer with a bullet list of repo-relative file paths only, nothing else.`
+          : `In this repository, which other repository files does \`${file}\` directly depend on — files it includes or imports, or whose types, functions or macros it uses? Answer with a bullet list of repo-relative file paths only, nothing else.`;
+}
+const impact = new Map([...reverse.keys()].map((file) => [file, affectedBy(file)]));
+const perKind = Math.max(1, Math.round(QUESTIONS / KINDS.length));
+const questions = KINDS.flatMap((kind) =>
+  kind === "dependents"
+    ? pick(reverse, kind, perKind)
+    : kind === "dependencies"
+      ? pick(forward, kind, perKind)
+      : pick(impact, kind, perKind, 10, 60), // big enough that one search is not the whole answer
+);
 
 // ── Running one question in one arm ──────────────────────────────────────────────────────────────
 mkdirSync(OUT, { recursive: true });
@@ -149,11 +198,13 @@ function namedFiles(text) {
 }
 
 function grade(question, answer) {
-  const { named, invented } = namedFiles(answer);
+  const { named: all, invented } = namedFiles(answer);
+  const named = INCLUDES ? all.filter((file) => judgeable.has(file)) : all;
   const expected = new Set(question.truth);
   const hit = named.filter((file) => expected.has(file)).length;
   return {
     named: named.length,
+    unjudged: all.length - named.length,
     precision: named.length ? hit / named.length : 0,
     recall: expected.size ? hit / expected.size : 1,
     invented,

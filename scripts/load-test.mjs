@@ -44,19 +44,29 @@ const record = (endpoint, ms, ok) => {
 };
 const ip = (n) => `10.${(n >> 16) & 255}.${(n >> 8) & 255}.${n & 255}`;
 
+/** Requests slower than this count as a timeout error: one stuck socket must not hold the run open. */
+const REQUEST_DEADLINE_MS = 30_000;
+const slow = []; // every request over 5 s, with when it started — to line up with server logs
+
 async function call(endpoint, path, { method = "GET", body, client } = {}) {
   const started = performance.now();
+  const startedAt = new Date().toISOString();
   try {
     const response = await fetch(`${API}${path}`, {
       method,
       headers: { "content-type": "application/json", "x-forwarded-for": client },
+      signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
     const text = await response.text();
-    record(endpoint, performance.now() - started, response.ok);
+    const ms = performance.now() - started;
+    record(endpoint, ms, response.ok);
+    if (ms > 5000) slow.push({ endpoint, path, startedAt, ms: Math.round(ms), status: response.status });
     return { status: response.status, body: text ? JSON.parse(text) : null };
-  } catch {
-    record(endpoint, performance.now() - started, false);
+  } catch (error) {
+    const ms = performance.now() - started;
+    record(endpoint, ms, false);
+    slow.push({ endpoint, path, startedAt, ms: Math.round(ms), error: error?.name === "TimeoutError" ? "timeout" : String(error?.message ?? error) });
     return { status: 0, body: null };
   }
 }
@@ -95,7 +105,7 @@ const jobs = await Promise.all(
       body: { mode: "public_hosted", repoUrl: `https://github.com/${repo}` },
       client: ip(1000 + index),
     });
-    return { repo, jobId: response.body?.jobId, submitted, started: null, finished: null, status: response.status === 202 ? "queued" : `rejected ${response.status}`, files: 0, runStatus: null };
+    return { repo, jobId: response.body?.jobId, submitted, started: null, finished: null, status: response.status === 202 ? "queued" : `rejected ${response.status}`, files: 0, runStatus: null, error: null };
   }),
 );
 
@@ -114,7 +124,13 @@ const tracker = (async () => {
           job.finished = now;
           job.status = body.status;
           job.runStatus = body.runStatus ?? null;
-          job.files = body.totalFiles ?? 0;
+          job.error = body.error ?? body.runStatusReason ?? null;
+          // The job record does not carry a file count; the finished result does.
+          if (body.status === "completed") {
+            const { body: done } = await call("GET /api/result/:id (tracker)", `/api/result/${job.jobId}`, { client: ip(1) });
+            const analysed = done?.result ?? done;
+            job.files = analysed?.summary?.files ?? analysed?.graph?.nodes?.length ?? 0;
+          }
         }
       }),
     );
@@ -147,8 +163,10 @@ clearInterval(memoryTimer);
 sampleMemory();
 await sleep(2500);
 
-const makespan = (performance.now() - t0) / 1000;
 const finished = jobs.filter((job) => job.finished !== null);
+// Throughput is the JOBS' timeline — first submit to last finish — not the test's wall clock, which a
+// single slow browsing request can stretch.
+const makespan = finished.length ? (Math.max(...finished.map((job) => job.finished)) - Math.min(...jobs.map((job) => job.submitted))) / 1000 : 0;
 const queueWaits = finished.filter((job) => job.started !== null).map((job) => job.started - job.submitted);
 const totals = finished.map((job) => job.finished - job.submitted);
 const round = (value) => (value === null ? null : Math.round(value));
@@ -161,7 +179,7 @@ const report = {
     submitted: jobs.length,
     accepted: jobs.filter((job) => job.jobId).length,
     completed: jobs.filter((job) => job.status === "completed").length,
-    failed: jobs.filter((job) => job.status === "failed").map((job) => job.repo),
+    failed: jobs.filter((job) => job.status === "failed").map((job) => ({ repo: job.repo, error: job.error })),
     filesAnalysed: finished.reduce((sum, job) => sum + job.files, 0),
     makespanSeconds: Number(makespan.toFixed(1)),
     throughputJobsPerMinute: Number(((finished.length / makespan) * 60).toFixed(1)),
@@ -174,6 +192,7 @@ const report = {
       { requests: values.length, errors: errors.get(endpoint) ?? 0, p50: round(pct(values, 50)), p95: round(pct(values, 95)), p99: round(pct(values, 99)), max: round(pct(values, 100)) },
     ]),
   ),
+  slowRequests: slow,
   peakMemoryMiB: Object.fromEntries([...memory].filter(([name]) => /api|worker|mongo|redis|postgres/.test(name)).map(([name, bytes]) => [name, Math.round(bytes / 1048576)])),
 };
 
@@ -184,4 +203,5 @@ for (const [endpoint, stats] of Object.entries(report.endpoints)) {
   console.log(`   ${endpoint.padEnd(30)} n=${String(stats.requests).padStart(5)} err=${stats.errors}  p50 ${stats.p50} ms  p95 ${stats.p95} ms  p99 ${stats.p99} ms  max ${stats.max} ms`);
 }
 console.log(`   peak memory MiB: ${JSON.stringify(report.peakMemoryMiB)}`);
-if (report.jobs.failed.length) console.log(`   failed: ${report.jobs.failed.join(", ")}`);
+for (const request of slow) console.log(`   slow: ${request.endpoint} ${request.path} at ${request.startedAt} — ${request.ms} ms${request.error ? ` (${request.error})` : ""}`);
+for (const failure of report.jobs.failed) console.log(`   failed: ${failure.repo} — ${failure.error ?? "no error recorded"}`);
