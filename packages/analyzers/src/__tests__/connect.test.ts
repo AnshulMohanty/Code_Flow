@@ -24,6 +24,7 @@ const LANG_BY_EXT: Record<string, string> = {
   ".js": "JavaScript",
   ".py": "Python",
   ".go": "Go",
+  ".java": "Java",
   ".json": "JSON",
   ".md": "Markdown",
 };
@@ -430,5 +431,34 @@ describe("connect — committed bundles", () => {
     expect(graph.edges).toEqual([{ from: "src/app.js", to: "vendor-ish/livereload.js", kind: "require", specifier: "../vendor-ish/livereload.js" }]);
     expect(graph.resolution.unresolvedImports).toEqual([]);
     expect(graph.cpg?.bundledFiles).toBe(2);
+  });
+});
+
+describe("connect — Java", () => {
+  it("imports, same-package uses and on-demand imports become lazy edges; external libraries do not", async () => {
+    const graph = await connect([
+      {
+        path: "src/main/java/com/acme/app/App.java",
+        content:
+          "package com.acme.app;\nimport java.util.List;\nimport com.acme.model.*;\nimport com.acme.util.Strings;\npublic class App { Helper h; User u; List<String> l; void f() { Strings.trim(); h.run(); } }\n",
+      },
+      { path: "src/main/java/com/acme/app/Helper.java", content: "package com.acme.app;\npublic class Helper { App back; void run() {} }\n" },
+      { path: "src/main/java/com/acme/model/User.java", content: "package com.acme.model;\npublic class User {}\n" },
+      { path: "src/main/java/com/acme/model/Order.java", content: "package com.acme.model;\npublic class Order {}\n" },
+      { path: "src/main/java/com/acme/util/Strings.java", content: "package com.acme.util;\npublic final class Strings { public static String trim() { return \"\"; } }\n" },
+    ]);
+    const pairs = graph.edges.map(({ from, to, specifier, lazy }) => [from.split("/").pop(), to.split("/").pop(), specifier, lazy]);
+    expect(pairs).toEqual(
+      expect.arrayContaining([
+        ["App.java", "Strings.java", "com.acme.util.Strings", true],
+        ["App.java", "User.java", "com.acme.model.*", true],
+        ["App.java", "Helper.java", "com.acme.app.Helper", true],
+        ["Helper.java", "App.java", "com.acme.app.App", true],
+      ]),
+    );
+    expect(pairs.some(([, to]) => to === "Order.java")).toBe(false); // on-demand import, never used
+    expect(graph.resolution.externalModules).toEqual(["java.util.List"]);
+    const calls = graph.cpgEdges!.map(({ from, to, symbol }) => [from.split("/").pop(), to.split("/").pop(), symbol]);
+    expect(calls).toEqual(expect.arrayContaining([["App.java", "Strings.java", "Strings.trim"]]));
   });
 });

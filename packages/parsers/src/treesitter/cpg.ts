@@ -7,12 +7,14 @@ import {
   PY_IMPORT_LINE,
   parseStaticImportLine,
   scanGoImports,
+  scanJavaImports,
   splitAliasSegments,
 } from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
-import { calleeName, calleeTail, field, namedChildrenOf, startLine, stringValue } from "./ast.js";
+import { calleeName, calleeTail, field, namedChildrenOf, parseableSource, startLine, stringValue } from "./ast.js";
 import { extractGoFacts } from "./go.js";
+import { extractJavaFacts } from "./java.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
 /**
@@ -34,8 +36,13 @@ export interface CpgImport {
   line: number;
   /** Erased at runtime: TS `import type` / `export type … from`, or a Python `if TYPE_CHECKING:` import. */
   typeOnly?: boolean;
-  /** Executed only when a function runs (a `require`/`import` inside a function body). */
+  /**
+   * Cannot fail at load time: a `require`/`import` inside a function body, or a Java import (the
+   * JVM loads a class on first use, so a class cycle is legal and never an import-order failure).
+   */
   lazy?: boolean;
+  /** Java `import static`. */
+  isStatic?: boolean;
 }
 
 /** A call site, recorded by the ROOT local binding it goes through. */
@@ -89,6 +96,17 @@ export interface CpgFacts {
   packageName?: string;
   declarations?: CpgDeclaration[];
   references?: CpgCall[];
+  /**
+   * Java. A simple type name resolves through the file's own types, single-type imports, the
+   * SAME package (no import needed) and on-demand imports — so the resolver needs every type
+   * name the file mentions, the names that shadow (its own types, type parameters), and dotted
+   * fully-qualified uses (`com.acme.Thing`).
+   */
+  typeRefs?: string[];
+  localTypes?: string[];
+  qualifiedRefs?: string[];
+  /** Java: names in the extends/implements clauses of top-level types (nested types do not shadow them). */
+  headerRefs?: string[];
 }
 
 /** `export … from "x"` is reported through `imports` with kind `reexport`. */
@@ -134,11 +152,12 @@ export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): C
   if (hasGrammar(lang) && input.content.length <= TREE_SITTER_MAX_BYTES) {
     const parser = grammarParser(lang);
     if (parser) {
-      const tree = parser.parse(input.content);
+      const tree = parser.parse(parseableSource(input.content));
       if (tree) {
         try {
           if (lang === "python") return pythonFacts(tree);
           if (lang === "go") return goFacts(tree);
+          if (lang === "java") return javaFacts(tree);
           return jsLikeFacts(tree);
         } finally {
           tree.delete();
@@ -537,6 +556,33 @@ function goFacts(tree: Tree): CpgFacts {
   };
 }
 
+// ── Java ──────────────────────────────────────────────────────────────────────────────
+
+function javaFacts(tree: Tree): CpgFacts {
+  const extract = extractJavaFacts(tree);
+  return {
+    imports: extract.imports.map((entry) => ({
+      source: entry.source,
+      // The local name a single-type or static import introduces; on-demand imports bind per use.
+      specifiers: entry.source.endsWith(".*") ? [] : [entry.source.split(".").pop() ?? entry.source],
+      kind: "import" as const,
+      line: entry.line,
+      lazy: true,
+      ...(entry.isStatic ? { isStatic: true } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    ...(extract.packageName ? { packageName: extract.packageName } : {}),
+    declarations: extract.types.filter((type) => !type.outer).map((type) => ({ name: type.name, line: type.line })),
+    typeRefs: extract.typeRefs,
+    localTypes: extract.localTypes,
+    qualifiedRefs: extract.qualifiedRefs,
+    headerRefs: extract.headerRefs,
+  };
+}
+
 // ── Regex fallback (imports + re-exports only) ────────────────────────────────────────
 
 /**
@@ -547,6 +593,24 @@ function goFacts(tree: Tree): CpgFacts {
  */
 function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFacts {
   const facts: CpgFacts = { imports: [], calls: [], inheritance: [], routes: [], engine: PARSER_VERSION };
+  if (language === "java") {
+    for (const entry of scanJavaImports(input.content)) {
+      facts.imports.push({
+        source: entry.source,
+        specifiers: entry.source.endsWith(".*") ? [] : [entry.source.split(".").pop() ?? entry.source],
+        kind: "import",
+        line: entry.line,
+        lazy: true,
+        ...(entry.isStatic ? { isStatic: true } : {}),
+      });
+    }
+    const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(input.content);
+    if (pkg) facts.packageName = pkg[1];
+    // A public top-level type must be named after its file — the one declaration knowable without a parse.
+    const stem = input.path.slice(input.path.lastIndexOf("/") + 1).replace(/\.java$/, "");
+    facts.declarations = [{ name: stem, line: 1 }];
+    return facts;
+  }
   if (language === "go") {
     for (const entry of scanGoImports(input.content)) {
       facts.imports.push({ source: entry.source, specifiers: entry.name ? [entry.name] : [], kind: "import", line: entry.line });

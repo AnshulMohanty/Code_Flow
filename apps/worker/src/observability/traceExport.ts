@@ -27,7 +27,7 @@ import {
  *
  * THE NETWORK SEND IS DEFERRED, deliberately and by construction: it activates only when
  * LANGFUSE_* / HELICONE_API_KEY are set, which no test sets and no default provides. Confirming it
- * against a real Langfuse or Helicone project needs the owner's keys and is a GO_LIVE.md step, not
+ * against a real Langfuse or Helicone project needs the owner's keys and is a DESIGN.md step, not
  * something this suite can honestly claim. What IS tested here is the resolution logic and the
  * payload — with an INJECTED `fetch`, so the assertion is on the request that would be sent.
  */

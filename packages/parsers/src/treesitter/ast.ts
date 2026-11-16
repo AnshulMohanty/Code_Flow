@@ -1,5 +1,15 @@
 import type { Node } from "web-tree-sitter";
 
+/**
+ * Source text as tree-sitter should see it. A raw NUL byte ends tree-sitter's input — commons-lang
+ * has a fuzz test with 3,429 of them inside string literals, and everything after the first was
+ * silently unparsed. NUL is never syntax (only literal or comment content), so it becomes a space:
+ * same length, same lines and columns.
+ */
+export function parseableSource(content: string): string {
+  return content.includes("\u0000") ? content.replace(/\u0000/g, " ") : content;
+}
+
 /** 1-based start line of a node (tree-sitter rows are 0-based). */
 export function startLine(node: Node): number {
   return node.startPosition.row + 1;

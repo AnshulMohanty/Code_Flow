@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import {
   createAnalyzeStage,
@@ -90,10 +90,16 @@ export interface LocalAnalysisResult {
  */
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".next", ".turbo", ".codeflow", "__pycache__", ".venv", "venv"]);
 
-/** Read a repo-relative file. Returns null when unreadable — a single bad file is not a failure. */
+/**
+ * Read a repo-relative file. Returns null when unreadable — a single bad file is not a failure — and
+ * when it resolves OUTSIDE the repository: the GitHub Action runs this on a pull request's code, and
+ * a committed `README.md -> /proc/self/environ` must not be read into the analysis.
+ */
 async function readRepoFile(repoPath: string, relativePath: string): Promise<string | null> {
   try {
-    return await readFile(path.join(repoPath, relativePath), "utf8");
+    const [root, real] = await Promise.all([realpath(repoPath), realpath(path.join(repoPath, relativePath))]);
+    if (real !== root && !real.startsWith(root + path.sep)) return null;
+    return await readFile(real, "utf8");
   } catch {
     return null;
   }
@@ -146,9 +152,9 @@ async function readRepoDir(repoPath: string, relativeDir: string): Promise<WalkE
  * is never zero. The first version of this used 0.05, which is the noise level itself — so the refusal
  * silently stopped refusing, and the acceptance test caught it.
  *
- * 0.15 sits ~3x above the measured noise and ~4.5x below a real match. It is intentionally HIGHER than
- * the hosted floor: a lexical embedder has no semantic recall to protect, so a near-miss here is much
- * more likely to be a collision than a paraphrase.
+ * 0.15 sits ~3x above the measured noise and ~4.5x below a real match. It is not comparable with the
+ * hosted floor (`RAG_MIN_SIMILARITY`, 0.2): that one is a cosine between a real model's embeddings,
+ * this one between 256-dimension hashed bags of words, so each is set against its own noise level.
  */
 export const LOCAL_MIN_SIMILARITY = 0.15;
 

@@ -2,7 +2,7 @@
 #
 # NOTHING HERE HAS BEEN APPLIED. This file is the deployment described so it can be reviewed;
 # creating the services, filling the secrets and paying for the plans are owner steps. The ordered
-# walkthrough is DEPLOY.md — read that, not this, to deploy.
+# walkthrough is DESIGN.md — read that, not this, to deploy.
 #
 # ── The shape of the system, and why it is four services and not one ──────────────────────────
 #
@@ -20,7 +20,7 @@
 #
 # apps/mcp and apps/local-cli are deliberately absent. The MCP server speaks stdio to a model
 # client on a developer's machine and the local CLI runs on a laptop; neither is a web service.
-# Their distribution channel is `npm publish`, not a deploy. See DEPLOY.md § "Not deployed".
+# Their distribution channel is `npm publish`, not a deploy. See DESIGN.md (Deploy).
 #
 # ── The two things most likely to bite ────────────────────────────────────────────────────────
 #
@@ -30,7 +30,7 @@
 #     offerings is an eviction policy.
 #  2. `CORS_ORIGINS` cannot be resolved here. It needs the web site's URL, and the web build needs
 #     the api's — a mutual reference Render cannot resolve on first create. It is `sync: false` and
-#     DEPLOY.md makes setting it an explicit step. Until it is set, the browser gets CORS errors
+#     DESIGN.md makes setting it an explicit step. Until it is set, the browser gets CORS errors
 #     against a healthy API, which reads like an outage and is not one.
 
 services:
@@ -67,6 +67,10 @@ services:
       # site's URL, so it is an owner step after the first deploy.
       - key: CORS_ORIGINS
         sync: false
+      # Render terminates TLS in ONE proxy hop. Without this every visitor shares the proxy's IP,
+      # so the per-IP rate limit becomes one global bucket.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
 
   # ── Worker ──────────────────────────────────────────────────────────────────────────────────
   - type: worker

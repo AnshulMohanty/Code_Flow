@@ -4,10 +4,10 @@
 
 ### The codebase map that proves its answers.
 
-CodeFlow maps how a JavaScript, TypeScript, Python or Go codebase fits together, answers questions
-cited to real files and lines, and **checks the code references in anyone's answer** — an AI agent's,
-a PR description's, a reviewer's — against the repository. The graph is scored against each
-language's own toolchain (the TypeScript compiler, `go list`); the checker runs offline, with no key.
+CodeFlow maps how a JavaScript, TypeScript, Python, Go or Java codebase fits together, answers
+questions cited to real files and lines, and **checks the code references in anyone's answer** — an AI
+agent's, a PR description's, a reviewer's — against the repository. The graph is scored against each
+language's own toolchain (the TypeScript compiler, `go list`, javac); the checker runs offline, with no key.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)
@@ -18,7 +18,7 @@ language's own toolchain (the TypeScript compiler, `go list`); the checker runs 
      commit. Drop it at docs/demo.gif and uncomment. -->
 <!-- ![CodeFlow analysing a repository](docs/demo.gif) -->
 
-<!-- TODO(deploy): nothing is deployed yet. DEPLOY.md and GO_LIVE.md are the runbooks;
+<!-- TODO(deploy): nothing is deployed yet. DESIGN.md §3.5 is the runbook;
      render.yaml (paid) and render.free.yaml (free tier) are the blueprints.
      **Live demo:** _not deployed_ -->
 
@@ -101,6 +101,25 @@ CodeFlow has one, `go list` does not — are all files behind build tags (`_wind
 `//go:build tools`), which a default `go list` skips. CI runs the etcd check and fails below 100%
 precision / 99% recall. Kubernetes (26,558 files) analyses in 34 s on a laptop.
 
+**Java**, against javac. `scripts/accuracy/JavaTruth.java` runs javac's own attribution (the Compiler
+Tree API) over every source file and records each name that resolves to a type declared in the
+repository — imports, same-package types (Java needs no import for those), nested and fully qualified
+names. CodeFlow's file-to-file edges are compared with that set. Measured on 2026-11-16:
+
+| Repository | Layout | Edges (per javac) | CodeFlow-only | Missed | Precision | Recall |
+|---|---|---:|---:|---:|---:|---:|
+| apache/ant | legacy Ant layout (`src/main/org/…`) | 5,725 | 7 | 3 | 99.88% | 99.95% |
+| junit-team/junit4 | Maven, Java 5 era | 2,474 | 0 | 3 | 100% | 99.88% |
+| apache/commons-lang | Maven | 1,783 | 0 | 0 | 100% | 100% |
+| jhy/jsoup | Maven | 1,425 | 0 | 0 | 100% | 100% |
+| google/gson | Maven, multi-module | 1,326 | 0 | 0 | 100% | 100% |
+
+Every remaining difference is the reference, not CodeFlow: the truth compiles without third-party jars,
+so where a file explicitly imports a library class (`javax.mail.Message`, hamcrest's `TypeSafeMatcher`)
+javac falls back to a same-named class in the file's own package; and Ant's test fixtures declare the
+same class in several directories, which one javac run maps to the first copy. CI runs the jsoup check
+and fails below 100% precision / 99% recall.
+
 Python imports are not benchmarked against a reference resolver yet.
 
 ---
@@ -111,7 +130,7 @@ Not everything here is the same kind of thing, and the difference matters more t
 
 | Capability | Kind | What that means |
 |---|---|---|
-| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports, Go modules (`replace`, `go.work`, nested modules, GOPATH-era repos). Scored against tsc and `go list` above. Committed JS bundles (webpack/browserify/Parcel) are left out rather than reported as hundreds of broken imports. |
+| Import graph | **Real, measured** | Relative imports, `.js`→`.ts` (NodeNext), tsconfig/jsconfig `paths` + `baseUrl` (with `extends`/`references`), workspace packages, Python relative + absolute (src layout) imports, Go modules (`replace`, `go.work`, nested modules, GOPATH-era repos), Java (imports, same-package types, on-demand and static imports, any source layout). Scored against tsc, `go list` and javac above. Committed JS bundles (webpack/browserify/Parcel) are left out rather than reported as hundreds of broken imports. |
 | Call graph, centrality, blast radius | **Real** | Computed from parsed source. Deterministic: same commit in, byte-identical numbers out. Key-file ranking counts production imports only, so heavily-tested files do not outrank load-bearing ones. |
 | Import cycles | **Real** | **Load-time** cycles only: `import type`, `if TYPE_CHECKING:`, imports inside function bodies and dynamic `import()` cannot cause an import-order failure and are excluded — on Zod, tRPC and Flask that is the difference between dozens of reported cycles and the true number, zero. |
 | Citation check of arbitrary text | **Real** | Does the file exist, are the cited lines inside it (physical line count), is the named symbol declared there? It proves a reference points at something real — not that the prose around it describes that code correctly. |
@@ -124,14 +143,15 @@ Not everything here is the same kind of thing, and the difference matters more t
 | "Test files that reach it" | **Heuristic** | Import reachability, **not** coverage. Labelled that way in the UI because there is no coverage data. |
 | AI summary, reading order, inferred domains | **Model output** | Grounded and labelled as inference wherever shown. The parser's structural roles sit on a different tab for exactly this reason. |
 | Specialist fan-out over communities, best-of-N | **Experimental** | Flag-gated (`FANOUT_SYNTHESIS`), off by default, and **unproven at real scale** — there is no measurement against a live model showing it produces better output than the single-shot stage. |
-| Speculative prefetch, model routing, parallel stages | **Experimental** | Flag-gated, off by default. The measured speedups are orchestration-only, on a hermetic harness with mock providers. |
+| Model routing, parallel stages | **Experimental** | Flag-gated, off by default. The measured speedups are orchestration-only, on a hermetic harness with mock providers. |
+| Speculative prefetch | **Experimental, on by default** | Builds the RAG chunk plan while synthesis waits on the provider; `speculate: false` turns it off. Its speedup is measured only on the hermetic harness. |
 
 ---
 
 ## Honest limits
 
 - **Language coverage is narrower than "any codebase".** Deep support — symbols, call edges and a
-  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python and Go**. Java, C#,
+  measured import graph — covers **JavaScript, TypeScript, JSX, TSX, Python, Go and Java**. C#,
   C/C++, Rust and PHP are next; until then they get line counts only, so `find_references`, callers
   and blast radius return little of use on those repositories. The pipeline degrades gracefully; it
   does not pretend.
@@ -150,8 +170,7 @@ Not everything here is the same kind of thing, and the difference matters more t
   and never fetches, so CI checkouts need `fetch-depth: 0`.
 - **Nothing is deployed, and the AI stages have not run against a live provider.** The graph numbers
   above are measured on real repositories; every AI-side number comes from a hermetic suite with
-  mocked providers. See `GO_LIVE.md` for what still needs a real
-  service.
+  mocked providers. `DESIGN.md` §6 lists what still needs a real service.
 
 ---
 
@@ -183,7 +202,7 @@ The dependency map in the UI is a **radial layout rendered as hand-written inlin
 library**. Distance from the centre is fan-in rank, so the most depended-upon modules sit in the
 middle. It replaced a force-directed graph deliberately: force layouts are non-deterministic, so two
 loads of the same repository produced two different pictures and neither said which module was
-load-bearing. See `ARCHITECTURE.md` for the reasoning behind this and the other significant choices.
+load-bearing. See `DESIGN.md` for the reasoning behind this and the other significant choices.
 
 ---
 
@@ -325,10 +344,11 @@ what breaks without each one. For the Docker run above, the only thing you must 
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `GEMINI_API_KEY` | — | **Required** for stages 7–8. One key powers both chat and embeddings. |
-| `LLM_PROVIDER` | inferred | `gemini` or `anthropic`. Both keys set with no explicit choice throws at boot rather than guessing. |
-| `EMBEDDING_PROVIDER` | inferred | `gemini` or `voyage`. Gemini recommended — Voyage's free tier allows 3 req/min. |
+| `LLM_PROVIDER` | inferred | `gemini`, `anthropic` or `openai`. More than one key set with no explicit choice throws at boot rather than guessing. |
+| `EMBEDDING_PROVIDER` | inferred | `gemini`, `voyage` or `openai`. Gemini recommended — Voyage's free tier allows 3 req/min. |
 | `MONGO_URI` / `REDIS_URL` / `POSTGRES_URL` | local containers | Point at managed services for a cloud deploy. |
 | `CORS_ORIGINS` | — | Comma-separated browser origins. Until it is set the browser gets CORS errors against a healthy API. |
+| `TRUST_PROXY_HOPS` | `0` | Reverse proxies in front of the API (Render: `1`). Without it every visitor shares the proxy's IP, so the per-IP rate limit becomes one global bucket. |
 | `RUN_WORKER_IN_PROCESS` | `false` | Runs the worker inside the API — one service instead of two, for a free tier. |
 | `LLM_PRICING` | — | JSON model→price. Unset ⇒ `usd: null` with the models named. |
 | `FANOUT_SYNTHESIS` | `false` | The experimental specialist fan-out. Also the only thing that fills the Domains tab. |
@@ -387,11 +407,5 @@ three images, boots the stack and runs a real analysis through it (`scripts/dock
 
 | File | What it is for |
 |------|---------------|
-| `ARCHITECTURE.md` | How the system is built and why — the decisions, with the measurements behind them. |
-| `DEPLOY.md` | Ordered deploy walkthrough. Render (paid), Render free tier, Railway. |
-| `GO_LIVE.md` | The manual runbook: keys, pricing, the pre-warm run, the proofs that need a real service. |
-| `CURRENT_STATE.md` | Live status and the deferred ledger — what is open, and why. |
-| `docs/archive/` | Superseded planning and phase logs, kept for provenance. |
+| `DESIGN.md` | How it is built and why, the critical decisions, the process (develop, verify, deploy, operate), and the roadmap with current status. |
 
-`legacy/index.html` and `card/` are **inherited from the upstream project** and are not part of this
-system — see `docs/archive/README.md`.

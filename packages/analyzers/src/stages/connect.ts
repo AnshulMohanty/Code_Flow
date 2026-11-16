@@ -1,5 +1,5 @@
 import { buildDependencyGraph } from "@codeflow/graph";
-import { createParserRegistry, extractCpgFacts, isJavaScriptBundle, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
+import { createParserRegistry, extractCpgFacts, grammarsFor, isJavaScriptBundle, type CpgFacts, type ParserRegistry } from "@codeflow/parsers";
 import { createModuleResolver, type GoUse, type ResolverLanguage } from "./moduleResolver.js";
 import type {
   CpgEdge,
@@ -103,8 +103,10 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
       //    Grammars are loaded once (shared with Inventory); a file whose language has no grammar
       //    falls back to regex import extraction, so DEPENDENCY coverage never regresses — only
       //    the enrichment (calls / inheritance / routes) is lost, and `graph.cpg` records that.
-      const treeSitter = await registry.ready();
-      if (!treeSitter.ready) {
+      const grammars = grammarsFor(structure.files.map((file) => file.path));
+      const treeSitter = await registry.ready({ languages: grammars });
+      // Warn only when a needed grammar is missing — a repo with no supported language needs none.
+      if (grammars.length > 0 && treeSitter.failed.some((entry) => grammars.includes(entry.language))) {
         ctx.logger.warn("Connect: no tree-sitter grammar loaded; the CPG will hold imports only.", {
           failed: treeSitter.failed.map((entry) => entry.language),
         });
@@ -188,6 +190,21 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
             });
             richDeps.push(toDependencyEdge(file.path, target, spec, richDeps.length));
           }
+        }
+
+        // 2a') Dependencies with no import statement: Java's same-package and fully qualified
+        //      uses. The JVM loads classes on first use, so these never form a load-time cycle.
+        for (const dependency of resolver.implicit(file.path, language)) {
+          for (const binding of dependency.bindings) {
+            if (!targetByBinding.has(binding)) targetByBinding.set(binding, dependency.target);
+          }
+          const key = `${file.path} ${dependency.target} import ${dependency.specifier}`;
+          if (edgeKeys.has(key)) continue;
+          edgeKeys.add(key);
+          edges.push({ from: file.path, to: dependency.target, kind: "import", specifier: dependency.specifier, lazy: true });
+          richDeps.push(
+            toDependencyEdge(file.path, dependency.target, { source: dependency.specifier, specifiers: [], kind: "import", line: 0 }, richDeps.length),
+          );
         }
 
         // 2b) Calls + inheritance, resolved through this file's own imports. A reference to
@@ -297,6 +314,7 @@ export function createConnectStage(deps: ConnectDependencies): PipelineStage<"gr
 function resolverLanguageOf(file: { language: string; ext: string }): ResolverLanguage {
   if (file.language === "Python" || file.ext === ".py") return "python";
   if (file.ext === ".go") return "go";
+  if (file.ext === ".java") return "java";
   return "js";
 }
 

@@ -6,7 +6,9 @@ import type { ParseFileInput, ParserAdapter } from "../types.js";
 import { TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
+import { parseableSource } from "./ast.js";
 import { extractGo } from "./go.js";
+import { extractJava } from "./java.js";
 import { extractJsLike } from "./jsLike.js";
 import { extractPython } from "./python.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
@@ -29,11 +31,12 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
   const parser = grammarParser(language);
   if (!parser) return null;
 
-  const tree = parser.parse(input.content);
+  const tree = parser.parse(parseableSource(input.content));
   if (!tree) return null;
   try {
     if (language === "python") return pythonParsedFile(tree, input);
     if (language === "go") return goParsedFile(tree, input);
+    if (language === "java") return typedParsedFile(tree, input, "java", extractJava);
     return jsLikeParsedFile(tree, input, language);
   } finally {
     // The tree lives in the wasm heap — releasing it is not optional on a big repo.
@@ -72,6 +75,28 @@ function pythonParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
     exports: [],
     symbols: extract.symbols,
     dependencies: extract.imports.map((parsedImport, index) => toPythonDependency(input.path, parsedImport, index)),
+    warnings: [],
+    parserVersion: TREE_SITTER_PARSER_VERSION,
+  };
+}
+
+/** Java (and the other symbol-indexed languages): imports name types; they resolve in Connect. */
+function typedParsedFile(
+  tree: Tree,
+  input: ParseFileInput,
+  language: LanguageId,
+  extract: (tree: Tree) => { imports: ParsedImport[]; exports: ParsedFile["exports"]; symbols: ParsedFile["symbols"] },
+): ParsedFile {
+  const result = extract(tree);
+  return {
+    path: input.path,
+    language,
+    extension: extensionOf(input.path),
+    loc: countLoc(input.content),
+    imports: result.imports,
+    exports: result.exports,
+    symbols: result.symbols,
+    dependencies: result.imports.map((parsedImport, index) => toDependency(input.path, parsedImport, index)),
     warnings: [],
     parserVersion: TREE_SITTER_PARSER_VERSION,
   };

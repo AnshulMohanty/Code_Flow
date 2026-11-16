@@ -9,7 +9,7 @@
  * OUTPUT changes, which is not the same cadence as a release. `ANALYZER_VERSION` in the
  * environment still overrides it for ad-hoc cache namespacing.
  */
-export const ANALYZER_VERSION = "1.1.0";
+export const ANALYZER_VERSION = "1.2.0";
 
 export const DEFAULT_API_PORT = 4000;
 export const DEFAULT_WEB_PORT = 5173;
@@ -52,16 +52,6 @@ export const RATE_MAX = 30;
 // Guard 5 — global daily LLM spend ceiling (the wallet guard).
 /** Cumulative LLM/embedding tokens allowed across ALL callers per UTC day. */
 export const DAILY_LLM_BUDGET = 5_000_000;
-
-// ── Dependency-graph render caps (P5 viz; render-only, P7-tunable) ───────────
-// These cap what the 2D graph PAINTS, never the underlying model (the full graph stays
-// in memory; "expand / show all" raises the cap). Placeholders — tune against a big repo.
-/** Default backbone: the top-N most-central files shown before "expand". */
-export const GRAPH_BACKBONE_NODES = 80;
-/** Focus mode reveals a node's k-hop neighbourhood. */
-export const GRAPH_FOCUS_HOPS = 1;
-/** Painting more than this many nodes triggers a perf warning (still allowed). */
-export const GRAPH_PERF_WARN_NODES = 600;
 
 // ── RAG query path (ask-the-repo; P7-tunable) ────────────────────────────────
 /** Top-k chunks retrieved per question before answering. */

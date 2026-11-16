@@ -1,7 +1,7 @@
 /**
  * BOOT-TIME WARM-UP — process-lifetime warm caches (V3-P5 task 1).
  *
- * RENAMED FROM "persistent warm worker pool", which is what V3_PLAN called it and what this module
+ * RENAMED FROM "persistent warm worker pool", which is what the original plan called it and what this module
  * never was. Nothing here pools processes or workers. The behaviour is unchanged — this is the same
  * registry, still gating /ready — and only the name was wrong. A name that overstates the mechanism
  * survives into a README, then into a conversation where somebody asks how the pool is sized.

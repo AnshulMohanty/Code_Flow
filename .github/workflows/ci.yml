@@ -59,8 +59,8 @@ jobs:
       - name: Eval golden set (hermetic — validation + determinism, no secrets)
         run: pnpm --filter @codeflow/eval run check
 
-      - name: Legacy root tests
-        run: node --test tests/*.mjs
+      - name: Repo hygiene (no raw control bytes in source)
+        run: node --test tests/source-hygiene.test.mjs
 
       # The import graph, scored against the TypeScript compiler's own module resolution on this
       # repository. Precision must be exact and recall ≥ 99%: the resolver once mapped 102 of 543
@@ -117,6 +117,48 @@ jobs:
             const a = require(process.env.RUNNER_TEMP + "/go-accuracy.json");
             console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
             if (a.goInRepoEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # The Java graph, scored against javac's own name resolution (the Compiler Tree API attributes
+  # every file; each source name that resolves to an in-repo type is an edge) on jsoup, pinned.
+  java-accuracy:
+    name: Graph accuracy vs javac (jsoup)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone jsoup at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/jsoup"
+          git -C "$RUNNER_TEMP/jsoup" fetch -q --depth 1 https://github.com/jhy/jsoup.git d90d57521d931db7bf7ee464a4c0a1a9293db088
+          git -C "$RUNNER_TEMP/jsoup" checkout -q FETCH_HEAD
+
+      - name: Score against javac
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/jsoup" --no-index --out "$RUNNER_TEMP/jsoup.json"
+          node scripts/accuracy/java.mjs "$RUNNER_TEMP/jsoup" "$RUNNER_TEMP/jsoup.json" --json > "$RUNNER_TEMP/java-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/java-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
+            if (a.javacEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
 
   # Builds the three images AND runs a real analysis through the composed stack. Building alone
   # was green while the worker exited 0 on boot and no job was ever consumed. Clones one small

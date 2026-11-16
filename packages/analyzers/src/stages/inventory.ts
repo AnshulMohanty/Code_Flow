@@ -1,5 +1,5 @@
 import { FILE_TIMEOUT_MS, PARSE_CONCURRENCY } from "@codeflow/config";
-import { createParserRegistry, type ParserRegistry } from "@codeflow/parsers";
+import { createParserRegistry, grammarsFor, type ParserRegistry } from "@codeflow/parsers";
 import type {
   EntryPointEvidence,
   EntryPointKind,
@@ -76,8 +76,10 @@ export function createInventoryStage(deps: InventoryDependencies): PipelineStage
       // Load the tree-sitter grammars before the parse fan-out. Idempotent and shared with
       // Connect; if a grammar is unavailable the registry's parsers fall back to regex, so
       // this never fails the stage.
-      const treeSitter = await registry.ready();
-      if (!treeSitter.ready) {
+      const grammars = grammarsFor(structure.files.map((file) => file.path));
+      const treeSitter = await registry.ready({ languages: grammars });
+      // Warn only when a needed grammar is missing — a repo with no supported language needs none.
+      if (grammars.length > 0 && treeSitter.failed.some((entry) => grammars.includes(entry.language))) {
         ctx.logger.warn("Inventory: no tree-sitter grammar loaded; parsing with the regex fallback.", {
           failed: treeSitter.failed.map((entry) => entry.language),
         });

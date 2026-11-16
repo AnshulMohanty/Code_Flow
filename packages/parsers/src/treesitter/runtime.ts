@@ -8,7 +8,7 @@ import { Language as TsLanguage, Parser as TsParser } from "web-tree-sitter";
  * `jsx` deliberately maps onto the JavaScript grammar: tree-sitter-javascript parses JSX
  * natively, so there is no separate jsx grammar to ship.
  */
-export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python" | "go";
+export type TreeSitterLanguageId = "javascript" | "jsx" | "typescript" | "tsx" | "python" | "go" | "java";
 
 export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "javascript",
@@ -17,6 +17,7 @@ export const TREE_SITTER_LANGUAGES: TreeSitterLanguageId[] = [
   "tsx",
   "python",
   "go",
+  "java",
 ];
 
 /** Grammar wasm filename per language (jsx shares the JavaScript grammar). */
@@ -27,6 +28,7 @@ const GRAMMAR_FILE: Record<TreeSitterLanguageId, string> = {
   tsx: "tree-sitter-tsx.wasm",
   python: "tree-sitter-python.wasm",
   go: "tree-sitter-go.wasm",
+  java: "tree-sitter-java.wasm",
 };
 
 /**
@@ -42,12 +44,18 @@ export interface InitTreeSitterOptions {
   locateWasm?: WasmLocator;
   /** Passed through to `Parser.init` (e.g. a `locateFile` for the runtime wasm). */
   moduleOptions?: Parameters<typeof TsParser.init>[0];
+  /**
+   * Load only these grammars (the languages a repository actually contains). Omitted ⇒ every
+   * supported grammar. Grammars differ by 25× in size (Go 0.2 MB, C++ 5.4 MB), so a pipeline
+   * asks for what it needs; a warm server loads everything once.
+   */
+  languages?: readonly TreeSitterLanguageId[];
 }
 
 export interface TreeSitterStatus {
   /** True when at least one grammar loaded. */
   ready: boolean;
-  /** Languages with a usable grammar, sorted. */
+  /** Languages with a usable grammar, in `TREE_SITTER_LANGUAGES` order. */
   loaded: TreeSitterLanguageId[];
   /** Languages whose grammar could not be loaded, with the reason (they fall back). */
   failed: Array<{ language: TreeSitterLanguageId; reason: string }>;
@@ -60,61 +68,63 @@ interface LoadedGrammar {
 }
 
 const grammars = new Map<TreeSitterLanguageId, LoadedGrammar>();
-let initPromise: Promise<TreeSitterStatus> | null = null;
-let status: TreeSitterStatus = { ready: false, loaded: [], failed: [] };
+const failures = new Map<TreeSitterLanguageId, string>();
+/** One load per language, shared by concurrent callers. */
+const loads = new Map<TreeSitterLanguageId, Promise<void>>();
+/** One Language per distinct wasm file (jsx reuses javascript's). */
+const byFile = new Map<string, Promise<Language>>();
+let runtimeInit: Promise<void> | null = null;
+let runtimeError: string | null = null;
 
 /**
- * Load the tree-sitter runtime + the grammar wasms. Idempotent: concurrent and repeat
- * calls share one load. NEVER throws for a missing/incompatible grammar — it records the
- * failure and that language keeps using its regex parser.
+ * Load the tree-sitter runtime + the requested grammar wasms. Idempotent and incremental:
+ * concurrent and repeat calls share each load, and a later call for a new language loads only
+ * that one. NEVER throws for a missing/incompatible grammar — it records the failure and that
+ * language keeps using its regex parser.
  *
  * Loading is async (wasm), but `parseFile` stays SYNCHRONOUS afterwards, which is what
  * keeps the `ParserAdapter` contract unchanged.
  */
-export function initTreeSitter(options: InitTreeSitterOptions = {}): Promise<TreeSitterStatus> {
-  initPromise ??= loadAll(options).catch((error: unknown) => {
-    // A runtime-level failure (no wasm at all) is still not fatal: every language falls
-    // back to regex. Record it and let callers see `ready: false`.
-    status = {
-      ready: false,
-      loaded: [],
-      failed: TREE_SITTER_LANGUAGES.map((language) => ({ language, reason: messageOf(error) })),
-    };
-    return status;
+export async function initTreeSitter(options: InitTreeSitterOptions = {}): Promise<TreeSitterStatus> {
+  const wanted = options.languages ?? TREE_SITTER_LANGUAGES;
+  runtimeInit ??= TsParser.init(options.moduleOptions).catch((error: unknown) => {
+    // A runtime-level failure (no wasm at all) is still not fatal: every language falls back.
+    runtimeError = messageOf(error);
   });
-  return initPromise;
+  await runtimeInit;
+  if (runtimeError === null) {
+    const locate = options.locateWasm ?? defaultLocator;
+    await Promise.all(
+      wanted.map((language) => {
+        let load = loads.get(language);
+        if (!load) {
+          load = loadGrammar(language, locate);
+          loads.set(language, load);
+        }
+        return load;
+      }),
+    );
+  } else {
+    for (const language of wanted) failures.set(language, runtimeError);
+  }
+  return treeSitterStatus();
 }
 
-async function loadAll(options: InitTreeSitterOptions): Promise<TreeSitterStatus> {
-  await TsParser.init(options.moduleOptions);
-  const locate = options.locateWasm ?? defaultLocator;
-
-  const loaded: TreeSitterLanguageId[] = [];
-  const failed: TreeSitterStatus["failed"] = [];
-  // One Language per distinct wasm file (jsx reuses javascript's), but one Parser per
-  // LanguageId so callers never share parser state across languages.
-  const byFile = new Map<string, Language>();
-
-  // Deterministic load order (also the order `loaded` is reported in).
-  for (const language of TREE_SITTER_LANGUAGES) {
-    const file = GRAMMAR_FILE[language];
-    try {
-      let grammar = byFile.get(file);
-      if (!grammar) {
-        grammar = await TsLanguage.load(await locate(file));
-        byFile.set(file, grammar);
-      }
-      const parser = new TsParser();
-      parser.setLanguage(grammar);
-      grammars.set(language, { language: grammar, parser });
-      loaded.push(language);
-    } catch (error: unknown) {
-      failed.push({ language, reason: messageOf(error) });
+async function loadGrammar(language: TreeSitterLanguageId, locate: WasmLocator): Promise<void> {
+  const file = GRAMMAR_FILE[language];
+  try {
+    let grammar = byFile.get(file);
+    if (!grammar) {
+      grammar = Promise.resolve(locate(file)).then((source) => TsLanguage.load(source));
+      byFile.set(file, grammar);
     }
+    const parser = new TsParser();
+    parser.setLanguage(await grammar);
+    grammars.set(language, { language: await grammar, parser });
+    failures.delete(language);
+  } catch (error: unknown) {
+    failures.set(language, messageOf(error));
   }
-
-  status = { ready: loaded.length > 0, loaded, failed };
-  return status;
 }
 
 /** Default (Node) locator: resolve the wasm out of the installed grammar package.
@@ -127,7 +137,12 @@ const defaultLocator: WasmLocator = async (file) => {
 
 /** Current load status without triggering a load. */
 export function treeSitterStatus(): TreeSitterStatus {
-  return { ready: status.ready, loaded: [...status.loaded], failed: [...status.failed] };
+  const loaded = TREE_SITTER_LANGUAGES.filter((language) => grammars.has(language));
+  const failed = TREE_SITTER_LANGUAGES.filter((language) => failures.has(language)).map((language) => ({
+    language,
+    reason: failures.get(language)!,
+  }));
+  return { ready: loaded.length > 0, loaded, failed };
 }
 
 /** True when `language` has a usable grammar right now. */
@@ -144,8 +159,11 @@ export function grammarParser(language: string): ParserType | undefined {
 export function resetTreeSitterForTests(): void {
   for (const entry of grammars.values()) entry.parser.delete();
   grammars.clear();
-  initPromise = null;
-  status = { ready: false, loaded: [], failed: [] };
+  failures.clear();
+  loads.clear();
+  byFile.clear();
+  runtimeInit = null;
+  runtimeError = null;
 }
 
 function messageOf(error: unknown): string {

@@ -3,7 +3,7 @@ import { tokenizeCode } from "./tokenize.js";
 /**
  * THE KEYLESS LOCAL EMBEDDER (V3-P5 task 4).
  *
- * WHAT V3_PLAN §5 ASKED FOR: "int8 MiniLM local embeddings". WHAT SHIPS: a deterministic
+ * WHAT THE ORIGINAL PLAN ASKED FOR: "int8 MiniLM local embeddings". WHAT SHIPS: a deterministic
  * bag-of-words embedder over the shared code tokenizer. That is a real difference and it is stated
  * here rather than buried, because the model NAME is the part a reader would otherwise assume.
  *
@@ -34,7 +34,7 @@ import { tokenizeCode } from "./tokenize.js";
  *      class name and path words into the text it sees.
  *
  * The honest upgrade path is one file: implement `EmbeddingClient` over `onnxruntime-web` plus a JS
- * WordPiece, and the local CLI changes nothing. Named in GO_LIVE.md.
+ * WordPiece, and the local CLI changes nothing. Named in DESIGN.md.
  *
  * DETERMINISTIC AND STABLE ACROSS PROCESSES: no RNG, no clock, a fixed hash — so an index built
  * today is still searchable tomorrow, which a random projection would not be.

@@ -223,3 +223,23 @@ export function isJavaScriptBundle(content: string): boolean {
   const head = content.slice(0, 4096);
   return head.includes("MODULE_NOT_FOUND") && /typeof require\s*&&\s*require/.test(head);
 }
+
+/** Java imports by line scanning — the fallback when the Java grammar is unavailable. */
+export interface JavaImportLine {
+  source: string;
+  isStatic: boolean;
+  line: number;
+}
+
+const JAVA_IMPORT = /^\s*import\s+(static\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)(\s*\.\s*\*)?\s*;/;
+
+export function scanJavaImports(content: string): JavaImportLine[] {
+  const out: JavaImportLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = JAVA_IMPORT.exec(text);
+    if (!match) return;
+    const name = match[2].replace(/\s+/g, "");
+    out.push({ source: match[3] ? `${name}.*` : name, isStatic: Boolean(match[1]), line: index + 1 });
+  });
+  return out;
+}
