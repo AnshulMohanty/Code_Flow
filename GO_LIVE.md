@@ -89,8 +89,8 @@ analysis are unaffected. Switching the CHAT provider has no index consequence at
 
 ```bash
 docker compose -f docker-compose.yml up -d           # mongo, redis, pgvector
-docker compose -f docker-compose.app.yml build
-docker compose -f docker-compose.app.yml up -d
+docker compose --env-file codeflow.env -f docker-compose.app.yml build
+docker compose --env-file codeflow.env -f docker-compose.app.yml up -d
 ```
 
 **Verify, do not assume:**

@@ -15,5 +15,5 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo CodeFlow is starting -^> open http://localhost:5173
-echo Logs:  docker compose -f docker-compose.app.yml logs -f
-echo Stop:  docker compose -f docker-compose.app.yml down   (add -v to also wipe the database)
+echo Logs:  docker compose --env-file codeflow.env -f docker-compose.app.yml logs -f
+echo Stop:  docker compose --env-file codeflow.env -f docker-compose.app.yml down   (add -v to also wipe the database)

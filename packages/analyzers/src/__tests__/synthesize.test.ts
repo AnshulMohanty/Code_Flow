@@ -12,6 +12,7 @@ import type {
   RepoStructure,
   TokenUsage,
 } from "@codeflow/shared-types";
+import { ProviderHttpError } from "../util/providerError.js";
 import { createSynthesizeStage, deriveSynthesis } from "../stages/synthesize.js";
 import { runPipeline } from "../pipeline/orchestrator.js";
 import type { LlmClient, LlmCompletionRequest, LlmCompletionResult } from "../llm/llmClient.js";
@@ -200,6 +201,21 @@ describe("synthesize — valid output", () => {
     const fenced = "```json\n" + goodResponse(["src/a.ts"]) + "\n```";
     const synthesis = deriveSynthesis(fenced, new Set(NODE_IDS));
     expect(synthesis.readingOrder[0].fileId).toBe("src/a.ts");
+  });
+});
+
+describe("synthesize — provider errors", () => {
+  it("does not retry a rejected request (401 bad key): one call, clean message", async () => {
+    const body = JSON.stringify({ error: { code: 400, message: "API key not valid.", status: "INVALID_ARGUMENT" } });
+    const client = mockClient([new ProviderHttpError("Gemini", 400, body)]);
+    await expect(synth(client, ctxFor(), 3)).rejects.toThrow("Synthesis failed after 1 attempt: Gemini API error 400: API key not valid. [INVALID_ARGUMENT]");
+    expect(client.calls).toHaveLength(1);
+  });
+
+  it("does retry a transient failure (429 / 5xx / network)", async () => {
+    const client = mockClient([new ProviderHttpError("Gemini", 429, "slow down"), new Error("socket hang up"), goodResponse(["src/a.ts"])]);
+    await synth(client, ctxFor(), 3);
+    expect(client.calls).toHaveLength(3);
   });
 });
 

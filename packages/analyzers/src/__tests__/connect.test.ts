@@ -141,6 +141,97 @@ describe("connect — module resolution", () => {
   });
 });
 
+describe("connect — real-repo resolution", () => {
+  it("resolves ESM `.js` specifiers to `.ts` sources (NodeNext TypeScript)", async () => {
+    const graph = await connect([
+      { path: "src/app.ts", content: "import { routes } from './routes/index.js';" },
+      { path: "src/routes/index.ts", content: "export const routes = [];" },
+    ]);
+    expect(graph.edges).toEqual([
+      { from: "src/app.ts", to: "src/routes/index.ts", kind: "import", specifier: "./routes/index.js" },
+    ]);
+    expect(graph.resolution.unresolved).toBe(0);
+  });
+
+  it("resolves a workspace package import to its source entry", async () => {
+    const graph = await connect([
+      { path: "packages/graph/package.json", content: JSON.stringify({ name: "@acme/graph", main: "dist/index.js" }), role: "config" },
+      { path: "packages/graph/src/index.ts", content: "export const g = 1;" },
+      { path: "apps/api/src/app.ts", content: "import { g } from '@acme/graph';" },
+    ]);
+    expect(graph.edges).toEqual([
+      { from: "apps/api/src/app.ts", to: "packages/graph/src/index.ts", kind: "import", specifier: "@acme/graph" },
+    ]);
+    expect(graph.resolution.external).toBe(0);
+  });
+
+  it("parses TEST files too, so tests that reach a module are visible in the graph", async () => {
+    const graph = await connect([
+      { path: "src/math.ts", content: "export const add = (a: number, b: number) => a + b;" },
+      { path: "test/math.test.ts", content: "import { add } from '../src/math';\nadd(1, 2);", role: "test" },
+    ]);
+    expect(graph.edges).toEqual([{ from: "test/math.test.ts", to: "src/math.ts", kind: "import", specifier: "../src/math" }]);
+  });
+
+  it("`from . import sessions` edges to the submodule, so no fake cycle through __init__", async () => {
+    const graph = await connect([
+      { path: "pkg/__init__.py", content: "from . import sessions" },
+      { path: "pkg/sessions.py", content: "from . import models" },
+      { path: "pkg/models.py", content: "x = 1" },
+    ]);
+    expect(graph.edges.map((e) => `${e.from}->${e.to}`).sort()).toEqual([
+      "pkg/__init__.py->pkg/sessions.py",
+      "pkg/sessions.py->pkg/models.py",
+    ]);
+  });
+});
+
+describe("connect — runtime vs type-only vs lazy imports", () => {
+  it("marks TS `import type` / all-`type` specifiers / `export type … from` as typeOnly", async () => {
+    const graph = await connect([
+      {
+        path: "src/a.ts",
+        content: [
+          "import type { B } from './b';",
+          "import { type C } from './c';",
+          "import { d, type D } from './d';",
+          "export type { E } from './e';",
+        ].join("\n"),
+      },
+      { path: "src/b.ts", content: "export type B = 1;" },
+      { path: "src/c.ts", content: "export type C = 1;" },
+      { path: "src/d.ts", content: "export const d = 1; export type D = 1;" },
+      { path: "src/e.ts", content: "export type E = 1;" },
+    ]);
+    const typeOnly = Object.fromEntries(graph.edges.map((e) => [e.to, e.typeOnly === true]));
+    expect(typeOnly).toEqual({ "src/b.ts": true, "src/c.ts": true, "src/d.ts": false, "src/e.ts": true });
+  });
+
+  it("marks Python TYPE_CHECKING imports typeOnly and function-body imports lazy", async () => {
+    const graph = await connect([
+      {
+        path: "pkg/a.py",
+        content: [
+          "from typing import TYPE_CHECKING",
+          "from . import b",
+          "if TYPE_CHECKING:",
+          "    from . import c",
+          "else:",
+          "    from . import d",
+          "def run():",
+          "    from . import e",
+        ].join("\n"),
+      },
+      ...["b", "c", "d", "e"].map((name) => ({ path: `pkg/${name}.py`, content: "x = 1" })),
+      { path: "pkg/__init__.py", content: "" },
+    ]);
+    const flags = Object.fromEntries(
+      graph.edges.map((e) => [e.to, [e.typeOnly ? "type" : "", e.lazy ? "lazy" : ""].filter(Boolean).join("+") || "runtime"]),
+    );
+    expect(flags).toEqual({ "pkg/b.py": "runtime", "pkg/c.py": "type", "pkg/d.py": "runtime", "pkg/e.py": "lazy" });
+  });
+});
+
 describe("connect — external & unresolved", () => {
   it("a bare/package import is external, not a node, and is tallied", async () => {
     const graph = await connect([

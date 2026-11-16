@@ -62,23 +62,27 @@ jobs:
       - name: Legacy root tests
         run: node --test tests/*.mjs
 
-  docker-build:
-    name: Docker images build (no push)
+      # The import graph, scored against the TypeScript compiler's own module resolution on this
+      # repository. Precision must be exact and recall ≥ 99%: the resolver once mapped 102 of 543
+      # of this repo's own imports (every `./x.js` → `x.ts` was missed) while every test passed.
+      - name: Graph accuracy vs tsc (self)
+        run: |
+          node apps/local-cli/dist/index.js analyze . --no-index --out "$RUNNER_TEMP/self.json"
+          node scripts/graph-accuracy.mjs . "$RUNNER_TEMP/self.json" --json > "$RUNNER_TEMP/accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # Builds the three images AND runs a real analysis through the composed stack. Building alone
+  # was green while the worker exited 0 on boot and no job was ever consumed. Clones one small
+  # public repository; no secrets (the AI stages run against a placeholder key and must degrade).
+  docker-smoke:
+    name: Docker stack smoke (build · boot · analyse)
     runs-on: ubuntu-latest
     needs: gate
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Build all three service images to validate the Dockerfiles. No push, no secrets —
-      # building needs neither. This is the job that actually proves Part A.
-      - name: Build API image
-        run: docker build -f apps/api/Dockerfile -t codeflow-api:ci .
-
-      - name: Build worker image
-        run: docker build -f apps/worker/Dockerfile -t codeflow-worker:ci .
-
-      - name: Build web image
-        run: docker build -f apps/web/Dockerfile -t codeflow-web:ci .
+      - name: Build, boot and analyse
+        run: ./scripts/docker-smoke.sh

@@ -22,8 +22,18 @@ export interface CpgImport {
   source: string;
   /** Local binding names introduced by this import (default, namespace, named aliases). */
   specifiers: string[];
+  /**
+   * Python `from X import a, b as c` only: the IMPORTED names (`a`, `b`), index-aligned with
+   * `specifiers` (`a`, `c`). The resolver needs the original name to tell a submodule import
+   * (`from . import sessions`) from a symbol import.
+   */
+  names?: string[];
   kind: "import" | "require" | "dynamic" | "reexport";
   line: number;
+  /** Erased at runtime: TS `import type` / `export type … from`, or a Python `if TYPE_CHECKING:` import. */
+  typeOnly?: boolean;
+  /** Executed only when a function runs (a `require`/`import` inside a function body). */
+  lazy?: boolean;
 }
 
 /** A call site, recorded by the ROOT local binding it goes through. */
@@ -148,7 +158,13 @@ function jsLikeFacts(tree: Tree): CpgFacts {
     const name = calleeName(callee);
     if (name === "require") {
       if (literal !== undefined) {
-        facts.imports.push({ source: literal, specifiers: requireBindings(call), kind: "require", line: startLine(call) });
+        facts.imports.push({
+          source: literal,
+          specifiers: requireBindings(call),
+          kind: "require",
+          line: startLine(call),
+          ...(insideFunction(call, JS_FUNCTION_TYPES) ? { lazy: true } : {}),
+        });
       }
       continue;
     }
@@ -189,7 +205,52 @@ function collectJsImport(statement: Node, facts: CpgFacts): void {
   const source = stringValue(field(statement, "source"));
   if (source === undefined) return;
   const clause = statement.namedChildren.find((child) => child?.type === "import_clause");
-  facts.imports.push({ source, specifiers: clause ? localBindings(clause) : [], kind: "import", line });
+  facts.imports.push({
+    source,
+    specifiers: clause ? localBindings(clause) : [],
+    kind: "import",
+    line,
+    ...(isTypeOnlyJsImport(statement, clause ?? undefined) ? { typeOnly: true } : {}),
+  });
+}
+
+/** `import type { A }`, or `import { type A, type B }` where EVERY binding is a type. */
+function isTypeOnlyJsImport(statement: Node, clause: Node | undefined): boolean {
+  if (/^import\s+type\s/.test(statement.text)) return true;
+  if (!clause) return false;
+  const children = namedChildrenOf(clause);
+  if (children.length !== 1 || children[0].type !== "named_imports") return false;
+  const specifiers = namedChildrenOf(children[0]).filter((child) => child.type === "import_specifier");
+  return specifiers.length > 0 && specifiers.every((specifier) => /^type\s/.test(specifier.text));
+}
+
+const JS_FUNCTION_TYPES = new Set([
+  "function_declaration",
+  "function_expression",
+  "function",
+  "arrow_function",
+  "method_definition",
+  "generator_function_declaration",
+]);
+const PY_FUNCTION_TYPES = new Set(["function_definition", "lambda"]);
+
+function insideFunction(node: Node, functionTypes: ReadonlySet<string>): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (functionTypes.has(current.type)) return true;
+  }
+  return false;
+}
+
+/** Inside the body of `if TYPE_CHECKING:` (or `typing.TYPE_CHECKING`), not its `else`. */
+function insideTypeCheckingBlock(node: Node): boolean {
+  let child: Node = node;
+  for (let current = node.parent; current; child = current, current = current.parent) {
+    if (current.type !== "if_statement") continue;
+    const condition = field(current, "condition");
+    const consequence = field(current, "consequence");
+    if (condition && /\bTYPE_CHECKING\b/.test(condition.text) && consequence && child.id === consequence.id) return true;
+  }
+  return false;
 }
 
 /** Local names an import clause binds — default, `* as ns`, and named aliases. */
@@ -215,7 +276,13 @@ function localBindings(clause: Node): string[] {
 function collectJsReexport(statement: Node, facts: CpgFacts): void {
   const source = stringValue(field(statement, "source"));
   if (source !== undefined) {
-    facts.imports.push({ source, specifiers: [], kind: "reexport", line: startLine(statement) });
+    facts.imports.push({
+      source,
+      specifiers: [],
+      kind: "reexport",
+      line: startLine(statement),
+      ...(/^export\s+type\s/.test(statement.text) ? { typeOnly: true } : {}),
+    });
   }
 }
 
@@ -291,8 +358,15 @@ function pythonFacts(tree: Tree): CpgFacts {
 
   for (const node of root.descendantsOfType(["import_statement", "import_from_statement"])) {
     if (!node) continue;
+    const before = facts.imports.length;
     if (node.type === "import_statement") collectPyImport(node, facts);
     else collectPyFromImport(node, facts);
+    const typeOnly = insideTypeCheckingBlock(node);
+    const lazy = insideFunction(node, PY_FUNCTION_TYPES);
+    for (const spec of facts.imports.slice(before)) {
+      if (typeOnly) spec.typeOnly = true;
+      if (lazy) spec.lazy = true;
+    }
   }
 
   for (const call of root.descendantsOfType("call")) {
@@ -348,16 +422,23 @@ function collectPyFromImport(statement: Node, facts: CpgFacts): void {
   if (!moduleName) return;
 
   const specifiers: string[] = [];
+  const names: string[] = [];
   for (const child of namedChildrenOf(statement)) {
     if (child.id === moduleName.id) continue;
-    if (child.type === "dotted_name") specifiers.push(child.text);
-    else if (child.type === "aliased_import") {
+    if (child.type === "dotted_name") {
+      specifiers.push(child.text);
+      names.push(child.text);
+    } else if (child.type === "aliased_import") {
       // The LOCAL binding is the alias when present — that is what call sites use.
-      const alias = field(child, "alias") ?? field(child, "name");
-      if (alias?.text) specifiers.push(alias.text);
+      const name = field(child, "name");
+      const alias = field(child, "alias") ?? name;
+      if (alias?.text) {
+        specifiers.push(alias.text);
+        names.push(name?.text ?? alias.text);
+      }
     }
   }
-  facts.imports.push({ source: moduleName.text, specifiers, kind: "import", line });
+  facts.imports.push({ source: moduleName.text, specifiers, names, kind: "import", line });
 }
 
 /** Flask `@app.route("/x", methods=[…])` and FastAPI `@router.get("/x")`. */
@@ -440,12 +521,11 @@ function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFac
       }
       const from = PY_FROM_IMPORT_LINE.exec(line.trim());
       if (from) {
-        facts.imports.push({
-          source: from[1],
-          specifiers: from[2].split(",").map((value) => splitAliasSegments(value)[0] ?? value.trim()),
-          kind: "import",
-          line: lineNumber,
-        });
+        const names = from[2]
+          .split(",")
+          .map((value) => (splitAliasSegments(value)[0] ?? value).replace(/[()]/g, "").trim())
+          .filter(Boolean);
+        facts.imports.push({ source: from[1], specifiers: names, names, kind: "import", line: lineNumber });
       }
       return;
     }

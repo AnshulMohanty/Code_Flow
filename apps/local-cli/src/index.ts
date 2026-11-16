@@ -1,7 +1,17 @@
 #!/usr/bin/env node
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { buildReferenceIndex, formatVerificationReport, verifyReferences } from "@codeflow/analyzers";
 import { analyzeLocal, queryLocal } from "./analyzeLocal.js";
+import {
+  changedFilesSince,
+  checkoutToTemp,
+  computeImpact,
+  defaultBase,
+  renderImpactMarkdown,
+  renderImpactText,
+  type ChangedFile,
+} from "./impact.js";
 
 /**
  * `codeflow-local` — the LOCAL-FIRST CLI (V3-P5 task 4).
@@ -17,6 +27,8 @@ import { analyzeLocal, queryLocal } from "./analyzeLocal.js";
  *
  *   codeflow-local analyze <repo-path> [--out result.json] [--no-index] [--index-dir DIR]
  *   codeflow-local ask <repo-path> "<question>" [--index-dir DIR] [-k N]
+ *   codeflow-local verify <repo-path> [text-file | -] [--text "…"] [--format text|markdown|json]
+ *   codeflow-local impact <repo-path> [--base REF] [--files a,b] [--format text|markdown|json]
  */
 
 interface ParsedArgs {
@@ -32,7 +44,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    if (!token.startsWith("-")) {
+    if (!token.startsWith("-") || token === "-") {
       positional.push(token);
       continue;
     }
@@ -65,6 +77,23 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
   codeflow-local ask <repo-path> "<question>" [options]
       --index-dir DIR     the index built by \`analyze\` (default <repo>/.codeflow)
       -k N                how many code chunks to return (default 5)
+
+  codeflow-local verify <repo-path> [text-file | -] [options]
+      Check every code reference in a piece of text — an agent's answer, a PR description, a review
+      comment — against the repository: does the file exist, are the cited lines inside it, is the
+      named symbol declared there? Reads the text from a file, from stdin ("-"), or from --text.
+      --text "..."        the text to check, inline
+      --format F          text (default) | markdown | json
+      Exit code 1 when any reference is wrong.
+
+  codeflow-local impact <repo-path> [options]
+      What a change set touches: dependents (direct + transitive), entry points, tests that reach
+      it, new import cycles and imports that resolve to nothing. Local git only — never fetches.
+      --base REF          compare against REF's merge-base with HEAD (default origin/HEAD, main, master)
+      --files a,b         use this file list instead of git
+      --format F          text (default) | markdown (PR comment) | json
+      --link-base URL     markdown only: prefix for file links (e.g. https://github.com/o/r/blob/SHA)
+      --fail-on LIST      exit 1 on: new-cycle, broken-import, untested (comma-separated)
 
 WHAT YOU GET, and what you do not:
   ✓ dependency graph, centrality, cycles, communities, symbols, entry points  — all offline
@@ -106,7 +135,10 @@ async function main(): Promise<number> {
     console.log(
       `communities:  ${metrics?.clusters ? `${metrics.clusters.count} (modularity ${metrics.clusters.modularity.toFixed(3)})` : "not computed"}`,
     );
-    console.log(`entry points: ${(analysis.result.entryPoints ?? []).map((entry) => entry.fileId).join(", ") || "none detected"}`);
+    const entryPoints = (analysis.result.entryPoints ?? []).map((entry) => entry.fileId);
+    console.log(
+      `entry points: ${entryPoints.length === 0 ? "none detected" : `${entryPoints.slice(0, 6).join(", ")}${entryPoints.length > 6 ? ` (+${entryPoints.length - 6} more)` : ""}`}`,
+    );
     console.log(`indexed:      ${analysis.chunkCount} chunk(s)${analysis.chunkCount ? ` in ${analysis.indexDir}` : ""}`);
     for (const warning of analysis.warnings) console.log(`warning:      ${warning}`);
     // Said every time, not once in a README: the absence of a summary is the one thing a user of the
@@ -154,6 +186,88 @@ async function main(): Promise<number> {
     }
     console.log("\nnote: local mode returns the GROUNDED CODE, not prose — there is no local LLM to summarise it.");
     return 0;
+  }
+
+  if (command === "verify") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("verify needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const text =
+      typeof flags.text === "string"
+        ? flags.text
+        : positional[1] === "-" || (!positional[1] && !process.stdin.isTTY)
+          ? await readStdin()
+          : positional[1]
+            ? await readFile(path.resolve(positional[1]), "utf8")
+            : undefined;
+    if (text === undefined) {
+      console.error('verify needs the text to check: a file, "-" for stdin, or --text "...".');
+      return 1;
+    }
+    const analysis = await analyzeLocal({ repoPath, skipIndex: true, onProgress: () => {} });
+    const root = path.resolve(repoPath);
+    const index = buildReferenceIndex(analysis.result, async (relative) => {
+      // Only paths the analysis discovered reach here (buildReferenceIndex checks), so no traversal.
+      const content = await readFile(path.join(root, relative), "utf8").catch(() => null);
+      return content === null ? undefined : content.split(/\r\n|\r|\n/).length - (content.endsWith("\n") ? 1 : 0);
+    });
+    const report = await verifyReferences(text, index);
+    const format = typeof flags.format === "string" ? flags.format : "text";
+    console.log(format === "json" ? JSON.stringify(report, null, 2) : formatVerificationReport(report, format === "markdown" ? "markdown" : "text"));
+    return report.fail > 0 ? 1 : 0;
+  }
+
+  if (command === "impact") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("impact needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    let changed: ChangedFile[];
+    let base: string | undefined;
+    if (typeof flags.files === "string") {
+      changed = flags.files.split(",").map((file) => file.trim()).filter(Boolean).map((file) => ({ path: file, status: "modified" as const }));
+    } else {
+      base = typeof flags.base === "string" ? flags.base : await defaultBase(root);
+      if (!base) {
+        console.error("impact: no --base given and none of origin/HEAD, origin/main, origin/master, main, master exists.");
+        return 1;
+      }
+      changed = await changedFilesSince(root, base);
+    }
+
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    let baseResult;
+    if (base) {
+      try {
+        const checkout = await checkoutToTemp(root, base);
+        try {
+          baseResult = (await analyzeLocal({ repoPath: checkout.dir, skipIndex: true, onProgress: () => {} })).result;
+        } finally {
+          await checkout.cleanup();
+        }
+      } catch (error) {
+        console.error(`impact: could not analyse base ${base} (${error instanceof Error ? error.message : String(error)}); new-cycle check skipped.`);
+      }
+    }
+    const report = computeImpact(head.result, changed, { ...(base ? { base } : {}), ...(baseResult ? { baseResult } : {}) });
+    const format = typeof flags.format === "string" ? flags.format : "text";
+    if (format === "json") console.log(JSON.stringify(report, null, 2));
+    else if (format === "markdown") {
+      console.log(renderImpactMarkdown(report, typeof flags["link-base"] === "string" ? { linkBase: flags["link-base"].replace(/\/$/, "") } : {}));
+    } else console.log(renderImpactText(report));
+
+    const failOn = new Set(typeof flags["fail-on"] === "string" ? flags["fail-on"].split(",").map((v) => v.trim()) : []);
+    const failed =
+      (failOn.has("new-cycle") && (report.newCycles?.length ?? 0) > 0) ||
+      (failOn.has("broken-import") && report.brokenImports.length > 0) ||
+      (failOn.has("untested") && report.untested.length > 0);
+    return failed ? 1 : 0;
   }
 
   console.error(`Unknown command "${command}".\n`);
@@ -229,4 +343,10 @@ if (invokedDirectly) {
       console.error(`codeflow-local failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exit(1);
     });
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
 }

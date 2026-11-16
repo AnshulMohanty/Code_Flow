@@ -68,6 +68,21 @@ describe("analyze — centrality / key files", () => {
     expect(metrics.keyFiles).toEqual(["hub.ts", "a.ts", "b.ts", "c.ts", "util.ts"]);
   });
 
+  it("ranks production source first: tests and docs never outrank a load-bearing module", async () => {
+    // core.ts is imported by two source files; util.ts is imported by five TEST files.
+    const tests = ["t1", "t2", "t3", "t4", "t5"].map((t) => node(`test/${t}.test.ts`, { layer: "test" }));
+    const graph = repoGraph(
+      [node("a.ts"), node("b.ts"), node("core.ts"), node("util.ts"), node("README.md", { layer: "docs" }), ...tests],
+      [edge("a.ts", "core.ts"), edge("b.ts", "core.ts"), ...tests.map((t) => edge(t.id, "util.ts"))],
+    );
+    const metrics = await analyze(graph);
+    expect(metrics.keyFiles[0]).toBe("core.ts");
+    expect(metrics.keyFiles.indexOf("util.ts")).toBeLessThan(metrics.keyFiles.indexOf("README.md"));
+    expect(metrics.keyFiles.slice(-6).every((id) => id.startsWith("test/") || id === "README.md")).toBe(true);
+    // perFile keeps the unfiltered truth: util really has five importers.
+    expect(metrics.perFile.find((f) => f.fileId === "util.ts")?.fanIn).toBe(5);
+  });
+
   it("fanIn / fanOut match hand-counted edges", async () => {
     const graph = repoGraph(
       [node("a.ts"), node("b.ts"), node("hub.ts")],
@@ -89,6 +104,22 @@ describe("analyze — cycles", () => {
     expect(metrics.cycles).toHaveLength(1);
     expect([...metrics.cycles[0].files].sort()).toEqual(["a.ts", "b.ts", "c.ts"]);
     expect(metrics.summary.cycleCount).toBe(1);
+  });
+
+  it("reports only LOAD-TIME cycles: type-only, lazy and dynamic edges cannot close a cycle", async () => {
+    const nodes = [node("a.py"), node("b.py"), node("c.py"), node("d.py")];
+    const graph = repoGraph(nodes, [
+      edge("a.py", "b.py"),
+      { ...edge("b.py", "a.py"), typeOnly: true },
+      edge("c.py", "d.py"),
+      { ...edge("d.py", "c.py"), lazy: true },
+      { ...edge("a.py", "c.py"), kind: "dynamic" },
+      edge("c.py", "a.py"),
+    ]);
+    const metrics = await analyze(graph);
+    expect(metrics.cycles).toEqual([]);
+    // the edges themselves stay in the graph: fan-in still counts them
+    expect(metrics.perFile.find((f) => f.fileId === "a.py")?.fanIn).toBe(2);
   });
 
   it("an acyclic graph has no cycles", async () => {

@@ -83,16 +83,42 @@ export function createAnalyzeStage(deps: AnalyzeDependencies = {}): PipelineStag
       });
       perFile.sort((a, b) => a.fileId.localeCompare(b.fileId)); // deterministic storage order
 
+      // Rankings answer "what is load-bearing in the PRODUCT": source files first, ordered by
+      // degree over production edges only (a heavily-tested module is not thereby central),
+      // then every other file. perFile keeps the full, unfiltered numbers.
+      const roleOf = (id: string) => nodeByPath.get(id)?.layer;
+      const productionDegree = new Map<string, number>();
+      for (const edge of repoGraph.edges) {
+        if (roleOf(edge.from) === "test" || roleOf(edge.to) === "test") continue;
+        productionDegree.set(edge.from, (productionDegree.get(edge.from) ?? 0) + 1);
+        productionDegree.set(edge.to, (productionDegree.get(edge.to) ?? 0) + 1);
+      }
+      const sourceFirst = (a: FileMetrics, b: FileMetrics) =>
+        Number(roleOf(b.fileId) === "source") - Number(roleOf(a.fileId) === "source");
       const keyFiles = [...perFile]
-        .sort((a, b) => b.centrality - a.centrality || a.fileId.localeCompare(b.fileId))
+        .sort(
+          (a, b) =>
+            sourceFirst(a, b) ||
+            (productionDegree.get(b.fileId) ?? 0) - (productionDegree.get(a.fileId) ?? 0) ||
+            b.centrality - a.centrality ||
+            a.fileId.localeCompare(b.fileId),
+        )
         .map((file) => file.fileId);
       const hotspots = [...perFile]
-        .sort((a, b) => b.complexity - a.complexity || a.fileId.localeCompare(b.fileId))
+        .sort((a, b) => sourceFirst(a, b) || b.complexity - a.complexity || a.fileId.localeCompare(b.fileId))
         .map((file) => file.fileId);
 
       // findCircularDependencies returns each cycle as an array of node paths (=== fileId),
       // each rotation-normalized. Sort the cycle list deterministically.
-      const cycles = findCircularDependencies(liveGraph)
+      // Cycles are LOAD-TIME cycles: an edge that is erased (`import type`, TYPE_CHECKING), deferred
+      // into a function body, or a dynamic import() cannot participate in an import-order failure.
+      // Counting them is the classic false positive (requests: 18 reported, most type-only).
+      const runtimeEdges = repoGraph.edges.filter((edge) => !edge.typeOnly && !edge.lazy && edge.kind !== "dynamic");
+      const runtimeGraph =
+        runtimeEdges.length === repoGraph.edges.length
+          ? liveGraph
+          : buildDependencyGraph({ files: repoGraph.nodes, dependencies: runtimeEdges.map(toDependencyEdge) });
+      const cycles = findCircularDependencies(runtimeGraph)
         .map((files) => ({ files }))
         .sort((a, b) => a.files.join("\u0000").localeCompare(b.files.join("\u0000")));
 

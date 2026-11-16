@@ -438,7 +438,7 @@ export interface RepoStructure {
 export interface EntryPoint {
   /** References FileNode.id. */
   fileId: string;
-  reason: "main" | "index" | "server" | "cli-bin" | "exported-root";
+  reason: "main" | "index" | "server" | "app" | "cli-bin" | "exported-root";
 }
 
 // ── Inventory slice (stage 4) ────────────────────────────────────────────────
@@ -532,6 +532,11 @@ export interface Inventory {
   symbolCount: number;
   /** Real lines-of-code per parsed file, keyed by repo-relative POSIX path. */
   loc: Record<string, number>;
+  /**
+   * PHYSICAL line count per parsed file (blank and comment lines included). `loc` is not a file
+   * length — checking that a cited line exists needs this one.
+   */
+  lines?: Record<string, number>;
   /** Hard-evidence project-type verdict for orchestrator reconciliation, if any. */
   projectTypeSignal?: ProjectTypeSignal;
   /** Files that could not be parsed (skipped — a single bad file is not a stage failure). */
@@ -553,6 +558,10 @@ export interface RepoDependencyEdge {
   kind: "import" | "require" | "dynamic" | "reexport";
   /** The raw import/require/from string as written in source. */
   specifier: string;
+  /** Erased at runtime (`import type`, `if TYPE_CHECKING:`). Present only when true. */
+  typeOnly?: true;
+  /** Runs only when a function is called (import inside a function body). Present only when true. */
+  lazy?: true;
 }
 
 /**

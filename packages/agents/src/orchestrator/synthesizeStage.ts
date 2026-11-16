@@ -102,7 +102,10 @@ export function createFanOutSynthesizeStage(deps: FanOutSynthesizeDependencies):
         const slash = fileId.lastIndexOf("/");
         return slash === -1 ? "" : fileId.slice(0, slash);
       };
-      const declaredEntryPoints = new Set((ctx.prior.entryPoints ?? []).map((entry) => entry.fileId));
+      const declaredEntryPoints = new Set([
+        ...(ctx.prior.entryPoints ?? []).map((entry) => entry.fileId),
+        ...(ctx.prior.inventory?.entryPoints ?? []).map((entry) => entry.filePath),
+      ]);
       const entryProbable = (fileId: string): boolean => {
         if (declaredEntryPoints.has(fileId)) return true;
         const own = directoryOf(fileId);

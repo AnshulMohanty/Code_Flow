@@ -11,7 +11,7 @@ import { createGraphOracleVerifier, createSandbox, truthFor, type OracleQuestion
 import { emptySession } from "@codeflow/memory";
 import type { AnalysisResult } from "@codeflow/shared-types";
 import type { ChunkTextStore, Reranker, VectorStore } from "@codeflow/retrieval";
-import type { EmbeddingClient } from "@codeflow/analyzers";
+import { buildReferenceIndex, formatVerificationReport, verifyReferences, type EmbeddingClient } from "@codeflow/analyzers";
 import type { McpScope } from "./scope.js";
 
 /**
@@ -179,7 +179,7 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
     );
   }
 
-  if (allows("verify")) tools.push(verifyTool());
+  if (allows("verify")) tools.push(verifyTool(), verifyCitationsTool());
 
   return tools;
 }
@@ -215,6 +215,39 @@ function graphFactsTool(): McpToolDefinition {
         `searchable chunks: ${result.ai?.rag?.chunkCount ?? 0}`,
       ];
       return { text: lines.join("\n") };
+    },
+  };
+}
+
+/**
+ * `verify_citations` — check every code reference in free text before showing it to a person.
+ *
+ * Where `verify_answer` grades a STRUCTURED claim, this takes prose: the agent's own draft answer, a
+ * PR description, a review comment. Every `path`, `path:line`, `#L` anchor, GitHub blob link and
+ * backticked symbol next to one is checked against the analysed repository. Model-free.
+ */
+function verifyCitationsTool(): McpToolDefinition {
+  return {
+    name: "verify_citations",
+    description:
+      "Check the code references in a piece of text (your draft answer, a PR description, a review comment) " +
+      "against the repository: does each cited file exist, are the cited lines inside it, is a symbol named next " +
+      "to a reference declared there (at those lines)? Deterministic, no model. Call it on your answer BEFORE " +
+      "presenting it, and fix or drop every reference marked ✗.",
+    scope: "verify",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text whose code references should be checked." },
+      },
+      required: ["text"],
+    },
+    async handler(args, deps) {
+      const text = typeof args.text === "string" ? args.text : "";
+      if (!text.trim()) return { text: "verify_citations: `text` is empty.", isError: true };
+      const result = await deps.loadResult();
+      const report = await verifyReferences(text, buildReferenceIndex(result));
+      return { text: formatVerificationReport(report, "text"), isError: false };
     },
   };
 }

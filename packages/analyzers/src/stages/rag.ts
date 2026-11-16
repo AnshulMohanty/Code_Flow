@@ -29,6 +29,7 @@ import { BudgetExceededError } from "../pipeline/errors.js";
 import { embedCacheKey, type CachedEmbedding } from "../rag/embedCache.js";
 import type { StageSpeculationSource } from "../pipeline/speculation.js";
 import { estimateTokens, sumUsage } from "../util/tokens.js";
+import { isRetryableError } from "../util/providerError.js";
 
 export interface RagDependencies {
   /** Injectable embedding client — tests mock it (no real API calls). */
@@ -724,20 +725,25 @@ async function embedWithRetry(
   ctx: PipelineContext,
 ): Promise<EmbeddingResult> {
   let lastError: unknown;
+  let attemptsMade = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    attemptsMade = attempt;
     try {
       return await client.embed({ texts, inputType: "document" });
     } catch (error) {
       lastError = error;
-      ctx.logger.warn("RAG embedding call failed; retrying if attempts remain.", {
-        attempt,
-        batchSize: texts.length,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const retryable = isRetryableError(error);
+      ctx.logger.warn(
+        retryable ? "RAG embedding call failed; retrying if attempts remain." : "RAG embedding call rejected; not retrying.",
+        { attempt, batchSize: texts.length, error: error instanceof Error ? error.message : String(error) },
+      );
+      if (!retryable) break;
     }
   }
   throw new Error(
-    `RAG embedding failed after ${maxAttempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    `RAG embedding failed after ${attemptsMade} attempt${attemptsMade === 1 ? "" : "s"}: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`,
   );
 }
 
