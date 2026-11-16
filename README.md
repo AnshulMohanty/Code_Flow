@@ -101,7 +101,7 @@ same `(file, specifier)`. Measured on 2026-11-16 at each repository's default-br
 |---|---:|---:|---:|---:|---:|---:|
 | trpc/trpc (pnpm monorepo) | 2,753 | 2,751 | 0 | 2 | 100% | 99.93% |
 | colinhacks/zod (NodeNext `.js`→`.ts`) | 823 | 821 | 0 | 2 | 100% | 99.76% |
-| CodeFlow itself | 824 | 824 | 0 | 0 | 100% | 100% |
+| CodeFlow itself | 916 | 916 | 0 | 0 | 100% | 100% |
 | shadcn-ui/taxonomy (`@/` aliases) | 260 | 260 | 0 | 0 | 100% | 100% |
 | expressjs/express | 154 | 154 | 0 | 0 | 100% | 100% |
 

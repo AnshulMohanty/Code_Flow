@@ -3,7 +3,7 @@
 Read `DESIGN.md` first. Its section 7 ("Roadmap and status") says which phase is in progress and what is
 left; continue from there. `README.md` is the public page.
 
-- Gate before every commit: `npx -y pnpm@9.15.4 -r typecheck`, `-r lint`, `test` (serial), `-r build`,
+- Gate before every commit: `npx -y pnpm@9.15.4 -r typecheck`, `-r lint`, `test` (serial), `-r --workspace-concurrency=1 build`,
   then the accuracy checks in `DESIGN.md` §3.3. All must pass.
 - Any change to deterministic output (parsing, resolution, graph, metrics) bumps `ANALYZER_VERSION` in
   `packages/config/src/constants.ts`.

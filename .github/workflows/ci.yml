@@ -41,9 +41,10 @@ jobs:
       - name: Test (serial, hermetic)
         run: pnpm test
 
-      # Catches Vite/build breakage that --noEmit typecheck misses.
+      # Catches Vite/build breakage that --noEmit typecheck misses. Serial: several packages' `prebuild`
+      # rebuild shared packages, and in parallel one tsc can read another's half-written .d.ts.
       - name: Build
-        run: pnpm -r build
+        run: pnpm -r --workspace-concurrency=1 build
 
       # V3-P1 acceptance gate: grades the tree-sitter engine against the regex baseline on
       # AUTHORED ground truth. Hermetic (local grammar wasm, no keys, no clone), so unlike
