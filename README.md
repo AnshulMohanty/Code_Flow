@@ -321,6 +321,36 @@ base of a PR in one process and parses every untouched file once.
 
 ---
 
+## Claude Code alone vs Claude Code + CodeFlow
+
+Give an agent the CodeFlow MCP server and it can ask the resolved graph instead of searching file by
+file. `scripts/agent-bench.mjs` measures whether that helps: headless Claude Code (Sonnet), the same
+question and the same read-only tools (Read, Grep, Glob) in both arms, the second arm also connected to
+CodeFlow over MCP. The answer to every question is a set of files, and the **truth comes from the
+compiler** (javac / clang, the same truth as the accuracy tables above), so CodeFlow never grades itself.
+Measured on 2026-11-16, 76 runs in all:
+
+| Question | Repository | Arm | Precision | Recall | Median time | Median turns | Cost (4 questions) |
+|---|---|---|---:|---:|---:|---:|---:|
+| **Impact** — "if F changes, what is affected, directly or indirectly?" (14–38 files) | jsoup (Java) | Claude alone | 1.00 | 1.00 | 19 s | 6 | $0.227 |
+| | | **+ CodeFlow** | 1.00 | 1.00 | **12 s** | **3** | **$0.139** |
+| | libuv (C) | Claude alone | 0.78 | 0.99 | 22 s | 6 | $0.400 |
+| | | **+ CodeFlow** | 0.79 | 1.00 | **18 s** | **3** | **$0.217** |
+| **Direct** — "which files depend on / does F depend on?" (3–6 files) | jsoup, libuv | both | 0.97–1.00 | 1.00 | ~10 s | 2–3 | equal |
+
+On impact questions the agent with CodeFlow answered in half the turns at **40–46% lower cost**, with
+the same accuracy: one `get_blast_radius` call instead of a chain of searches. On direct questions it
+is a tie — one grep for a class or header name is already the whole answer, and that is reported here
+rather than left out. Read it as a pilot: 4 questions per kind per repository, one run each, mid-size
+repositories (215 and 380 files); larger repositories, where a search returns far more, are next. Two
+fixes came out of the runs themselves: MCP server instructions that route question phrasing to a tool
+(the agent had used CodeFlow in 2 of 4 runs; now 8 of 8), and full lists for MCP clients (a 25-item
+cap, sized for the internal agent, sent the client searching for the rest). The libuv precision of
+~0.79 is the same in both arms and comes from the truth, not the agents: clang's truth is one Linux
+build, and both arms rightly name files that reach `uv/tree.h` only through Windows-only headers.
+
+---
+
 ## Check an answer or a PR
 
 Three model-free checks, all offline:
