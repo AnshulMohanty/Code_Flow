@@ -161,7 +161,7 @@ Not everything here is the same kind of thing, and the difference matters more t
 | AI summary, reading order, inferred domains | **Model output** | Grounded and labelled as inference wherever shown. The parser's structural roles sit on a different tab for exactly this reason. |
 | Specialist fan-out over communities, best-of-N | **Experimental** | Flag-gated (`FANOUT_SYNTHESIS`), off by default, and **unproven at real scale** — there is no measurement against a live model showing it produces better output than the single-shot stage. |
 | Model routing, parallel stages | **Experimental** | Flag-gated, off by default. The measured speedups are orchestration-only, on a hermetic harness with mock providers. |
-| Speculative prefetch | **Experimental, on by default** | Builds the RAG chunk plan while synthesis waits on the provider; `speculate: false` turns it off. Its speedup is measured only on the hermetic harness. |
+| Speculative prefetch | **Experimental, opt-in** (`SPECULATIVE_PREFETCH=true`) | Builds the RAG chunk plan while synthesis waits on the provider. The overlap is proven on the hermetic harness; it stays off until a run against a real provider shows it pays for its CPU. |
 
 ---
 

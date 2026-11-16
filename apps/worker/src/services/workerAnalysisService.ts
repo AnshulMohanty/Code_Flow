@@ -38,6 +38,12 @@ export const env = {
    * escape hatch costs one env var.
    */
   parallelStages: (process.env.PARALLEL_STAGES || "").toLowerCase() === "true",
+  /**
+   * Speculative prefetch (build RAG's chunk plan while synthesis waits on the provider). Opt-in:
+   * the overlap is proven on the hermetic bench, but no run against a real provider has measured
+   * that it pays for the CPU it spends — and an unmeasured optimisation does not get to be a default.
+   */
+  speculativePrefetch: (process.env.SPECULATIVE_PREFETCH || "").toLowerCase() === "true",
   /** V3-P5 model routing: the cheap/fast model. Falls back to the single configured model. */
   fastModel: process.env.FAST_MODEL || "",
 };

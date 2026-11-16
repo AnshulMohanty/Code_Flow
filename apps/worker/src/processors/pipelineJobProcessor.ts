@@ -79,6 +79,8 @@ export interface PipelineJobDependencies {
    * deterministic spine, and the slices are proven byte-identical either way.
    */
   parallelStages?: boolean;
+  /** Speculative prefetch (`SPECULATIVE_PREFETCH=true`). Off unless asked for — see workerAnalysisService. */
+  speculativePrefetch?: boolean;
   /**
    * V3-P5 observability: prices per model, for the per-run cost figure. INJECTED rather than baked
    * in — prices change, differ per account, and a stale table would report confident wrong money.
@@ -381,6 +383,7 @@ export async function runAnalysisJob(
       budget: deps.budget,
       now,
       ...(deps.parallelStages ? { schedule: "layered" as const } : {}),
+      speculate: deps.speculativePrefetch === true,
     });
 
     // Speculation onto the run SPAN, so the hit rate is queryable in the trace rather than only

@@ -48,8 +48,9 @@ Stages live in `packages/analyzers/src/stages/`, scheduling in `pipeline/schedul
 - A deterministic failure ⇒ `failed`. An AI failure ⇒ `partial` (the map survives). Abort ⇒ `aborted`.
 - The result is assembled per slice, never deep-merged. AI output lives only under `result.ai.*`.
 - Sequential by default. `PARALLEL_STAGES=true` launches a stage when its reads are ready; the only real
-  parallel pair is `synthesize` ∥ `rag`. **Speculative prefetch is on by default** (builds RAG's chunk
-  plan while synthesis waits); `speculate: false` turns it off (`orchestrator.ts`).
+  parallel pair is `synthesize` ∥ `rag`. Speculative prefetch (builds RAG's chunk plan while synthesis
+  waits) is a library default but **off in the worker** unless `SPECULATIVE_PREFETCH=true` — proven on the
+  hermetic bench, not yet against a real provider.
 
 **Graph.** `graph.edges` = dependencies only (fan-in/out count these). `graph.cpgEdges` (call, extends,
 implements; weighted) and `graph.routes` are separate. Louvain runs on the union. `fileId` is always the
@@ -139,6 +140,7 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | Go same-package references are call edges, not import edges | Go forbids package cycles; file-level same-package edges would invent cycles | `connect.ts` |
 | Grammars load per language, on demand | 25× size spread; a Go repo must not pay for C++ | `parsers/src/treesitter/runtime.ts` |
 | Parse each file once per run; one tree walk per extractor; parse output cached by content hash | Profiling Kubernetes showed 13.5 s of 33 s parsing every file twice and ~9 s re-walking trees; a re-run should parse only what changed | `extractCache.ts`, `ast.ts` `collectByType`, `factsStore.ts` |
+| Experimental speed-ups (fan-out, best-of-N, parallel stages, speculative prefetch) are opt-in until a real-provider run measures them | An unmeasured optimisation does not get to be a default | `workerAnalysisService.ts` |
 | Performance work is accepted only with an identical graph | A faster wrong answer is worse than a slow right one | `README.md` speed table, checked edge for edge |
 | Louvain is seeded (xorshift32, seed 1, sorted ids, canonical relabel) | Plain Louvain gives a different partition each run | `packages/graph/src/communities.ts` |
 | tree-sitter fallback is a size ceiling, never a timeout | A clock-based cut-off breaks determinism | `parseTreeSitter.ts` |
@@ -256,7 +258,7 @@ refuses a dirty tree without `--allow-dirty`), commit `apps/web/src/demo/snapsho
 | Stores | `MONGO_URI`, `REDIS_URL`, `POSTGRES_URL` (API and worker must name the same instances) |
 | Providers | `LLM_PROVIDER` (anthropic \| gemini \| openai), `EMBEDDING_PROVIDER` (voyage \| gemini \| openai), `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `VOYAGE_API_KEY`, `OPENAI_API_KEY` |
 | Models | `SYNTHESIS_MODEL`, `GEMINI_MODEL`, `OPENAI_MODEL`, `VOYAGE_MODEL`, `GEMINI_EMBEDDING_MODEL`/`_DIM`, `OPENAI_EMBEDDING_MODEL`/`_DIM` |
-| Flags | `FANOUT_SYNTHESIS`, `PARALLEL_STAGES`, `FAST_MODEL`, `RUN_WORKER_IN_PROCESS` |
+| Flags | `FANOUT_SYNTHESIS`, `PARALLEL_STAGES`, `SPECULATIVE_PREFETCH`, `FAST_MODEL`, `RUN_WORKER_IN_PROCESS` (all off by default) |
 | API/web | `API_PORT` → `PORT` → 4000, `CORS_ORIGINS`, `TRUST_PROXY_HOPS`, `WEB_PORT`, `API_BASE_URL`, `VITE_API_BASE_URL` (build time) |
 | Worker | `WORKER_CONCURRENCY` (default 2, max 8), `WORKER_HEALTH_PORT`, `CODEFLOW_GIT_TIMEOUT_MS`, `CODEFLOW_TMP_DIR`, `CODEFLOW_KEEP_TMP` |
 | Cost/observability | `LLM_PRICING`, `LANGFUSE_*`, `HELICONE_*`, `GIT_SHA` |
@@ -341,8 +343,8 @@ Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an I
 | Phase | Status | What is left |
 |---|---|---|
 | **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
-| **1. Languages** | **Go, Java and C/C++ done** (above) | C# (truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`, `int main`). Follow §3.4. |
-| **2. Speed & scale** | **Done:** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); incremental analysis — a one-file change re-analyses Kubernetes in 7.8 s; graph identical throughout | Replace the hard 25k-file cap (hosted guard) with streaming; load-test harness on the Docker stack (simulated users, bots opening PRs, large repos in parallel) reporting p50/p95/p99, throughput, queue wait, memory; scale 1 → 2 → 4 workers; prove or switch off arena / best-of-N / speculative prefetch |
+| **1. Languages** | **Go, Java and C/C++ done** (above). C# extractor + resolver drafted on branch `wip/csharp` (not built or measured) | C# (finish; truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`, `int main`). Follow §3.4. |
+| **2. Speed & scale** | **Done:** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); incremental analysis — a one-file change re-analyses Kubernetes in 7.8 s; graph identical throughout | Load test: harness built (`scripts/load-test.sh` + `.mjs`, `docker-compose.loadtest.yml`: 24 repos as PR bots, 20 browsing users, 1/2/4 workers). First run: 2 workers → 23/24 jobs in 27.9 s, API reads p95 ≤ 21 ms, 0 errors. **Not yet trustworthy**: `urfave/cli` fails every run, the files-analysed count reads 0 (script reads the wrong field), and at 4 workers one `/api/result` request hung 205 s — explain all three before quoting scaling numbers. Speculative prefetch is now opt-in (`SPECULATIVE_PREFETCH`); fan-out/best-of-N were already off. Still open: replace the hosted 25k-file cap with streaming. |
 | **3. Online beats Claude alone** | — | MCP tools tuned for agents; function-level chunks; benchmark Claude alone vs Claude + CodeFlow (5 big repos × 20 questions: time, tokens, tool calls, wrong citations) |
 | **4. Real-problem checks** | `impact` exists | Test selection proven on real commit history; architecture rules file in CI; dead-code report; quiet PR comment; replay OSS PR history and file real issues |
 | **5. Ship** | — | npm publish, Marketplace listing, live demo, 60-second GIF, README around Map / Check / Ask, one write-up |

@@ -284,6 +284,7 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
           ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
           fanOutSynthesis: env.fanOutSynthesis,
           parallelStages: env.parallelStages,
+          speculativePrefetch: env.speculativePrefetch,
           embeddingClient,
           ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
           cache,
