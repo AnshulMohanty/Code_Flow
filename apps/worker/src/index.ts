@@ -1,4 +1,6 @@
+import { realpathSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import mongoose from "mongoose";
 import { Queue, Worker } from "bullmq";
@@ -20,7 +22,7 @@ import { createMongoCacheHandle, createMongoEventLogStore, createMongoWorkerAnal
 import { runAnalysisJob } from "./processors/pipelineJobProcessor.js";
 import { createGitRepoCloner } from "./services/gitRepoCloner.js";
 import { createBullmqProgressPublisher } from "./services/progressPublisher.js";
-import { readRepoFile } from "./services/repoFileReader.js";
+import { gitTrackedFiles, readRepoFile } from "./services/repoFileReader.js";
 import { readRepoDir } from "./services/repoDirectoryWalker.js";
 import { measureRepoSize } from "./services/measureRepoSize.js";
 import { cleanupRepoPath } from "./services/publicRepoCloneService.js";
@@ -276,11 +278,15 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
           publisher: createBullmqProgressPublisher(job),
           readFile: readRepoFile,
           readDir: readRepoDir,
+          trackedFiles: gitTrackedFiles,
           measureRepoSize,
+          ...(env.maxRepoFiles ? { maxRepoFiles: env.maxRepoFiles } : {}),
+          ...(env.maxRepoBytes ? { maxRepoBytes: env.maxRepoBytes } : {}),
           cleanupRepo: cleanupRepoPath,
           ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
           fanOutSynthesis: env.fanOutSynthesis,
           parallelStages: env.parallelStages,
+          speculativePrefetch: env.speculativePrefetch,
           embeddingClient,
           ...(retrieval ? { vectorStore: retrieval.vectorStore, textStore: retrieval.textStore } : {}),
           cache,
@@ -380,17 +386,28 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
 }
 
 /**
- * Run only when INVOKED as the process entrypoint, not when imported.
+ * True when `moduleUrl` is the script node was asked to run (`process.argv[1]`), compared as real
+ * filesystem paths. Exported for the test.
  *
- * The API imports `startAnalysisWorker` from this module in embedded mode; without this guard that
- * import would ALSO start a second fully-configured worker as a side effect — its own Mongo connect,
- * its own health-server bind, its own BullMQ consumer. Separator-normalised for the same reason as
- * apps/local-cli: `process.argv[1]` uses the platform separator, and a guard that is silently false
- * on Windows is a guard that does nothing.
+ * This used to be a path-shape regex (`worker/(dist|src)/index.js`), which was false inside the
+ * Docker image — the worker is deployed to `/app/dist/index.js`, with no `worker/` segment — so the
+ * container exited 0 without ever consuming a job. Comparing the module's own URL to argv[1] has no
+ * opinion about directory layout, survives symlinks (realpath), and is still false when the API
+ * merely IMPORTS this module for embedded mode.
  */
-const ENTRY_PATTERN = new RegExp("worker/(?:dist|src)/index[.](?:js|ts)$");
+export function isEntrypoint(moduleUrl: string, argv1: string | undefined): boolean {
+  if (!argv1) return false;
+  const real = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(fileURLToPath(moduleUrl)) === real(argv1);
+}
 
-if (ENTRY_PATTERN.test((process.argv[1] ?? "").split(path.sep).join("/"))) {
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   startAnalysisWorker().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : "Unknown worker startup error.";
     console.error(`CodeFlow worker failed to start: ${message}`);

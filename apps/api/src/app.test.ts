@@ -2,7 +2,7 @@ import type { AnalysisResult, PipelineRunStatus, ProgressEvent, ProgressMessage,
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "./config/env.js";
-import { createApp } from "./app.js";
+import { createApp, trustProxyHopsFromEnv } from "./app.js";
 import { createInMemoryRateLimitStore } from "./middleware/rateLimit.js";
 import { setAnalysisQueueEnqueueForTests } from "./queues/analysisQueue.js";
 import { setProgressSubscriberForTests } from "./queues/progressChannel.js";
@@ -179,6 +179,28 @@ describe("codeflow api", () => {
 
     expect(blocked.body).toMatchObject({ error: { code: "RATE_LIMITED" } });
     expect(blocked.headers["retry-after"]).toBeDefined();
+  });
+
+  it("behind a proxy, rate-limits each CLIENT, not the proxy (TRUST_PROXY_HOPS)", async () => {
+    withAvailableQueue();
+    const body = { mode: "public_hosted", owner: "facebook", repo: "react", branch: "main" };
+    const behindProxy = createApp({ rateLimit: { max: 1, store: createInMemoryRateLimitStore() }, trustProxyHops: 1 });
+    await request(behindProxy).post("/api/analyze").set("X-Forwarded-For", "203.0.113.1").send(body).expect(202);
+    // A different visitor through the same proxy has its own bucket…
+    await request(behindProxy).post("/api/analyze").set("X-Forwarded-For", "203.0.113.2").send(body).expect(202);
+    // …and the first one is still limited.
+    await request(behindProxy).post("/api/analyze").set("X-Forwarded-For", "203.0.113.1").send(body).expect(429);
+
+    // Without the setting every request carries the proxy's address: one shared bucket.
+    const shared = createApp({ rateLimit: { max: 1, store: createInMemoryRateLimitStore() }, trustProxyHops: 0 });
+    await request(shared).post("/api/analyze").set("X-Forwarded-For", "203.0.113.1").send(body).expect(202);
+    await request(shared).post("/api/analyze").set("X-Forwarded-For", "203.0.113.2").send(body).expect(429);
+  });
+
+  it("TRUST_PROXY_HOPS accepts only a whole number of hops", () => {
+    expect(trustProxyHopsFromEnv("1")).toBe(1);
+    expect(trustProxyHopsFromEnv("2")).toBe(2);
+    for (const value of [undefined, "", "true", "-1", "1.5", "abc"]) expect(trustProxyHopsFromEnv(value)).toBe(0);
   });
 
   it("POST /api/analyze returns a cached analysis when a known commit SHA is supplied", async () => {
@@ -582,7 +604,7 @@ describe("SSE replay (#20)", () => {
  * In-memory progress channel with replay — a test double for the BullMQ transport.
  * Messages published before a subscriber attaches are replayed on subscribe, which
  * keeps the SSE test deterministic (publish-then-GET). The real transport does NOT
- * replay (a late subscriber misses earlier events — see CURRENT_STATE.md).
+ * replay (a late subscriber misses earlier events).
  */
 function makeReplayChannel(): ProgressSubscriber & {
   publishProgress(jobId: string, event: ProgressEvent): void;

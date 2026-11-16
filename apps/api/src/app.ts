@@ -15,10 +15,25 @@ export interface CreateAppOptions {
    *  limits; prod injects a Redis-backed store shared across instances. Tests inject a small
    *  limit + fresh store. */
   rateLimit?: RateLimitOptions;
+  /**
+   * Reverse proxies in front of the API (`TRUST_PROXY_HOPS`). The rate limit keys on `req.ip`;
+   * behind a proxy that is the PROXY's address unless Express is told how many hops to trust, so
+   * every visitor would share one bucket and one heavy user would lock everyone out. An exact hop
+   * count, never `true`: trusting every hop lets a client pick its own IP via X-Forwarded-For.
+   */
+  trustProxyHops?: number;
+}
+
+/** `TRUST_PROXY_HOPS` → a hop count; anything that is not a whole number ≥ 0 means 0 (trust nothing). */
+export function trustProxyHopsFromEnv(value: string | undefined): number {
+  const hops = Number(value);
+  return Number.isInteger(hops) && hops > 0 ? hops : 0;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
   const app = express();
+  const hops = options.trustProxyHops ?? trustProxyHopsFromEnv(process.env.TRUST_PROXY_HOPS);
+  if (hops > 0) app.set("trust proxy", hops);
 
   // CORS first so cross-origin preflight (OPTIONS) is answered before json parsing / rate limit.
   app.use(createCorsMiddleware());

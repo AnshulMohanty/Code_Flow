@@ -163,3 +163,128 @@ function readImportClause(raw: string | null): string | null {
   if (!endsWithWhitespace(specifiers)) return null; // the `\s+` before `from`
   return specifiers.trim();
 }
+
+/**
+ * Go imports by line scanning — the fallback when the Go grammar is unavailable. Handles the
+ * single form (`import "x"`, `import alias "x"`) and the grouped form (`import ( … )`), with
+ * interpreted or raw string paths. Comments after a spec are ignored.
+ */
+export interface GoImportLine {
+  source: string;
+  name?: string;
+  line: number;
+}
+
+const GO_SPEC = /^(?:([A-Za-z_][\w]*|\.)\s+)?(?:"([^"\\]+)"|`([^`]+)`)/;
+
+export function scanGoImports(content: string): GoImportLine[] {
+  const imports: GoImportLine[] = [];
+  let inBlock = false;
+  const lines = content.split(/\r\n|\r|\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (inBlock) {
+      if (trimmed.startsWith(")")) {
+        inBlock = false;
+        continue;
+      }
+      pushGoSpec(trimmed, index + 1, imports);
+      continue;
+    }
+    if (!trimmed.startsWith("import")) continue;
+    const rest = trimmed.slice("import".length).trim();
+    if (rest.startsWith("(")) {
+      const inline = rest.slice(1).trim();
+      if (inline && !inline.startsWith(")")) pushGoSpec(inline, index + 1, imports);
+      inBlock = !inline.includes(")");
+    } else if (/^\s/.test(trimmed.slice("import".length))) {
+      pushGoSpec(rest, index + 1, imports);
+    }
+  }
+  return imports;
+}
+
+function pushGoSpec(text: string, line: number, out: GoImportLine[]): void {
+  const match = GO_SPEC.exec(text);
+  if (!match) return;
+  const source = match[2] ?? match[3];
+  out.push({ source, ...(match[1] ? { name: match[1] } : {}), line });
+}
+
+/**
+ * True for a committed JavaScript BUNDLE — the output of webpack, browserify or Parcel. Its
+ * `require()` calls resolve against a module table inside the file, so reading them as repo
+ * imports invents broken edges. Detected by each bundler's runtime signature, which hand-written
+ * code does not contain.
+ */
+export function isJavaScriptBundle(content: string): boolean {
+  if (content.includes("__webpack_require__") || content.includes("parcelRequire")) return true;
+  // browserify's prelude: `var c="function"==typeof require&&require; … "MODULE_NOT_FOUND"`.
+  const head = content.slice(0, 4096);
+  return head.includes("MODULE_NOT_FOUND") && /typeof require\s*&&\s*require/.test(head);
+}
+
+/** Java imports by line scanning — the fallback when the Java grammar is unavailable. */
+export interface JavaImportLine {
+  source: string;
+  isStatic: boolean;
+  line: number;
+}
+
+const JAVA_IMPORT = /^\s*import\s+(static\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)(\s*\.\s*\*)?\s*;/;
+
+export function scanJavaImports(content: string): JavaImportLine[] {
+  const out: JavaImportLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = JAVA_IMPORT.exec(text);
+    if (!match) return;
+    const name = match[2].replace(/\s+/g, "");
+    out.push({ source: match[3] ? `${name}.*` : name, isStatic: Boolean(match[1]), line: index + 1 });
+  });
+  return out;
+}
+
+/** C/C++ `#include` lines — the fallback when the grammar is unavailable. */
+export interface CIncludeLine {
+  path: string;
+  system: boolean;
+  line: number;
+}
+
+const C_INCLUDE = /^\s*#\s*include\s*([<"])([^>"\n]+)[>"]/;
+
+export function scanCIncludes(content: string): CIncludeLine[] {
+  const out: CIncludeLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = C_INCLUDE.exec(text);
+    if (match) out.push({ path: match[2].trim(), system: match[1] === "<", line: index + 1 });
+  });
+  return out;
+}
+
+/** C# `using` directives and namespaces by line — the fallback when the grammar is unavailable. */
+export interface CSharpUsingLine {
+  target: string;
+  kind: "namespace" | "static" | "alias";
+  alias?: string;
+  global: boolean;
+  line: number;
+}
+
+const CS_USING = /^\s*(global\s+)?using\s+(static\s+)?(?:([A-Za-z_]\w*)\s*=\s*)?([A-Za-z_][\w.]*)\s*;/;
+
+export function scanCSharpUsings(content: string): CSharpUsingLine[] {
+  const out: CSharpUsingLine[] = [];
+  content.split(/\r\n|\r|\n/).forEach((text, index) => {
+    const match = CS_USING.exec(text);
+    if (!match) return;
+    out.push({
+      target: match[4],
+      kind: match[3] ? "alias" : match[2] ? "static" : "namespace",
+      ...(match[3] ? { alias: match[3] } : {}),
+      global: Boolean(match[1]),
+      line: index + 1,
+    });
+  });
+  return out;
+}

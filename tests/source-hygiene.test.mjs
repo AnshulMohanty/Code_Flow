@@ -23,7 +23,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
  * being readable by the tools everyone uses on it.
  */
 
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', 'legacy']);
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next']);
 const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.mjs', '.cjs', '.js', '.json', '.yml', '.yaml', '.md'];
 /** Built from its char code so no shell, heredoc or editor between here and disk can eat it. */
 const SEPARATOR = String.fromCharCode(92);

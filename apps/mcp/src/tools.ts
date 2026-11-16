@@ -1,6 +1,7 @@
 import {
   createBlastRadiusTool,
   createFindReferencesTool,
+  createFindUsagesTool,
   createGetCallersTool,
   createSearchTool,
   createSymbolSearchTool,
@@ -11,7 +12,7 @@ import { createGraphOracleVerifier, createSandbox, truthFor, type OracleQuestion
 import { emptySession } from "@codeflow/memory";
 import type { AnalysisResult } from "@codeflow/shared-types";
 import type { ChunkTextStore, Reranker, VectorStore } from "@codeflow/retrieval";
-import type { EmbeddingClient } from "@codeflow/analyzers";
+import { buildReferenceIndex, formatVerificationReport, verifyReferences, type EmbeddingClient } from "@codeflow/analyzers";
 import type { McpScope } from "./scope.js";
 
 /**
@@ -68,8 +69,12 @@ export interface McpToolDefinition {
  *  stateless, so there is no "it" to resolve, and a tool that silently reused another caller's
  *  entity would answer about the wrong file. */
 function statelessContext(result: AnalysisResult): ToolContext {
-  return { result, memory: emptySession("mcp", result.id) };
+  // The whole list (up to 1000): an MCP client has no shared tool-result budget, and a truncated list
+  // sends it off to search for the rest — measured in the agent benchmark (see DESIGN.md §7).
+  return { result, memory: emptySession("mcp", result.id), listLimit: MCP_LIST_LIMIT };
 }
+
+const MCP_LIST_LIMIT = 1000;
 
 /** Adapt one shared `AgentTool` into an MCP tool. */
 function fromAgentTool(
@@ -132,8 +137,9 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
         name: "get_blast_radius",
         scope: "graph",
         description:
-          "Every file transitively affected if a file changes (reverse reachability over the dependency graph). " +
-          "Answers 'what breaks if I touch this'.",
+          "Every file that could be affected if a file changes — everything that depends on it directly OR " +
+          "indirectly (reverse reachability over the resolved dependency graph), in one call. Answers 'what breaks " +
+          "if I touch this' without searching hop by hop.",
         inputSchema: FILE_ID_SCHEMA,
       }),
       fromAgentTool(createSymbolSearchTool(), {
@@ -145,6 +151,19 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
         inputSchema: {
           type: "object",
           properties: { name: { type: "string", description: "Symbol name, exact or partial." } },
+          required: ["name"],
+        },
+      }),
+      fromAgentTool(createFindUsagesTool(), {
+        name: "find_usages",
+        scope: "graph",
+        description:
+          "Where a function, method, class or type is declared, and every RESOLVED place that uses it (call, `new`, " +
+          "extends/implements) with file:line and count. Unlike a text search, a same-named symbol in another module " +
+          "is not mixed in. Use it instead of grepping for a name.",
+        inputSchema: {
+          type: "object",
+          properties: { name: { type: "string", description: "Symbol name, e.g. parse, Store, Reader.read." } },
           required: ["name"],
         },
       }),
@@ -179,7 +198,7 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
     );
   }
 
-  if (allows("verify")) tools.push(verifyTool());
+  if (allows("verify")) tools.push(verifyTool(), verifyCitationsTool());
 
   return tools;
 }
@@ -215,6 +234,39 @@ function graphFactsTool(): McpToolDefinition {
         `searchable chunks: ${result.ai?.rag?.chunkCount ?? 0}`,
       ];
       return { text: lines.join("\n") };
+    },
+  };
+}
+
+/**
+ * `verify_citations` — check every code reference in free text before showing it to a person.
+ *
+ * Where `verify_answer` grades a STRUCTURED claim, this takes prose: the agent's own draft answer, a
+ * PR description, a review comment. Every `path`, `path:line`, `#L` anchor, GitHub blob link and
+ * backticked symbol next to one is checked against the analysed repository. Model-free.
+ */
+function verifyCitationsTool(): McpToolDefinition {
+  return {
+    name: "verify_citations",
+    description:
+      "Check the code references in a piece of text (your draft answer, a PR description, a review comment) " +
+      "against the repository: does each cited file exist, are the cited lines inside it, is a symbol named next " +
+      "to a reference declared there (at those lines)? Deterministic, no model. Call it on your answer BEFORE " +
+      "presenting it, and fix or drop every reference marked ✗.",
+    scope: "verify",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text whose code references should be checked." },
+      },
+      required: ["text"],
+    },
+    async handler(args, deps) {
+      const text = typeof args.text === "string" ? args.text : "";
+      if (!text.trim()) return { text: "verify_citations: `text` is empty.", isError: true };
+      const result = await deps.loadResult();
+      const report = await verifyReferences(text, buildReferenceIndex(result));
+      return { text: formatVerificationReport(report, "text"), isError: false };
     },
   };
 }

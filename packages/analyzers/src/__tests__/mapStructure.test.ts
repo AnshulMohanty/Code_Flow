@@ -119,6 +119,37 @@ describe("map-structure — ignores", () => {
     expect(structure.files.map((f) => f.path)).toEqual(["src/index.ts"]);
   });
 
+  it("recognises a test file named plainly test.ts beside the code (date-fns layout)", async () => {
+    const roles = rolesByPath(await mapStructure({ "src/addDays/index.ts": 1, "src/addDays/test.ts": 1, "src/lib/spec.js": 1, "src/latest.ts": 1 }));
+    expect(roles["src/addDays/test.ts"]).toBe("test");
+    expect(roles["src/lib/spec.js"]).toBe("test");
+    expect(roles["src/addDays/index.ts"]).toBe("source");
+    expect(roles["src/latest.ts"]).toBe("source");
+  });
+
+  it("keeps a build/out/coverage directory that is a Go package (Kubernetes' pkg/test/coverage)", async () => {
+    const structure = await mapStructure({
+      "pkg/test/coverage/coverage.go": 1,
+      "tools/build/build.go": 1,
+      "coverage/lcov.info": 1,
+      "coverage/lcov-report/index.html": 1,
+      "web/build/main.js": 1,
+    });
+    expect(structure.files.map((f) => f.path)).toEqual(["pkg/test/coverage/coverage.go", "tools/build/build.go"]);
+  });
+
+  it("never drops a file git TRACKS, even when .gitignore matches it (zlib's committed zconf.h)", async () => {
+    const tree = makeTree({ "zconf.h": 1, "zlib.h": 1, "build/out.o": 1, "gen/keep.c": 1, "gen/tmp.c": 1 }, "/zconf.h\ngen/\n");
+    const stage = createMapStructureStage({
+      readDir: tree.readDir,
+      readFile: tree.readFile,
+      trackedFiles: async () => new Set(["zconf.h", "zlib.h", "gen/keep.c"]),
+      now: () => 0,
+    });
+    const { partial } = await stage.run(input, ctx());
+    expect(partial.structure!.files.map((f) => f.path)).toEqual(["gen/keep.c", "zconf.h", "zlib.h"]);
+  });
+
   it("respects .gitignore patterns (glob, dir, negation)", async () => {
     const structure = await mapStructure(
       {

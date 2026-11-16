@@ -6,6 +6,13 @@ import type { ParseFileInput, ParserAdapter } from "../types.js";
 import { TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
+import { parseableSource } from "./ast.js";
+import { projectCFamily } from "./cfamily.js";
+import { projectCSharp } from "./csharp.js";
+import { extractFor, SHARED_EXTRACT } from "./cpg.js";
+import { extractKey, rememberExtract } from "./extractCache.js";
+import { projectGo, type GoExtract } from "./go.js";
+import { projectJava } from "./java.js";
 import { extractJsLike } from "./jsLike.js";
 import { extractPython } from "./python.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
@@ -28,12 +35,19 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
   const parser = grammarParser(language);
   if (!parser) return null;
 
-  const tree = parser.parse(input.content);
+  const tree = parser.parse(parseableSource(input.content));
   if (!tree) return null;
   try {
-    return language === "python"
-      ? pythonParsedFile(tree, input)
-      : jsLikeParsedFile(tree, input, language);
+    if (language === "python") return pythonParsedFile(tree, input);
+    if (SHARED_EXTRACT.has(language)) {
+      // One extract serves both views: kept for Connect (parse once), projected here for Inventory.
+      const extract = extractFor(language, tree, input.content);
+      rememberExtract(extractKey(language, input.path, input.content), extract);
+      if (language === "go") return goParsedFile(projectGo(extract as GoExtract), input);
+      const project = language === "java" ? projectJava : language === "csharp" ? projectCSharp : projectCFamily;
+      return typedParsedFile(project(extract as never), input, language);
+    }
+    return jsLikeParsedFile(tree, input, language);
   } finally {
     // The tree lives in the wasm heap — releasing it is not optional on a big repo.
     tree.delete();
@@ -71,6 +85,42 @@ function pythonParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
     exports: [],
     symbols: extract.symbols,
     dependencies: extract.imports.map((parsedImport, index) => toPythonDependency(input.path, parsedImport, index)),
+    warnings: [],
+    parserVersion: TREE_SITTER_PARSER_VERSION,
+  };
+}
+
+/** Java (and the other symbol-indexed languages): imports name types; they resolve in Connect. */
+function typedParsedFile(
+  result: { imports: ParsedImport[]; exports: ParsedFile["exports"]; symbols: ParsedFile["symbols"] },
+  input: ParseFileInput,
+  language: LanguageId,
+): ParsedFile {
+  return {
+    path: input.path,
+    language,
+    extension: extensionOf(input.path),
+    loc: countLoc(input.content),
+    imports: result.imports,
+    exports: result.exports,
+    symbols: result.symbols,
+    dependencies: result.imports.map((parsedImport, index) => toDependency(input.path, parsedImport, index)),
+    warnings: [],
+    parserVersion: TREE_SITTER_PARSER_VERSION,
+  };
+}
+
+/** Go import paths name packages; they resolve in Connect, against go.mod and the repo's directories. */
+function goParsedFile(extract: ReturnType<typeof projectGo>, input: ParseFileInput): ParsedFile {
+  return {
+    path: input.path,
+    language: "go",
+    extension: extensionOf(input.path),
+    loc: countLoc(input.content),
+    imports: extract.imports,
+    exports: extract.exports,
+    symbols: extract.symbols,
+    dependencies: extract.imports.map((parsedImport, index) => toDependency(input.path, parsedImport, index)),
     warnings: [],
     parserVersion: TREE_SITTER_PARSER_VERSION,
   };

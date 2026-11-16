@@ -35,7 +35,24 @@ export interface McpServerCore {
   callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult>;
   /** For the startup banner — an operator should be able to see the surface they just exposed. */
   describe(): string;
+  /**
+   * Server instructions, sent in the MCP handshake and shown to the client's model. They map the way a
+   * question is PHRASED to the tool that answers it in one call — measured: in the agent benchmark the
+   * model reached for the graph in only half of the runs where it would have saved turns.
+   */
+  instructions(): string;
 }
+
+/** Question phrasing → tool, for the tools that are actually enabled. */
+const TOOL_GUIDE: Array<{ tool: string; when: string }> = [
+  { tool: "get_blast_radius", when: "\"what could be affected / what breaks if X changes\", \"what depends on X directly OR indirectly\" — the whole transitive set in ONE call" },
+  { tool: "find_references", when: "\"who imports / includes / depends on X\", \"what does X depend on\" — direct, in both directions, labelled" },
+  { tool: "find_usages", when: "\"who calls / where is <function, method, class, type> used\" — resolved uses at file:line" },
+  { tool: "symbol_search", when: "\"where is <symbol> defined\"" },
+  { tool: "get_callers", when: "\"which files call into X\"" },
+  { tool: "graph_facts", when: "a first look: entry points, central files, cycles" },
+  { tool: "verify_citations", when: "before answering with file paths or file:line references — checks every one" },
+];
 
 export function createMcpServerCore(options: McpServerOptions): McpServerCore {
   const policy = createScopePolicy(options.scopes);
@@ -82,6 +99,18 @@ export function createMcpServerCore(options: McpServerOptions): McpServerCore {
           `Tool "${name}" failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
+    },
+
+    instructions() {
+      const guide = TOOL_GUIDE.filter((entry) => byName.has(entry.tool));
+      if (guide.length === 0) return "";
+      return [
+        "CodeFlow holds this repository's RESOLVED dependency and call graph, built by parsing every file " +
+          "(import, include and name resolution checked against the language's own compiler). Its answers are " +
+          "exact file paths. For any question about how files or symbols depend on each other, call the matching " +
+          "tool BEFORE searching file by file:",
+        ...guide.map((entry) => `- ${entry.tool}: ${entry.when}`),
+      ].join("\n");
     },
 
     describe() {

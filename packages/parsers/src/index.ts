@@ -1,16 +1,30 @@
-export { detectLanguage, isJavaScriptLike } from "./language.js";
+export { detectLanguage, grammarsFor, isJavaScriptLike } from "./language.js";
 export { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
 export { isSupportedSourceFile, shouldExcludePath } from "./filesystem/fileFilters.js";
 export { resolvePythonImport, resolveRelativeImport } from "./resolution/importResolver.js";
 export { createParserRegistry, parseRepository, ParserRegistry } from "./registry.js";
+export {
+  contentHash,
+  createMemoryFactsStore,
+  factsStoreStats,
+  setFactsStore,
+  type FactsStore,
+} from "./factsStore.js";
 export { genericParser } from "./parsers/genericParser.js";
+export { goParser } from "./parsers/goParser.js";
+export { javaParser } from "./parsers/javaParser.js";
+export { cParser, cppParser } from "./parsers/cFamilyParser.js";
+export { csharpParser } from "./parsers/csharpParser.js";
 export { javascriptParser } from "./parsers/javascriptParser.js";
 export { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 export { pythonParser } from "./parsers/pythonParser.js";
 export { createTreeSitterParser, parseTreeSitterFile } from "./treesitter/parseTreeSitter.js";
 export { extractCpgFacts } from "./treesitter/cpg.js";
+export { isGoExported } from "./treesitter/go.js";
+export { isJavaScriptBundle } from "./utils/importScan.js";
 export type {
   CpgCall,
+  CpgDeclaration,
   CpgFacts,
   CpgImport,
   CpgInheritance,

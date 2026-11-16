@@ -9,7 +9,7 @@
 # IS the pipe.
 #
 # It also means this image is normally run by a CLIENT (`docker run -i`), not by an orchestrator —
-# see GO_LIVE.md for the Cursor / Claude Code / Windsurf configuration.
+# see DESIGN.md for the Cursor / Claude Code / Windsurf configuration.
 
 # ── Build stage: install the whole workspace, build all @codeflow/* + the app ──
 FROM node:20-slim AS build

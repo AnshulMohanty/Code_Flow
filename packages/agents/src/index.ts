@@ -55,6 +55,7 @@ export {
 export {
   createBlastRadiusTool,
   createFindReferencesTool,
+  createFindUsagesTool,
   createGetCallersTool,
   createGraphTools,
   createSymbolSearchTool,

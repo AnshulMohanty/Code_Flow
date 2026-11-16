@@ -23,7 +23,7 @@
  * THE CACHE KEY IS (repo, commit SHA, analyzerVersion). So a pre-warm is not permanent: the repo
  * moves on, and a bumped ANALYZER_VERSION invalidates every entry at once. That is correct — a stale
  * cached analysis is a wrong analysis — and it is why the pre-warm is a documented, repeatable
- * script rather than a one-off (see scripts/prewarm-demos.mjs and GO_LIVE.md).
+ * script rather than a one-off (see scripts/prewarm-demos.mjs and DESIGN.md).
  */
 
 export interface DemoRepo {

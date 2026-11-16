@@ -1,38 +1,19 @@
 import type { AnalysisSliceKey, PipelineStage, PipelineStageId } from "@codeflow/shared-types";
 
 /**
- * DAG-LAYERED SCHEDULING (V3-P5 task 1).
- *
- * WHAT THE DAG ACTUALLY LOOKS LIKE, measured from the code rather than assumed:
+ * DAG-layered scheduling. The pipeline is
  *
  *   ingest → orient → map-structure → inventory → connect → analyze → ┬ synthesize
  *                                                                     └ rag
  *
- * The deterministic chain is genuinely LINEAR, and that is not a missed opportunity — each stage
- * consumes the slice the previous one produced (map-structure reads `orientation`, inventory reads
- * `structure`, connect reads both, analyze reads `graph`). Parallelising a chain whose every link is
- * a real data dependency would either produce wrong output or require duplicating work.
+ * The deterministic chain is linear (each stage reads the previous one's slice); the one independent
+ * pair is synthesize and rag — the two slow, provider-bound stages — so there is exactly one parallel
+ * layer. Dependencies are DECLARED (`STAGE_READS` + `stage.owns`) and layered with Kahn's algorithm; a
+ * contract test fails if a declaration and the code disagree.
  *
- * The ONE independent pair is `synthesize` and `rag` — and they happen to be the two AI stages, i.e.
- * the two slowest and the only provider-bound ones. So the honest summary is: there is exactly one
- * parallel layer in this pipeline, and it is the layer worth having. A four-way fan-out over the
- * parse chain would have looked more impressive on a diagram and been slower and wrong.
- *
- * DEPENDENCIES ARE DECLARED, NOT INFERRED. `STAGE_READS` states what each stage reads from
- * `ctx.prior`, and `stage.owns` already states what it writes; the layering is Kahn's algorithm over
- * those. Inferring reads (by grepping, or by proxying `ctx.prior`) would be clever and fragile — a
- * stage that starts reading a new slice must declare it, and the contract test below fails if the
- * declaration and the code disagree about a slice nobody produces.
- *
- * DETERMINISM IS PRESERVED, and this is the part that matters most given the invariant. Within a
- * layer, stages run concurrently but:
- *   - every stage sees the SAME `ctx.prior` snapshot (taken before the layer starts),
- *   - slices are assigned AFTER the layer settles, in declared order,
- *   - per-stage records are ordered by declaration, not by completion.
- * So the RESULT is byte-identical to the sequential run — asserted by a test that runs both and
- * compares. What is NOT deterministic is the ORDER progress EVENTS arrive in within a layer, and
- * that is deliberate: an event stream is a live UI signal, and buffering it to preserve an order
- * nobody depends on would delay feedback for no benefit.
+ * Within a layer every stage sees the same `ctx.prior` snapshot, slices are assigned after the layer
+ * settles in declared order, and records are ordered by declaration — so the result is byte-identical
+ * to the sequential run (a test runs both). Only the order of progress events within a layer varies.
  */
 
 /**

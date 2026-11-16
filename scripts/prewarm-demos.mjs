@@ -11,7 +11,7 @@
  *
  * IT IS NOT PART OF THE HERMETIC SUITE AND CANNOT BE. It needs a deployed API, provider keys and
  * network access to GitHub, and it SPENDS MONEY (one synthesis + one embedding pass per repository).
- * So it is a documented manual step — see GO_LIVE.md — and nothing in CI invokes it.
+ * So it is a documented manual step — see DESIGN.md — and nothing in CI invokes it.
  *
  * IT IS RE-RUNNABLE, and it has to be: the cache key includes the commit SHA and the analyzer
  * version, so every push to a demo repository and every ANALYZER_VERSION bump invalidates entries.

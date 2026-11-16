@@ -2,36 +2,16 @@ import { AGENT_MAX_TOOLS_PER_STEP } from "@codeflow/config";
 import type { AgentTool } from "./contracts.js";
 
 /**
- * PER-STEP TOOL CURATION (V3-P3 task 3).
+ * Per-step tool curation. A tool's description is prompt text paid on every turn, and a model offered
+ * fewer, relevant tools picks better, so each step offers only plausible tools — by fixed rules, never
+ * a model (that would be a paid call to save a paid call, and unreproducible):
  *
- * WHAT THIS ACTUALLY SAVES. A tool's `description` is prompt text, paid for on EVERY turn whether
- * the tool is called or not. Six tools with two-line descriptions is a few hundred tokens of fixed
- * overhead per call, multiplied by up to six turns per question, on every question. Omitting the
- * descriptions of tools that cannot plausibly help is therefore the largest single lever on the
- * agent's context budget — larger than trimming memory, which is already bounded.
- *
- * IT IS ALSO A QUALITY LEVER, and that is the less obvious half. A model offered six tools picks
- * worse than one offered three: irrelevant options invite exploratory calls that cost a turn and
- * return nothing. Curation is not only cheaper, it converges faster.
- *
- * THE RULES, deliberately DETERMINISTIC — no model decides which tools a model may see, because
- * that would be a paid call to save a paid call, and it would make the loop's behaviour
- * unreproducible:
- *
- *   1. A tool with NO triggers is general-purpose and always a candidate (`search_code`).
+ *   1. A tool with no triggers is general-purpose and always a candidate (`search_code`).
  *   2. A tool whose trigger appears in the question is a candidate.
- *   3. A tool already USED this question stays a candidate — the model may legitimately call it
- *      again with different arguments.
- *   4. A tool that returned EMPTY twice is dropped. Offering it a third time invites a third
- *      empty call, and the model has no memory of the pattern that a counter here has.
- *   5. Whatever survives is capped at `AGENT_MAX_TOOLS_PER_STEP`, ordered so the strongest signal
- *      wins: trigger matches first (by match count), then already-used, then general-purpose.
- *
- * Rule 4 is the one worth arguing about. It can in principle drop a tool that would have
- * succeeded on a third, better-formed call. Accepted knowingly: two empties is strong evidence the
- * tool has nothing for this question, and the cost of being wrong is one lost option out of
- * several, whereas the cost of not having the rule is a loop that burns its whole turn budget
- * re-asking the same empty question.
+ *   3. A tool already used for this question stays a candidate.
+ *   4. A tool that returned empty twice is dropped (accepted risk: it might have worked a third time;
+ *      without the rule a loop can burn its whole turn budget on the same empty call).
+ *   5. Survivors are capped at `AGENT_MAX_TOOLS_PER_STEP`: trigger matches first, then used, then general.
  */
 
 /** What the router needs to know about how this question has gone so far. */

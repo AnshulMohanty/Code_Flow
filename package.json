@@ -2,7 +2,7 @@
   "name": "codeflow",
   "version": "0.0.0",
   "private": true,
-  "description": "CodeFlow MERN migration monorepo skeleton.",
+  "description": "CodeFlow: a codebase map whose answers are checked against the code.",
   "packageManager": "pnpm@9.15.4",
   "engines": {
     "node": ">=20"

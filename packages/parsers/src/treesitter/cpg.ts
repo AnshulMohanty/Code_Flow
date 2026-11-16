@@ -6,11 +6,21 @@ import {
   PY_FROM_IMPORT_LINE,
   PY_IMPORT_LINE,
   parseStaticImportLine,
+  scanGoImports,
+  scanJavaImports,
+  scanCIncludes,
+  scanCSharpUsings,
   splitAliasSegments,
 } from "../utils/importScan.js";
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
-import { calleeName, calleeTail, field, namedChildrenOf, startLine, stringValue } from "./ast.js";
+import { calleeName, calleeTail, field, namedChildrenOf, parseableSource, startLine, stringValue } from "./ast.js";
+import { throughFactsStore } from "../factsStore.js";
+import { extractKey, takeExtract } from "./extractCache.js";
+import { extractGoFacts, type GoExtract } from "./go.js";
+import { extractCFamilyFacts, type CFamilyExtract } from "./cfamily.js";
+import { extractCSharp, type CSharpExtract } from "./csharp.js";
+import { extractJavaFacts, type JavaExtract } from "./java.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
 /**
@@ -22,8 +32,31 @@ export interface CpgImport {
   source: string;
   /** Local binding names introduced by this import (default, namespace, named aliases). */
   specifiers: string[];
+  /**
+   * Python `from X import a, b as c` only: the IMPORTED names (`a`, `b`), index-aligned with
+   * `specifiers` (`a`, `c`). The resolver needs the original name to tell a submodule import
+   * (`from . import sessions`) from a symbol import.
+   */
+  names?: string[];
   kind: "import" | "require" | "dynamic" | "reexport";
   line: number;
+  /** Erased at runtime: TS `import type` / `export type … from`, or a Python `if TYPE_CHECKING:` import. */
+  typeOnly?: boolean;
+  /**
+   * Cannot fail at load time: a `require`/`import` inside a function body, or a Java import (the
+   * JVM loads a class on first use, so a class cycle is legal and never an import-order failure).
+   */
+  lazy?: boolean;
+  /** Java `import static`. */
+  isStatic?: boolean;
+  /** C/C++ `#include <x>`: searched only on the include path, never the including file's directory. */
+  system?: boolean;
+  /** C# `using J = X.Y;` → "J". */
+  alias?: string;
+  /** C# `global using` — applies to every file of the project. */
+  global?: boolean;
+  /** C#: the namespace a `using` is written in — its name is looked up from there outwards. */
+  scope?: string;
 }
 
 /** A call site, recorded by the ROOT local binding it goes through. */
@@ -40,6 +73,12 @@ export interface CpgInheritance {
   binding: string;
   symbol: string;
   kind: "extends" | "implements";
+  line: number;
+}
+
+/** A top-level declaration (Go): what an importer's `pkg.Name` can point at. */
+export interface CpgDeclaration {
+  name: string;
   line: number;
 }
 
@@ -63,6 +102,34 @@ export interface CpgFacts {
   routes: CpgRoute[];
   /** `treesitter-v1` ⇒ calls/inheritance/routes are real. `parser-v1` ⇒ imports only. */
   engine: string;
+  /**
+   * Go only. A Go import names a package (a directory), so resolving it to the FILES it really
+   * depends on needs the package name, the top-level declarations, and every `x.Y` reference
+   * (calls, types, values) — not just call sites.
+   */
+  packageName?: string;
+  declarations?: CpgDeclaration[];
+  references?: CpgCall[];
+  /**
+   * Java. A simple type name resolves through the file's own types, single-type imports, the
+   * SAME package (no import needed) and on-demand imports — so the resolver needs every type
+   * name the file mentions, the names that shadow (its own types, type parameters), and dotted
+   * fully-qualified uses (`com.acme.Thing`).
+   */
+  typeRefs?: string[];
+  localTypes?: string[];
+  qualifiedRefs?: string[];
+  /** Java: names in the extends/implements clauses of top-level types (nested types do not shadow them). */
+  headerRefs?: string[];
+  /** C#: the namespaces this file declares (types here see their own and every enclosing namespace). */
+  namespaces?: string[];
+  /** C#: names seen only as `Name.Member`, and the PascalCase members/locals declared in the file. */
+  accessRefs?: string[];
+  memberNames?: string[];
+  /** C#: own top-level partial types the file names — it depends on their other parts. */
+  partialSelfRefs?: string[];
+  /** C#: nested types, by the fully qualified outermost type that holds them. */
+  nestedTypes?: Array<{ outer: string; name: string }>;
 }
 
 /** `export … from "x"` is reported through `imports` with kind `reexport`. */
@@ -105,13 +172,24 @@ const PY_ROUTE_METHODS: Record<string, HttpRouteMethod> = {
  */
 export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): CpgFacts {
   const lang = language ?? detectLanguage(input.path);
+  return throughFactsStore("facts", lang, input.path, input.content, () => computeCpgFacts(input, lang));
+}
+
+function computeCpgFacts(input: ParseFileInput, lang: LanguageId): CpgFacts {
   if (hasGrammar(lang) && input.content.length <= TREE_SITTER_MAX_BYTES) {
+    // Go / Java / C/C++: Inventory may already have parsed this exact content — take its extract.
+    if (SHARED_EXTRACT.has(lang)) {
+      const cached = takeExtract<unknown>(extractKey(lang, input.path, input.content));
+      if (cached !== undefined) return factsFromExtract(lang, cached);
+    }
     const parser = grammarParser(lang);
     if (parser) {
-      const tree = parser.parse(input.content);
+      const tree = parser.parse(parseableSource(input.content));
       if (tree) {
         try {
-          return lang === "python" ? pythonFacts(tree) : jsLikeFacts(tree);
+          if (lang === "python") return pythonFacts(tree);
+          if (SHARED_EXTRACT.has(lang)) return factsFromExtract(lang, extractFor(lang, tree, input.content));
+          return jsLikeFacts(tree);
         } finally {
           tree.delete();
         }
@@ -119,6 +197,24 @@ export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): C
     }
   }
   return regexFallbackFacts(input, lang);
+}
+
+/** Languages whose Inventory symbols and Connect facts come from ONE extract (so one parse). */
+export const SHARED_EXTRACT = new Set<string>(["go", "java", "c", "cpp", "csharp"]);
+
+/** The raw extract for a shared-extract language — what `parseTreeSitterFile` caches for Connect. */
+export function extractFor(language: string, tree: Tree, content: string): unknown {
+  if (language === "go") return extractGoFacts(tree);
+  if (language === "java") return extractJavaFacts(tree);
+  if (language === "csharp") return extractCSharp(tree, content);
+  return extractCFamilyFacts(tree, content);
+}
+
+function factsFromExtract(language: string, extract: unknown): CpgFacts {
+  if (language === "go") return goFacts(extract as GoExtract);
+  if (language === "java") return javaFacts(extract as JavaExtract);
+  if (language === "csharp") return csharpFacts(extract as CSharpExtract);
+  return cFamilyFacts(extract as CFamilyExtract);
 }
 
 // ── JS / TS / JSX / TSX ───────────────────────────────────────────────────────────────
@@ -148,7 +244,13 @@ function jsLikeFacts(tree: Tree): CpgFacts {
     const name = calleeName(callee);
     if (name === "require") {
       if (literal !== undefined) {
-        facts.imports.push({ source: literal, specifiers: requireBindings(call), kind: "require", line: startLine(call) });
+        facts.imports.push({
+          source: literal,
+          specifiers: requireBindings(call),
+          kind: "require",
+          line: startLine(call),
+          ...(insideFunction(call, JS_FUNCTION_TYPES) ? { lazy: true } : {}),
+        });
       }
       continue;
     }
@@ -189,7 +291,52 @@ function collectJsImport(statement: Node, facts: CpgFacts): void {
   const source = stringValue(field(statement, "source"));
   if (source === undefined) return;
   const clause = statement.namedChildren.find((child) => child?.type === "import_clause");
-  facts.imports.push({ source, specifiers: clause ? localBindings(clause) : [], kind: "import", line });
+  facts.imports.push({
+    source,
+    specifiers: clause ? localBindings(clause) : [],
+    kind: "import",
+    line,
+    ...(isTypeOnlyJsImport(statement, clause ?? undefined) ? { typeOnly: true } : {}),
+  });
+}
+
+/** `import type { A }`, or `import { type A, type B }` where EVERY binding is a type. */
+function isTypeOnlyJsImport(statement: Node, clause: Node | undefined): boolean {
+  if (/^import\s+type\s/.test(statement.text)) return true;
+  if (!clause) return false;
+  const children = namedChildrenOf(clause);
+  if (children.length !== 1 || children[0].type !== "named_imports") return false;
+  const specifiers = namedChildrenOf(children[0]).filter((child) => child.type === "import_specifier");
+  return specifiers.length > 0 && specifiers.every((specifier) => /^type\s/.test(specifier.text));
+}
+
+const JS_FUNCTION_TYPES = new Set([
+  "function_declaration",
+  "function_expression",
+  "function",
+  "arrow_function",
+  "method_definition",
+  "generator_function_declaration",
+]);
+const PY_FUNCTION_TYPES = new Set(["function_definition", "lambda"]);
+
+function insideFunction(node: Node, functionTypes: ReadonlySet<string>): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (functionTypes.has(current.type)) return true;
+  }
+  return false;
+}
+
+/** Inside the body of `if TYPE_CHECKING:` (or `typing.TYPE_CHECKING`), not its `else`. */
+function insideTypeCheckingBlock(node: Node): boolean {
+  let child: Node = node;
+  for (let current = node.parent; current; child = current, current = current.parent) {
+    if (current.type !== "if_statement") continue;
+    const condition = field(current, "condition");
+    const consequence = field(current, "consequence");
+    if (condition && /\bTYPE_CHECKING\b/.test(condition.text) && consequence && child.id === consequence.id) return true;
+  }
+  return false;
 }
 
 /** Local names an import clause binds — default, `* as ns`, and named aliases. */
@@ -215,7 +362,13 @@ function localBindings(clause: Node): string[] {
 function collectJsReexport(statement: Node, facts: CpgFacts): void {
   const source = stringValue(field(statement, "source"));
   if (source !== undefined) {
-    facts.imports.push({ source, specifiers: [], kind: "reexport", line: startLine(statement) });
+    facts.imports.push({
+      source,
+      specifiers: [],
+      kind: "reexport",
+      line: startLine(statement),
+      ...(/^export\s+type\s/.test(statement.text) ? { typeOnly: true } : {}),
+    });
   }
 }
 
@@ -291,8 +444,15 @@ function pythonFacts(tree: Tree): CpgFacts {
 
   for (const node of root.descendantsOfType(["import_statement", "import_from_statement"])) {
     if (!node) continue;
+    const before = facts.imports.length;
     if (node.type === "import_statement") collectPyImport(node, facts);
     else collectPyFromImport(node, facts);
+    const typeOnly = insideTypeCheckingBlock(node);
+    const lazy = insideFunction(node, PY_FUNCTION_TYPES);
+    for (const spec of facts.imports.slice(before)) {
+      if (typeOnly) spec.typeOnly = true;
+      if (lazy) spec.lazy = true;
+    }
   }
 
   for (const call of root.descendantsOfType("call")) {
@@ -348,16 +508,23 @@ function collectPyFromImport(statement: Node, facts: CpgFacts): void {
   if (!moduleName) return;
 
   const specifiers: string[] = [];
+  const names: string[] = [];
   for (const child of namedChildrenOf(statement)) {
     if (child.id === moduleName.id) continue;
-    if (child.type === "dotted_name") specifiers.push(child.text);
-    else if (child.type === "aliased_import") {
+    if (child.type === "dotted_name") {
+      specifiers.push(child.text);
+      names.push(child.text);
+    } else if (child.type === "aliased_import") {
       // The LOCAL binding is the alias when present — that is what call sites use.
-      const alias = field(child, "alias") ?? field(child, "name");
-      if (alias?.text) specifiers.push(alias.text);
+      const name = field(child, "name");
+      const alias = field(child, "alias") ?? name;
+      if (alias?.text) {
+        specifiers.push(alias.text);
+        names.push(name?.text ?? alias.text);
+      }
     }
   }
-  facts.imports.push({ source: moduleName.text, specifiers, kind: "import", line });
+  facts.imports.push({ source: moduleName.text, specifiers, names, kind: "import", line });
 }
 
 /** Flask `@app.route("/x", methods=[…])` and FastAPI `@router.get("/x")`. */
@@ -415,6 +582,119 @@ const PY_ROUTE_METHODS_BY_LABEL: Record<string, HttpRouteMethod> = {
   HEAD: "HEAD",
 };
 
+// ── Go ────────────────────────────────────────────────────────────────────────────────
+
+function goFacts(extract: GoExtract): CpgFacts {
+  return {
+    // `specifiers` carries the explicit name only (alias, `.` or `_`); the default binding is
+    // the TARGET package's name, which only the resolver knows.
+    imports: extract.imports.map((entry) => ({
+      source: entry.source,
+      specifiers: entry.name ? [entry.name] : [],
+      kind: "import" as const,
+      line: entry.line,
+    })),
+    calls: extract.calls,
+    inheritance: extract.embeds.map((embed) => ({ ...embed, kind: "extends" as const })),
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    ...(extract.packageName ? { packageName: extract.packageName } : {}),
+    declarations: extract.declarations.map((decl) => ({ name: decl.name, line: decl.line })),
+    references: extract.references,
+  };
+}
+
+// ── Java ──────────────────────────────────────────────────────────────────────────────
+
+function javaFacts(extract: JavaExtract): CpgFacts {
+  return {
+    imports: extract.imports.map((entry) => ({
+      source: entry.source,
+      // The local name a single-type or static import introduces; on-demand imports bind per use.
+      specifiers: entry.source.endsWith(".*") ? [] : [entry.source.split(".").pop() ?? entry.source],
+      kind: "import" as const,
+      line: entry.line,
+      lazy: true,
+      ...(entry.isStatic ? { isStatic: true } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    ...(extract.packageName ? { packageName: extract.packageName } : {}),
+    declarations: extract.types.filter((type) => !type.outer).map((type) => ({ name: type.name, line: type.line })),
+    typeRefs: extract.typeRefs,
+    localTypes: extract.localTypes,
+    qualifiedRefs: extract.qualifiedRefs,
+    headerRefs: extract.headerRefs,
+  };
+}
+
+// ── C# ────────────────────────────────────────────────────────────────────────────────
+
+function csharpFacts(extract: CSharpExtract): CpgFacts {
+  return {
+    imports: extract.usings.map((entry) => ({
+      source: entry.target,
+      specifiers: entry.alias ? [entry.alias] : [],
+      kind: "import" as const,
+      line: entry.line,
+      // The CLR loads a type on first use: a type cycle is legal, never a load-time failure.
+      lazy: true,
+      ...(entry.kind === "static" ? { isStatic: true } : {}),
+      ...(entry.alias ? { alias: entry.alias } : {}),
+      ...(entry.global ? { global: true } : {}),
+      ...(entry.scope ? { scope: entry.scope } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: extract.routes.map((route) => ({ ...route, framework: "unknown" as const })),
+    engine: TREE_SITTER_PARSER_VERSION,
+    namespaces: extract.namespaces,
+    // Top-level types, fully qualified: what other files can reach by namespace.
+    declarations: extract.types
+      .filter((type) => !type.outer)
+      .map((type) => {
+        const name = type.arity > 0 ? `${type.name}\`${type.arity}` : type.name;
+        return { name: type.namespace ? `${type.namespace}.${name}` : name, line: type.line };
+      }),
+    typeRefs: extract.typeRefs,
+    localTypes: extract.localTypes,
+    qualifiedRefs: extract.qualifiedRefs,
+    partialSelfRefs: extract.partialSelfRefs,
+    accessRefs: extract.accessRefs,
+    memberNames: extract.memberNames,
+    nestedTypes: extract.types
+      .filter((type) => type.outermost)
+      .map((type) => ({
+        outer: type.namespace ? `${type.namespace}.${type.outermost}` : type.outermost!,
+        name: type.arity > 0 ? `${type.name}\`${type.arity}` : type.name,
+      })),
+  };
+}
+
+// ── C / C++ ───────────────────────────────────────────────────────────────────────────
+
+function cFamilyFacts(extract: CFamilyExtract): CpgFacts {
+  return {
+    imports: extract.includes.map((entry) => ({
+      source: entry.path,
+      specifiers: [],
+      kind: "import" as const,
+      line: entry.line,
+      ...(entry.system ? { system: true } : {}),
+    })),
+    calls: extract.calls,
+    inheritance: extract.inheritance,
+    routes: [],
+    engine: TREE_SITTER_PARSER_VERSION,
+    // Non-static function DEFINITIONS: C's one flat namespace, what a call by name can reach.
+    declarations: extract.functions
+      .filter((fn) => !fn.isStatic && !fn.qualifiedName.includes("::"))
+      .map((fn) => ({ name: fn.name, line: fn.line })),
+  };
+}
+
 // ── Regex fallback (imports + re-exports only) ────────────────────────────────────────
 
 /**
@@ -425,6 +705,53 @@ const PY_ROUTE_METHODS_BY_LABEL: Record<string, HttpRouteMethod> = {
  */
 function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFacts {
   const facts: CpgFacts = { imports: [], calls: [], inheritance: [], routes: [], engine: PARSER_VERSION };
+  if (language === "csharp") {
+    for (const entry of scanCSharpUsings(input.content)) {
+      facts.imports.push({
+        source: entry.target,
+        specifiers: entry.alias ? [entry.alias] : [],
+        kind: "import",
+        line: entry.line,
+        lazy: true,
+        ...(entry.kind === "static" ? { isStatic: true } : {}),
+        ...(entry.alias ? { alias: entry.alias } : {}),
+        ...(entry.global ? { global: true } : {}),
+      });
+    }
+    const namespace = /^\s*namespace\s+([\w.]+)/m.exec(input.content)?.[1];
+    if (namespace) facts.namespaces = [namespace];
+    return facts;
+  }
+  if (language === "c" || language === "cpp") {
+    for (const entry of scanCIncludes(input.content)) {
+      facts.imports.push({ source: entry.path, specifiers: [], kind: "import", line: entry.line, ...(entry.system ? { system: true } : {}) });
+    }
+    return facts;
+  }
+  if (language === "java") {
+    for (const entry of scanJavaImports(input.content)) {
+      facts.imports.push({
+        source: entry.source,
+        specifiers: entry.source.endsWith(".*") ? [] : [entry.source.split(".").pop() ?? entry.source],
+        kind: "import",
+        line: entry.line,
+        lazy: true,
+        ...(entry.isStatic ? { isStatic: true } : {}),
+      });
+    }
+    const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(input.content);
+    if (pkg) facts.packageName = pkg[1];
+    // A public top-level type must be named after its file — the one declaration knowable without a parse.
+    const stem = input.path.slice(input.path.lastIndexOf("/") + 1).replace(/\.java$/, "");
+    facts.declarations = [{ name: stem, line: 1 }];
+    return facts;
+  }
+  if (language === "go") {
+    for (const entry of scanGoImports(input.content)) {
+      facts.imports.push({ source: entry.source, specifiers: entry.name ? [entry.name] : [], kind: "import", line: entry.line });
+    }
+    return facts;
+  }
   const isPython = language === "python";
   const lines = input.content.split(/\r\n|\r|\n/);
 
@@ -440,12 +767,11 @@ function regexFallbackFacts(input: ParseFileInput, language: LanguageId): CpgFac
       }
       const from = PY_FROM_IMPORT_LINE.exec(line.trim());
       if (from) {
-        facts.imports.push({
-          source: from[1],
-          specifiers: from[2].split(",").map((value) => splitAliasSegments(value)[0] ?? value.trim()),
-          kind: "import",
-          line: lineNumber,
-        });
+        const names = from[2]
+          .split(",")
+          .map((value) => (splitAliasSegments(value)[0] ?? value).replace(/[()]/g, "").trim())
+          .filter(Boolean);
+        facts.imports.push({ source: from[1], specifiers: names, names, kind: "import", line: lineNumber });
       }
       return;
     }

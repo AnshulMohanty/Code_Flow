@@ -104,7 +104,7 @@ export function createGetCallersTool(): AgentTool {
       return {
         text:
           `${callers.length} file(s) call into ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""}: ` +
-          `${renderList(callers)}.` +
+          `${renderList(callers, context.listLimit)}.` +
           (callers.length === 0 ? " Note: only call/inheritance edges resolvable through imports are known." : ""),
         fileIds: callers,
         empty: callers.length === 0,
@@ -146,10 +146,10 @@ export function createFindReferencesTool(): AgentTool {
       return {
         text:
           `References for ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""}:\n` +
-          `- imported by: ${renderList(importedBy)}\n` +
-          `- imports: ${renderList(imports)}\n` +
-          `- called by: ${renderList(calledBy)}\n` +
-          `- calls: ${renderList(calls)}`,
+          `- imported by: ${renderList(importedBy, context.listLimit)}\n` +
+          `- imports: ${renderList(imports, context.listLimit)}\n` +
+          `- called by: ${renderList(calledBy, context.listLimit)}\n` +
+          `- calls: ${renderList(calls, context.listLimit)}`,
         fileIds: all,
         empty: all.length === 0,
       };
@@ -182,7 +182,7 @@ export function createBlastRadiusTool(): AgentTool {
       return {
         text:
           `Changing ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""} transitively affects ` +
-          `${affected.length} file(s): ${renderList(affected)}.`,
+          `${affected.length} file(s): ${renderList(affected, context.listLimit)}.`,
         fileIds: affected,
         empty: affected.length === 0,
       };
@@ -249,12 +249,76 @@ function runSymbolSearch(name: string, result: AnalysisResult, fromMemory: boole
   };
 }
 
-/** All four graph tools, in a stable order. */
+/**
+ * `find_usages` — where a symbol is DECLARED and every place that USES it, at file:line.
+ *
+ * The file-level tools answer "which files"; an agent's real question is usually about one function
+ * or type ("who calls `parse`?"). A text search answers that with every same-named identifier in the
+ * repository. The call graph answers it RESOLVED: each use went through the caller's own imports (or
+ * Go/Java/C#'s package and namespace rules, or C's one definition), so a `parse` in another module
+ * is not mixed in. Uses inside the declaring file are not graph edges and are not listed — the tool
+ * says so.
+ */
+export function createFindUsagesTool(): AgentTool {
+  return {
+    id: "find_usages",
+    description:
+      "find_usages(name) — where a function, method, class or type is declared, and every resolved place that " +
+      "uses it (call, `new`, extends/implements) with file:line and count. Exact, from the code graph: a " +
+      "same-named symbol elsewhere is not mixed in, unlike a text search.",
+    args: ["name"],
+    triggers: ["usages", "usage", "used", "call sites", "who calls", "references to", "where is it used"],
+    async run(args: ToolArgs, context: ToolContext): Promise<ToolResult> {
+      const raw = args.name ?? args.symbol ?? args.query;
+      const name = typeof raw === "string" ? raw.trim() : "";
+      if (!name) return { text: "find_usages needs a `name` argument.", empty: true };
+      return runFindUsages(name, context.result, context.listLimit ?? 40);
+    },
+  };
+}
+
+/** `store.Open` → `Open`, `Reader::read` → `read`. */
+function leafOf(symbol: string): string {
+  const parts = symbol.split(/::|\./);
+  return parts[parts.length - 1] ?? symbol;
+}
+
+function runFindUsages(name: string, result: AnalysisResult, limit: number): ToolResult {
+  const leaf = leafOf(name);
+  const symbols = result.inventory?.symbols ?? [];
+  const declarations = symbols
+    .filter((symbol) => symbol.name === name || leafOf(symbol.name) === leaf)
+    .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line);
+  const declaringFiles = new Set(declarations.map((symbol) => symbol.filePath));
+  const uses = (result.graph?.cpgEdges ?? [])
+    .filter((edge) => leafOf(edge.symbol) === leaf && (declaringFiles.size === 0 || declaringFiles.has(edge.to)))
+    .sort((a, b) => a.to.localeCompare(b.to) || a.from.localeCompare(b.from) || a.line - b.line);
+
+  if (declarations.length === 0 && uses.length === 0) {
+    return { text: `No declaration of "${name}" and no resolved use of it in the code graph.`, empty: true };
+  }
+  const declared = declarations.slice(0, 10).map((symbol) => `- ${symbol.filePath}:${symbol.line} ${symbol.name} (${symbol.kind})`);
+  const shown = uses.slice(0, limit).map(
+    (edge) => `- ${edge.from}:${edge.line} → ${edge.to} — ${edge.kind} \`${edge.symbol}\`${edge.count > 1 ? ` (×${edge.count})` : ""}`,
+  );
+  const callers = sorted(uses.map((edge) => edge.from));
+  const lines = [
+    `"${name}" — declared ${declarations.length} time(s)${declarations.length > declared.length ? " (first 10)" : ""}:`,
+    ...(declared.length ? declared : ["- (no declaration found in the inventory)"]),
+    `Used at ${uses.length} resolved site(s) in ${callers.length} file(s)${uses.length > shown.length ? ` (first ${shown.length})` : ""}:`,
+    ...(shown.length ? shown : ["- none resolved"]),
+    "Uses inside the declaring file itself are not graph edges and are not listed.",
+  ];
+  return { text: lines.join("\n"), fileIds: sorted([...declaringFiles, ...callers]), empty: false };
+}
+
+/** All graph tools, in a stable order. */
 export function createGraphTools(): AgentTool[] {
   return [
     createFindReferencesTool(),
     createGetCallersTool(),
     createBlastRadiusTool(),
     createSymbolSearchTool(),
+    createFindUsagesTool(),
   ];
 }

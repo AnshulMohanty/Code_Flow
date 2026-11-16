@@ -17,6 +17,7 @@ import type {
   StageEmbeddingTarget,
   StageRunRecord,
   StageStatus,
+  EntryPoint,
 } from "@codeflow/shared-types";
 import { statusReasonOf } from "./errors.js";
 import { computeLayers, describeSchedule, STAGE_READS } from "./schedule.js";
@@ -747,13 +748,29 @@ function assembleResult(
     orientation: slices.orientation,
     structure: slices.structure,
     inventory: slices.inventory,
-    entryPoints: slices.entryPoints,
+    // Derived from Inventory's detection when no stage set it. It used to be passed through as
+    // `slices.entryPoints`, which nothing produces — so every reader of `result.entryPoints` (four
+    // web tabs, the MCP graph_facts tool, the supervisor) saw none on every analysis.
+    entryPoints: slices.entryPoints ?? deriveEntryPoints(slices),
 
     // AI slice (clearly separated; assembled from the ai* slice keys)
     ai: buildAi(slices),
 
     pipeline,
   };
+}
+
+/** `inventory.entryPoints` (filePath-keyed) projected onto graph fileIds, deduped, sorted. */
+export function deriveEntryPoints(slices: Partial<AnalysisResultSlices>): EntryPoint[] | undefined {
+  const detected = slices.inventory?.entryPoints;
+  if (!detected) return undefined;
+  const nodeIds = slices.graph ? new Set(slices.graph.nodes.map((node) => node.id)) : undefined;
+  const byFile = new Map<string, EntryPoint>();
+  for (const entry of detected) {
+    if (nodeIds && !nodeIds.has(entry.filePath)) continue;
+    if (!byFile.has(entry.filePath)) byFile.set(entry.filePath, { fileId: entry.filePath, reason: entry.kind });
+  }
+  return [...byFile.values()].sort((a, b) => a.fileId.localeCompare(b.fileId));
 }
 
 function buildAi(slices: Partial<AnalysisResultSlices>): AiAnalysis | undefined {

@@ -14,6 +14,11 @@ const { Schema, model, models } = mongoose;
 
 export const ANALYSIS_QUEUE_NAME = "codeflow-analysis";
 
+function positiveInt(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 export const env = {
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017/codeflow",
   redisUrl: process.env.REDIS_URL || "redis://localhost:6379",
@@ -38,6 +43,19 @@ export const env = {
    * escape hatch costs one env var.
    */
   parallelStages: (process.env.PARALLEL_STAGES || "").toLowerCase() === "true",
+  /**
+   * Speculative prefetch (build RAG's chunk plan while synthesis waits on the provider). Opt-in:
+   * the overlap is proven on the hermetic bench, but no run against a real provider has measured
+   * that it pays for the CPU it spends — and an unmeasured optimisation does not get to be a default.
+   */
+  speculativePrefetch: (process.env.SPECULATIVE_PREFETCH || "").toLowerCase() === "true",
+  /**
+   * Repo-size caps per job (Ingest refuses a bigger clone before parsing). Memory is the limit: measured
+   * with the CLI, a job needs about 150 MiB + 30 KiB per file (Kubernetes, 26,595 files: 890 MiB), and a
+   * worker runs WORKER_CONCURRENCY jobs at once. Unset ⇒ MAX_FILES / MAX_BYTES from @codeflow/config.
+   */
+  maxRepoFiles: positiveInt(process.env.MAX_REPO_FILES),
+  maxRepoBytes: positiveInt(process.env.MAX_REPO_BYTES),
   /** V3-P5 model routing: the cheap/fast model. Falls back to the single configured model. */
   fastModel: process.env.FAST_MODEL || "",
 };

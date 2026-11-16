@@ -1,36 +1,14 @@
 import type { AnalysisResult } from "@codeflow/shared-types";
 
 /**
- * SIZE-AWARE EXTERNALIZATION OF THE STORED ANALYSIS (V3-P5 task 5, ledger #20).
+ * Keeps the stored analysis under Mongo's 16 MB document limit. `graph.cpgEdges` and `graph.routes`
+ * grow with the repository: 100,000 cpgEdges alone are 13.8 MB of JSON, and BSON is 1.083x JSON for this
+ * shape (measured with `BSON.calculateObjectSize`; comparing the JSON length understates it by 8%).
  *
- * THE PROBLEM, and why it kept being deferred. Mongo rejects any document over 16 MB. V3-P1 added
- * `graph.cpgEdges` and `graph.routes` to the stored analysis, both uncapped, so the document grows
- * with the repository. V3-P2 removed the LARGE contributor (inline RAG vectors, ledger #8) and then
- * deliberately did NOT resolve this one, on the grounds that the graph slice's growth was UNMEASURED
- * on a real large repo and externalising on a guess is building without evidence. That reasoning was
- * right, and it is also why the fix is not "always externalize".
- *
- * WHAT CHANGED IS THAT IT IS NOW MEASURED, twice:
- *
- *   1. BSON IS 1.083x THE JSON SIZE for this data's shape — measured with
- *      `BSON.calculateObjectSize` over 1k / 20k / 100k / 200k synthetic cpgEdges, and the ratio is
- *      stable across all four. That matters because the obvious instinct is to compare
- *      `JSON.stringify().length` against 16 MB, which UNDERSTATES the real size by 8% (BSON adds a
- *      type byte and a length prefix per value, and turns every array index into a string key).
- *   2. 100,000 cpgEdges ALONE is 13.8 MB of JSON / 14.9 MB of BSON. So the ceiling is not
- *      theoretical: a single large monorepo file's worth of call edges gets there.
- *
- * SO: MEASURE EACH DOCUMENT, EXTERNALIZE ONLY WHEN IT MATTERS. A small repo's document is stored
- * exactly as before — no second collection, no second read, no behaviour change at all — and a large
- * one sheds its heaviest optional fields, in a fixed priority order, until it fits. That is strictly
- * better than the two obvious alternatives: always-inline breaks above the limit, and
- * always-externalize makes every read of every small analysis pay for a join.
- *
- * A FAILED REHYDRATE MUST BE LOUD, and this is the subtle part. `shared-types` already flags the
- * exact ambiguity: absent `cpgEdges` means "the parser could not produce them", so an analysis whose
- * externalized edges failed to load would be indistinguishable from a repo with genuinely no calls
- * or routes. `rehydrateAnalysis` therefore reports what it could not load, and the caller pushes a
- * warning naming the fields — never silently hands back a result that looks complete.
+ * So each document is measured, and only one too large sheds its heaviest optional fields, in a fixed
+ * order, into a side collection. Small analyses are stored exactly as before (no join on read). A failed
+ * rehydrate is loud: absent `cpgEdges` would otherwise read as "the parser produced none", so
+ * `rehydrateAnalysis` reports what it could not load and the caller warns, naming the fields.
  */
 
 /** Mongo's hard per-document ceiling. */

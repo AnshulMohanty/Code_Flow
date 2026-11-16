@@ -1,7 +1,13 @@
 import { readFile } from "node:fs/promises";
 import type { ParsedFile } from "@codeflow/shared-types";
 import { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
+import { throughFactsStore } from "./factsStore.js";
+import { grammarsFor } from "./language.js";
 import { genericParser } from "./parsers/genericParser.js";
+import { cParser, cppParser } from "./parsers/cFamilyParser.js";
+import { csharpParser } from "./parsers/csharpParser.js";
+import { goParser } from "./parsers/goParser.js";
+import { javaParser } from "./parsers/javaParser.js";
 import { javascriptParser } from "./parsers/javascriptParser.js";
 import { jsxParser, tsxParser, typescriptParser } from "./parsers/typescriptParser.js";
 import { pythonParser } from "./parsers/pythonParser.js";
@@ -22,6 +28,11 @@ const DEFAULT_PARSERS = [
   createTreeSitterParser(typescriptParser),
   createTreeSitterParser(tsxParser),
   createTreeSitterParser(pythonParser),
+  createTreeSitterParser(goParser),
+  createTreeSitterParser(javaParser),
+  createTreeSitterParser(cParser),
+  createTreeSitterParser(cppParser),
+  createTreeSitterParser(csharpParser),
   genericParser,
 ];
 
@@ -47,12 +58,13 @@ export class ParserRegistry {
   }
 
   parseFile(input: ParseFileInput) {
-    return this.getParserForPath(input.path).parseFile(input);
+    const parser = this.getParserForPath(input.path);
+    return throughFactsStore("parsed", parser.language, input.path, input.content, () => parser.parseFile(input));
   }
 
   async parseRepository(repoRoot: string, options: ParseRepositoryOptions = {}): Promise<ParsedFile[]> {
-    await this.ready();
     const files = await discoverSourceFiles(repoRoot, options);
+    await this.ready({ languages: grammarsFor(files.map((file) => file.path)) });
     const parsedFiles: ParsedFile[] = [];
 
     for (const file of files) {

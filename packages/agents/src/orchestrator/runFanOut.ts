@@ -35,37 +35,21 @@ import {
 } from "./supervisor.js";
 
 /**
- * THE ORCHESTRATOR (V3-P4 tasks 1-3): fan out specialists over communities, collect structured
- * summaries on a blackboard, have one supervisor synthesise.
+ * The fan-out orchestrator:
  *
  *   plan routing (deterministic, free)
- *     -> for each selected community, run 5 specialists IN PARALLEL (bounded concurrency)
- *          -> hard communities get N trajectories, scored by an EXACT verifier, best kept
- *          -> phase gate per specialist: input safety, schema, grounding, budget
- *     -> blackboard (structured summaries only, never transcripts)
- *     -> ONE supervisor over a BOUNDED selection + deterministic graph facts
- *     -> grounded synthesis, or a deterministic fallback if the supervisor fails
+ *     -> per selected community, 5 specialists in parallel (bounded by FANOUT_MAX_CONCURRENCY)
+ *          -> hard communities get N trajectories, scored by an exact verifier, best kept
+ *          -> per-specialist gate: input safety, schema, grounding, budget
+ *     -> blackboard (structured summaries, never transcripts)
+ *     -> ONE supervisor over a bounded selection + deterministic graph facts
+ *     -> grounded synthesis, or a deterministic fallback
  *
- * FOUR PROPERTIES THIS FILE IS RESPONSIBLE FOR, each with the reason it matters:
- *
- * 1. **Genuinely parallel.** Specialists for a community run concurrently, capped by
- *    `FANOUT_MAX_CONCURRENCY` (provider rate limits and peak memory are real). `peakConcurrency` is
- *    OBSERVED, not assumed — a counter incremented around each call — because a wall-clock
- *    measurement alone is flaky on a loaded machine while a concurrency counter is exact.
- *
- * 2. **Orchestrator context does not grow with worker count.** Enforced by the blackboard's bounded
- *    selection, and reported as `supervisorContext` so the claim is measured rather than argued.
- *
- * 3. **N-times cost only on the routed-hard tail.** `bestOfNExtraCalls` is reported separately from
- *    `specialistCalls`, so the extra bill is always attributable.
- *
- * 4. **The Synthesize contract is unchanged.** Grounding, the SHA-keyed cache, the budget, and
- *    "AI failure ⇒ partial" all behave exactly as the single-shot stage did. Where this path differs
- *    it differs by being MORE forgiving: a specialist failing is a recorded entry, not a failed run,
- *    because losing one lens of five is not losing the analysis.
- *
- * AGENTS ARE AI LEAVES. Nothing here writes a deterministic slice; the graph, metrics and
- * communities are computed before any agent runs and are read-only throughout.
+ * Measured, not argued: `peakConcurrency` is counted around each call, `supervisorContext` shows the
+ * supervisor's input does not grow with worker count, `bestOfNExtraCalls` is reported apart from
+ * `specialistCalls`. The Synthesize contract (grounding, SHA cache, budget, "AI failure ⇒ partial") is
+ * unchanged; a failed specialist is a recorded entry, not a failed run. Agents never write a
+ * deterministic slice.
  */
 
 export interface FanOutDeps {

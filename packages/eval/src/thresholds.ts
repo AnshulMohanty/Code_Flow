@@ -2,7 +2,7 @@
 // you cannot pick real thresholds against a mock fixture; they are calibrated against the
 // real scored run on a chosen repo in P7. The report computes pass/fail against them, but
 // the eval is **NOT wired into CI gating** (CI stays hermetic + fast; the gating run needs
-// real keys ⇒ P7). See CURRENT_STATE / PHASE_LOG ledger.
+// real keys ⇒ P7). 
 
 export interface EvalThresholds {
   readingOrderRecallAtK: { k: number; min: number };

@@ -41,9 +41,10 @@ jobs:
       - name: Test (serial, hermetic)
         run: pnpm test
 
-      # Catches Vite/build breakage that --noEmit typecheck misses.
+      # Catches Vite/build breakage that --noEmit typecheck misses. Serial: several packages' `prebuild`
+      # rebuild shared packages, and in parallel one tsc can read another's half-written .d.ts.
       - name: Build
-        run: pnpm -r build
+        run: pnpm -r --workspace-concurrency=1 build
 
       # V3-P1 acceptance gate: grades the tree-sitter engine against the regex baseline on
       # AUTHORED ground truth. Hermetic (local grammar wasm, no keys, no clone), so unlike
@@ -59,26 +60,244 @@ jobs:
       - name: Eval golden set (hermetic — validation + determinism, no secrets)
         run: pnpm --filter @codeflow/eval run check
 
-      - name: Legacy root tests
-        run: node --test tests/*.mjs
+      - name: Repo hygiene (no raw control bytes in source)
+        run: node --test tests/source-hygiene.test.mjs
 
-  docker-build:
-    name: Docker images build (no push)
+      # This repository's own layering (codeflow.rules.json: packages never import apps, the base layer
+      # depends on nothing above it, the web app never reaches server code, ...), enforced on the
+      # resolved graph — so an import through a workspace package name is caught too.
+      - name: Architecture rules (self)
+        run: node apps/local-cli/dist/index.js check .
+
+      # The import graph, scored against the TypeScript compiler's own module resolution on this
+      # repository. Precision must be exact and recall ≥ 99%: the resolver once mapped 102 of 543
+      # of this repo's own imports (every `./x.js` → `x.ts` was missed) while every test passed.
+      - name: Graph accuracy vs tsc (self)
+        run: |
+          node apps/local-cli/dist/index.js analyze . --no-index --out "$RUNNER_TEMP/self.json"
+          node scripts/graph-accuracy.mjs . "$RUNNER_TEMP/self.json" --json > "$RUNNER_TEMP/accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # The Go import graph, scored against the Go toolchain's own resolution (`go list -deps -test`)
+  # on a real multi-module repository (14 modules, go.work), pinned to a commit. Precision must be
+  # exact and recall ≥ 99%. Clones one public repository and downloads its modules; no secrets.
+  go-accuracy:
+    name: Graph accuracy vs go list (etcd)
     runs-on: ubuntu-latest
     needs: gate
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
 
-      # Build all three service images to validate the Dockerfiles. No push, no secrets —
-      # building needs neither. This is the job that actually proves Part A.
-      - name: Build API image
-        run: docker build -f apps/api/Dockerfile -t codeflow-api:ci .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
 
-      - name: Build worker image
-        run: docker build -f apps/worker/Dockerfile -t codeflow-worker:ci .
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
 
-      - name: Build web image
-        run: docker build -f apps/web/Dockerfile -t codeflow-web:ci .
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone etcd at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/etcd"
+          git -C "$RUNNER_TEMP/etcd" fetch -q --depth 1 https://github.com/etcd-io/etcd.git f577f0d80fc58210a94aee6e09aebf6b2ad96165
+          git -C "$RUNNER_TEMP/etcd" checkout -q FETCH_HEAD
+
+      - name: Score against go list
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/etcd" --no-index --out "$RUNNER_TEMP/etcd.json"
+          node scripts/accuracy/go.mjs "$RUNNER_TEMP/etcd" "$RUNNER_TEMP/etcd.json" --json > "$RUNNER_TEMP/go-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/go-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.goInRepoEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # The Java graph, scored against javac's own name resolution (the Compiler Tree API attributes
+  # every file; each source name that resolves to an in-repo type is an edge) on jsoup, pinned.
+  java-accuracy:
+    name: Graph accuracy vs javac (jsoup)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone jsoup at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/jsoup"
+          git -C "$RUNNER_TEMP/jsoup" fetch -q --depth 1 https://github.com/jhy/jsoup.git d90d57521d931db7bf7ee464a4c0a1a9293db088
+          git -C "$RUNNER_TEMP/jsoup" checkout -q FETCH_HEAD
+
+      - name: Score against javac
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/jsoup" --no-index --out "$RUNNER_TEMP/jsoup.json"
+          node scripts/accuracy/java.mjs "$RUNNER_TEMP/jsoup" "$RUNNER_TEMP/jsoup.json" --json > "$RUNNER_TEMP/java-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/java-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
+            if (a.javacEdges < 1000 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # The C# graph, scored against Roslyn (the compiler inside the .NET SDK; nothing from NuGet): every
+  # .csproj compiled with its references, global usings and each target framework, on MediatR, pinned.
+  csharp-accuracy:
+    name: Graph accuracy vs Roslyn (MediatR)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone MediatR at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/mediatr"
+          git -C "$RUNNER_TEMP/mediatr" fetch -q --depth 1 https://github.com/jbogard/MediatR.git 1fad4c7a35c8dd4e733a0f8d43e28eddc1aa5f5b
+          git -C "$RUNNER_TEMP/mediatr" checkout -q FETCH_HEAD
+
+      - name: Score against Roslyn
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+          DOTNET_NOLOGO: "1"
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/mediatr" --no-index --out "$RUNNER_TEMP/mediatr.json"
+          node scripts/accuracy/csharp.mjs "$RUNNER_TEMP/mediatr" "$RUNNER_TEMP/mediatr.json" --json > "$RUNNER_TEMP/csharp-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/csharp-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
+            if (a.roslynEdges < 500 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # Python imports, scored against Python's own import machinery (importlib PathFinder; nothing from the
+  # repository is executed) on click, pinned.
+  python-accuracy:
+    name: Graph accuracy vs Python's import system (click)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone click at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/click"
+          git -C "$RUNNER_TEMP/click" fetch -q --depth 1 https://github.com/pallets/click.git e38188e9e205005d5af5f9e59df51904c984586a
+          git -C "$RUNNER_TEMP/click" checkout -q FETCH_HEAD
+
+      - name: Score against Python
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/click" --no-index --out "$RUNNER_TEMP/click.json"
+          node scripts/accuracy/python.mjs "$RUNNER_TEMP/click" "$RUNNER_TEMP/click.json" --json > "$RUNNER_TEMP/python-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/python-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · extra ${a.extra} · missed ${a.missed}`);
+            if (a.pythonInRepoEdges < 150 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # C/C++ includes, scored against clang 21 compiling every translation unit with the project's own
+  # CMake flags (compile_commands.json), on libuv, pinned. Runs clang + cmake in a container.
+  c-accuracy:
+    name: Graph accuracy vs clang (libuv)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "codeflow-local..." build
+
+      - name: Clone libuv at a pinned commit
+        run: |
+          git init -q "$RUNNER_TEMP/libuv"
+          git -C "$RUNNER_TEMP/libuv" fetch -q --depth 1 https://github.com/libuv/libuv.git ded7ccfc8a92912983ff7bd38a345c5bd0430291
+          git -C "$RUNNER_TEMP/libuv" checkout -q FETCH_HEAD
+
+      - name: Score against clang
+        run: |
+          node apps/local-cli/dist/index.js analyze "$RUNNER_TEMP/libuv" --no-index --out "$RUNNER_TEMP/libuv.json"
+          node scripts/accuracy/c.mjs "$RUNNER_TEMP/libuv" "$RUNNER_TEMP/libuv.json" --json > "$RUNNER_TEMP/c-accuracy.json"
+          node -e '
+            const a = require(process.env.RUNNER_TEMP + "/c-accuracy.json");
+            console.log(`precision ${a.precision} · recall ${a.recall} · agree ${a.agree} · wrong ${a.wrong} · missed ${a.missed}`);
+            if (a.clangInRepoIncludes < 400 || a.precision < 1 || a.recall < 0.99) { console.error(JSON.stringify(a.samples, null, 2)); process.exit(1); }'
+
+  # Builds the three images AND runs a real analysis through the composed stack. Building alone
+  # was green while the worker exited 0 on boot and no job was ever consumed. Clones one small
+  # public repository; no secrets (the AI stages run against a placeholder key and must degrade).
+  docker-smoke:
+    name: Docker stack smoke (build · boot · analyse)
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, boot and analyse
+        run: ./scripts/docker-smoke.sh
