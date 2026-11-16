@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { analyzeLocal } from "../analyzeLocal.js";
-import { assertSafeRef, changedFilesSince, checkoutToTemp, computeImpact, renderImpactMarkdown } from "../impact.js";
+import type { AnalysisResult } from "@codeflow/shared-types";
+import { assertSafeRef, changedFilesSince, checkoutToTemp, computeImpact, renderImpactMarkdown, selectTests } from "../impact.js";
 
 let repo: string;
 
@@ -77,6 +78,43 @@ describe("impact (end to end, real git)", () => {
     const markdown = renderImpactMarkdown(report);
     expect(markdown).toContain("❌ **1 new import cycle(s)**");
     expect(markdown).toContain("`src/lonely.ts` imports `./gone`");
+  });
+});
+
+describe("test selection", () => {
+  it("selects the tests whose import closure reaches the change, plus changed tests themselves", async () => {
+    const head = (await analyzeLocal({ repoPath: repo, skipIndex: true, factsCache: false })).result;
+    // util ← app ← test/app.test.ts
+    expect(selectTests(head, [{ path: "src/util.ts", status: "modified" }])).toEqual({ tests: ["test/app.test.ts"], all: false });
+    expect(selectTests(head, [{ path: "test/app.test.ts", status: "modified" }]).tests).toEqual(["test/app.test.ts"]);
+    // Nothing reaches lonely.ts: nothing to run.
+    expect(selectTests(head, [{ path: "src/lonely.ts", status: "modified" }])).toEqual({ tests: [], all: false });
+  });
+
+  it("selects EVERY test when a change cannot be traced through imports (a manifest, a config)", async () => {
+    const head = (await analyzeLocal({ repoPath: repo, skipIndex: true, factsCache: false })).result;
+    const selection = selectTests(head, [{ path: "package.json", status: "modified" }, { path: "src/util.ts", status: "modified" }]);
+    expect(selection.all).toBe(true);
+    expect(selection.tests).toEqual(["test/app.test.ts"]);
+    expect(selection.reason).toContain("package.json");
+  });
+
+  it("Go: a package's own tests and its dependents' package tests, though no test imports the file", () => {
+    const node = (id: string, layer: string) => ({ id, path: id, name: id, layer, language: "Go", lines: 1, symbolCount: 0 });
+    const head = {
+      graph: {
+        nodes: [
+          node("store/open.go", "source"),
+          node("store/open_test.go", "test"),
+          node("api/server.go", "source"),
+          node("api/server_test.go", "test"),
+          node("cli/main.go", "source"),
+          node("cli/main_test.go", "test"),
+        ],
+        edges: [{ from: "api/server.go", to: "store/open.go", kind: "import", specifier: "example.com/store" }],
+      },
+    } as unknown as AnalysisResult;
+    expect(selectTests(head, [{ path: "store/open.go", status: "modified" }]).tests).toEqual(["api/server_test.go", "store/open_test.go"]);
   });
 });
 

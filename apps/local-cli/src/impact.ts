@@ -53,7 +53,77 @@ export interface ImpactReport {
   totalSourceFiles: number;
 }
 
-const IMPORT_PARSED_LANGUAGES = new Set(["TypeScript", "JavaScript", "Python"]);
+const IMPORT_PARSED_LANGUAGES = new Set(["TypeScript", "JavaScript", "Python", "Go", "Java", "C", "C++"]);
+
+// ── test selection ────────────────────────────────────────────────────────────────
+
+export interface TestSelection {
+  /** Test files to run. When `all` is true, every test file in the repository. */
+  tests: string[];
+  /** True when the change touches something the graph cannot see through, so nothing may be skipped. */
+  all: boolean;
+  /** Why `all` is true: the changed files the graph cannot reason about. */
+  reason?: string;
+}
+
+/** Roles whose change can affect any test without an import edge (manifests, lockfiles, configs, CI). */
+const OPAQUE_ROLES = new Set(["config", "build", "other"]);
+
+/**
+ * The test files a change set can affect: every test whose import closure reaches a changed file,
+ * every changed test file itself, and — for Go, whose tests live IN the package and do not import it —
+ * the `_test.go` files of every package containing a changed or affected Go file.
+ *
+ * Safe by construction rather than clever: a change to a file the graph cannot see through (a
+ * `package.json`, a lockfile, `tsconfig.json`, a Makefile, CI) selects EVERY test, and says why. A
+ * selection that skips a failing test is worse than no selection.
+ */
+export function selectTests(head: AnalysisResult, changed: ChangedFile[]): TestSelection {
+  const nodes = head.graph?.nodes ?? [];
+  const roleOf = new Map(nodes.map((node) => [node.id, node.layer] as const));
+  const allTests = nodes.filter((node) => node.layer === "test").map((node) => node.id).sort();
+
+  const opaque = changed.filter((file) => {
+    const role = roleOf.get(file.path);
+    if (role === undefined) return file.status === "deleted" ? false : true; // not in the graph at all
+    return OPAQUE_ROLES.has(role);
+  });
+  // A deleted SOURCE file affects whatever imported it; the head graph no longer has those edges.
+  const deletedSource = changed.filter((file) => file.status === "deleted" && !/\.(md|mdx|txt|rst)$/i.test(file.path));
+  if (opaque.length || deletedSource.length) {
+    const named = [...opaque, ...deletedSource].map((file) => file.path);
+    return {
+      tests: allTests,
+      all: true,
+      reason: `${named.slice(0, 3).join(", ")}${named.length > 3 ? ` and ${named.length - 3} more` : ""} cannot be traced through imports`,
+    };
+  }
+
+  const dependents = new Map<string, string[]>();
+  for (const edge of head.graph?.edges ?? []) {
+    const list = dependents.get(edge.to) ?? [];
+    list.push(edge.from);
+    dependents.set(edge.to, list);
+  }
+  const reached = new Set<string>();
+  const queue = changed.map((file) => file.path).filter((id) => roleOf.has(id));
+  for (const id of queue) reached.add(id);
+  while (queue.length) {
+    for (const next of dependents.get(queue.shift()!) ?? []) {
+      if (!reached.has(next)) {
+        reached.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  const selected = new Set([...reached].filter((id) => roleOf.get(id) === "test"));
+  // Go: a package's tests sit beside it, in the same directory, and need no import.
+  const goDirs = new Set([...reached].filter((id) => id.endsWith(".go")).map((id) => id.slice(0, id.lastIndexOf("/") + 1)));
+  for (const test of allTests) {
+    if (test.endsWith("_test.go") && goDirs.has(test.slice(0, test.lastIndexOf("/") + 1))) selected.add(test);
+  }
+  return { tests: [...selected].sort(), all: false };
+}
 
 // ── git ───────────────────────────────────────────────────────────────────────────
 
@@ -184,7 +254,10 @@ export function computeImpact(
     }
     const reachers = reachersOf(file.path);
     const production = [...reachers].filter((id) => !isTest(id));
-    const reachingTests = [...reachers].filter(isTest);
+    // Same rule as `selectTests`, so `impact` and `tests` never disagree (Go's in-package tests included).
+    const reachingTests = OPAQUE_ROLES.has(roleOf.get(file.path) ?? "")
+      ? []
+      : selectTests(head, [{ path: file.path, status: "modified" }]).tests.filter((id) => id !== file.path);
     const entries = [...reachers, file.path].filter((id) => entryPoints.has(id)).sort();
     production.forEach((id) => !changedSet.has(id) && blast.add(id));
     reachingTests.forEach((id) => tests.add(id));

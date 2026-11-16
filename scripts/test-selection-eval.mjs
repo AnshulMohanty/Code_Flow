@@ -35,30 +35,21 @@ const result = JSON.parse(readFileSync(path.resolve(arg("--result")), "utf8"));
 const RUNNER = arg("--runner", "vitest");
 const SAMPLES = Number(arg("--samples", "20"));
 const TEST_CMD = arg("--test-cmd", RUNNER === "go" ? "go test -json ./..." : RUNNER === "jest" ? "npx jest" : "npx vitest run");
+/** Only inject faults under this directory (a workspace package whose suite the test command runs). */
+const SCOPE = arg("--scope", "");
+
+// The SHIPPED selection — the same function `codeflow-local tests` and `impact` use — not a copy.
+const { selectTests } = await import(new URL("../apps/local-cli/dist/impact.js", import.meta.url).href);
 
 const nodes = new Map((result.graph?.nodes ?? []).map((node) => [node.id, node]));
-const reverse = new Map();
-for (const edge of result.graph?.edges ?? []) {
-  if (!reverse.has(edge.to)) reverse.set(edge.to, new Set());
-  reverse.get(edge.to).add(edge.from);
-}
 // The universe of tests is whatever the RUNNER reports (filled from the baseline run below), never
 // CodeFlow's own file-role guess — the measurement must not depend on the thing being measured.
 let tests = [];
 
-/** CodeFlow's selection: test files whose import closure reaches `file`. */
+/** CodeFlow's selection for a change to `file`, within the tests the runner actually runs. */
 function selectedFor(file) {
-  const seen = new Set([file]);
-  const queue = [file];
-  while (queue.length) {
-    for (const dependent of reverse.get(queue.pop()) ?? []) {
-      if (!seen.has(dependent)) {
-        seen.add(dependent);
-        queue.push(dependent);
-      }
-    }
-  }
-  return tests.filter((test) => seen.has(test));
+  const runnable = new Set(tests);
+  return selectTests(result, [{ path: file, status: "modified" }]).tests.filter((test) => runnable.has(test));
 }
 
 /** The failing test files (or Go packages) of one full run. */
@@ -114,6 +105,7 @@ const testSet = new Set(tests);
 const sources = [...nodes.values()]
   .filter((node) => !testSet.has(node.id) && !node.id.endsWith("_test.go") && (RUNNER === "go" ? node.id.endsWith(".go") : /\.[cm]?[jt]sx?$/.test(node.id)) && node.layer !== "docs")
   .map((node) => node.id)
+  .filter((file) => (!SCOPE || file.startsWith(`${SCOPE.replace(/\/$/, "")}/`)) && !/(^|\/)__tests__\//.test(file))
   .filter((file) => selectedFor(file).length > 0)
   .sort();
 const sample = [];

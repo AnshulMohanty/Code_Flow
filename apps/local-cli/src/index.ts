@@ -12,6 +12,7 @@ import {
   defaultBase,
   renderImpactMarkdown,
   renderImpactText,
+  selectTests,
   type ChangedFile,
 } from "./impact.js";
 
@@ -97,6 +98,12 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
       --format F          text (default) | markdown (PR comment) | json
       --link-base URL     markdown only: prefix for file links (e.g. https://github.com/o/r/blob/SHA)
       --fail-on LIST      exit 1 on: new-cycle, broken-import, untested (comma-separated)
+
+  codeflow-local tests <repo-path> [--base REF | --files a,b] [--json]
+      The test files a change set can affect, one per line — for \`vitest run $(...)\`, \`go test\`,
+      \`pytest\`. Every test whose import closure reaches a changed file, every changed test, and Go
+      package tests. A change the graph cannot trace (package.json, a lockfile, a config, CI) selects
+      EVERY test and says why on stderr: skipping a failing test is worse than running one more.
 
 WHAT YOU GET, and what you do not:
   ✓ dependency graph, centrality, cycles, communities, symbols, entry points  — all offline
@@ -222,6 +229,37 @@ async function main(): Promise<number> {
     const format = typeof flags.format === "string" ? flags.format : "text";
     console.log(format === "json" ? JSON.stringify(report, null, 2) : formatVerificationReport(report, format === "markdown" ? "markdown" : "text"));
     return report.fail > 0 ? 1 : 0;
+  }
+
+  if (command === "tests") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("tests needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    let changed: ChangedFile[];
+    if (typeof flags.files === "string") {
+      changed = flags.files.split(",").map((file) => file.trim()).filter(Boolean).map((file) => ({ path: file, status: "modified" as const }));
+    } else {
+      const base = typeof flags.base === "string" ? flags.base : await defaultBase(root);
+      if (!base) {
+        console.error("tests: no --base given and none of origin/HEAD, origin/main, origin/master, main, master exists.");
+        return 1;
+      }
+      changed = await changedFilesSince(root, base);
+    }
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const selection = selectTests(head.result, changed);
+    if (flags.json === true) {
+      console.log(JSON.stringify({ changed: changed.map((file) => file.path), ...selection }, null, 2));
+    } else {
+      if (selection.all) console.error(`tests: running ALL ${selection.tests.length} test file(s) — ${selection.reason}`);
+      else console.error(`tests: ${selection.tests.length} test file(s) reach ${changed.length} changed file(s)`);
+      for (const test of selection.tests) console.log(test);
+    }
+    return 0;
   }
 
   if (command === "impact") {
