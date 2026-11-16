@@ -342,7 +342,7 @@ On impact questions the agent with CodeFlow answered in half the turns at **40â€
 the same accuracy: one `get_blast_radius` call instead of a chain of searches. On direct questions it
 is a tie â€” one grep for a class or header name is already the whole answer, and that is reported here
 rather than left out. Read it as a pilot: 4 questions per kind per repository, one run each, mid-size
-repositories (215 and 380 files); larger repositories, where a search returns far more, are next. Two
+repositories (about 215 and 380 source files); larger repositories, where a search returns far more, are next. Two
 fixes came out of the runs themselves: MCP server instructions that route question phrasing to a tool
 (the agent had used CodeFlow in 2 of 4 runs; now 8 of 8), and full lists for MCP clients (a 25-item
 cap, sized for the internal agent, sent the client searching for the rest). The libuv precision of
