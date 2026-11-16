@@ -3,6 +3,13 @@ export { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
 export { isSupportedSourceFile, shouldExcludePath } from "./filesystem/fileFilters.js";
 export { resolvePythonImport, resolveRelativeImport } from "./resolution/importResolver.js";
 export { createParserRegistry, parseRepository, ParserRegistry } from "./registry.js";
+export {
+  contentHash,
+  createMemoryFactsStore,
+  factsStoreStats,
+  setFactsStore,
+  type FactsStore,
+} from "./factsStore.js";
 export { genericParser } from "./parsers/genericParser.js";
 export { goParser } from "./parsers/goParser.js";
 export { javaParser } from "./parsers/javaParser.js";

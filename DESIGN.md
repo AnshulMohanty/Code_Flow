@@ -63,6 +63,14 @@ pipeline asks only for the languages its files need (`grammarsFor`), because gra
 `TREE_SITTER_MAX_BYTES` (2 MB of characters), or when a parse returns null. Raw NUL bytes are replaced by
 spaces before tree-sitter sees them (it stops at the first NUL; positions are unchanged).
 
+**Parse once, walk once, cache by content.** For Go, Java and C/C++, Inventory and Connect read the same
+per-file extract: Inventory's is kept (consume-once, `treesitter/extractCache.ts`) and Connect takes it,
+so each file is parsed once per run; each extractor collects all its node types in ONE tree walk
+(`collectByType`). A pluggable `FactsStore` (`parsers/src/factsStore.ts`) keeps every file's parse
+output by (kind, `ANALYZER_VERSION`, language, path, content hash): the CLI backs it with
+`.codeflow/cache`, `impact` with one in-memory store for head and base. The CLI streams `--out` JSON
+(`apps/local-cli/src/jsonOut.ts`) instead of building one giant string.
+
 **Connect runs in two passes**: extract facts from every file, then resolve. Go and Java resolve a name
 to the file that **declares** it, which needs every file's declarations first. Committed JavaScript
 bundles (webpack / browserify / Parcel runtime signatures) are kept as nodes but not parsed for imports —
@@ -130,6 +138,8 @@ overflow collection; `nodes` never move (`apps/api/src/services/analysisOverflow
 | `.gitignore` never drops a file git TRACKS (`git ls-files`) | It only governs untracked files; zlib commits its gitignored `zconf.h` | `mapStructure.ts`, both apps' `gitTrackedFiles` |
 | Go same-package references are call edges, not import edges | Go forbids package cycles; file-level same-package edges would invent cycles | `connect.ts` |
 | Grammars load per language, on demand | 25× size spread; a Go repo must not pay for C++ | `parsers/src/treesitter/runtime.ts` |
+| Parse each file once per run; one tree walk per extractor; parse output cached by content hash | Profiling Kubernetes showed 13.5 s of 33 s parsing every file twice and ~9 s re-walking trees; a re-run should parse only what changed | `extractCache.ts`, `ast.ts` `collectByType`, `factsStore.ts` |
+| Performance work is accepted only with an identical graph | A faster wrong answer is worse than a slow right one | `README.md` speed table, checked edge for edge |
 | Louvain is seeded (xorshift32, seed 1, sorted ids, canonical relabel) | Plain Louvain gives a different partition each run | `packages/graph/src/communities.ts` |
 | tree-sitter fallback is a size ceiling, never a timeout | A clock-based cut-off breaks determinism | `parseTreeSitter.ts` |
 | WASM tree-sitter, not native bindings | One build for worker and CLI; no native toolchain | `packages/parsers/package.json` |
@@ -332,7 +342,7 @@ Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an I
 |---|---|---|
 | **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
 | **1. Languages** | **Go, Java and C/C++ done** (above) | C# (truth: Roslyn), Rust (truth: the crate module tree from `rustc`), PHP (truth: composer's class map); Kotlin later. Content-based entry points (`func main`, `static void main`, `int main`). Follow §3.4. |
-| **2. Speed & scale** | Baseline measured: Kubernetes (26,558 files) analyses in 34 s with **1.95 GB peak memory** | Incremental analysis (per-file facts cached by content hash); cut peak memory; replace the hard 25k-file cap with streaming; load-test harness on the Docker stack (simulated users asking, bots opening PRs, large repos in parallel) reporting p50/p95/p99, throughput, queue wait, memory; scale 1 → 2 → 4 workers; prove or switch off arena / best-of-N / speculative prefetch |
+| **2. Speed & scale** | **Done:** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); incremental analysis — a one-file change re-analyses Kubernetes in 7.8 s; graph identical throughout | Replace the hard 25k-file cap (hosted guard) with streaming; load-test harness on the Docker stack (simulated users, bots opening PRs, large repos in parallel) reporting p50/p95/p99, throughput, queue wait, memory; scale 1 → 2 → 4 workers; prove or switch off arena / best-of-N / speculative prefetch |
 | **3. Online beats Claude alone** | — | MCP tools tuned for agents; function-level chunks; benchmark Claude alone vs Claude + CodeFlow (5 big repos × 20 questions: time, tokens, tool calls, wrong citations) |
 | **4. Real-problem checks** | `impact` exists | Test selection proven on real commit history; architecture rules file in CI; dead-code report; quiet PR comment; replay OSS PR history and file real issues |
 | **5. Ship** | — | npm publish, Marketplace listing, live demo, 60-second GIF, README around Map / Check / Ask, one write-up |

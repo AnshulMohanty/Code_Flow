@@ -139,40 +139,55 @@ export function extractGoFacts(tree: Tree): GoExtract {
     }
   }
 
-  // References through a possible import binding: `x.Y` in expressions and `x.T` in types.
-  for (const node of root.descendantsOfType(["selector_expression", "qualified_type"])) {
+  // ONE walk for everything below (each `descendantsOfType` is a full tree walk in wasm, and this
+  // used to take four). References keep one entry per distinct name: resolution needs which names
+  // a file uses, not how often — Kubernetes files reference fields thousands of times.
+  const seenRefs = new Set<string>();
+  const fieldEmbeds: GoReference[] = [];
+  const elemEmbeds: GoReference[] = [];
+  for (const node of root.descendantsOfType(["selector_expression", "qualified_type", "call_expression", "field_declaration", "type_elem"])) {
     if (!node) continue;
-    const ref = qualifiedReference(node);
-    if (ref) out.references.push(ref);
-  }
-
-  for (const call of root.descendantsOfType("call_expression")) {
-    if (!call) continue;
-    const callee = field(call, "function");
-    if (!callee) continue;
-    if (callee.type === "identifier") {
-      out.calls.push({ binding: callee.text, symbol: callee.text, line: startLine(call) });
-      continue;
+    switch (node.type) {
+      case "selector_expression":
+      case "qualified_type": {
+        const ref = qualifiedReference(node);
+        if (ref && !seenRefs.has(ref.symbol)) {
+          seenRefs.add(ref.symbol);
+          out.references.push(ref);
+        }
+        break;
+      }
+      case "call_expression": {
+        const callee = field(node, "function");
+        if (!callee) break;
+        if (callee.type === "identifier") {
+          out.calls.push({ binding: callee.text, symbol: callee.text, line: startLine(node) });
+          break;
+        }
+        const ref = callee.type === "selector_expression" ? qualifiedReference(callee) : undefined;
+        if (!ref) break;
+        out.calls.push({ ...ref, line: startLine(node) });
+        collectRoute(callee, node, out);
+        break;
+      }
+      case "field_declaration": {
+        // Embedding: a struct field that is only a type.
+        if (field(node, "name")) break;
+        const embedded = embeddedType(field(node, "type"));
+        if (embedded) fieldEmbeds.push({ ...embedded, line: startLine(node) });
+        break;
+      }
+      case "type_elem":
+        for (const type of namedChildrenOf(node)) {
+          const embedded = embeddedType(type);
+          if (embedded) elemEmbeds.push({ ...embedded, line: startLine(node) });
+        }
+        break;
+      default:
+        break;
     }
-    const ref = callee.type === "selector_expression" ? qualifiedReference(callee) : undefined;
-    if (!ref) continue;
-    out.calls.push({ ...ref, line: startLine(call) });
-    collectRoute(callee, call, out);
   }
-
-  // Embedding: a struct field or interface element that is only a type.
-  for (const fieldDecl of root.descendantsOfType("field_declaration")) {
-    if (!fieldDecl || field(fieldDecl, "name")) continue;
-    const embedded = embeddedType(field(fieldDecl, "type"));
-    if (embedded) out.embeds.push({ ...embedded, line: startLine(fieldDecl) });
-  }
-  for (const elem of root.descendantsOfType("type_elem")) {
-    if (!elem) continue;
-    for (const type of namedChildrenOf(elem)) {
-      const embedded = embeddedType(type);
-      if (embedded) out.embeds.push({ ...embedded, line: startLine(elem) });
-    }
-  }
+  out.embeds.push(...fieldEmbeds, ...elemEmbeds);
 
   return out;
 }
@@ -265,7 +280,11 @@ export function isGoExported(name: string): boolean {
 }
 
 export function extractGo(tree: Tree): GoParsedExtract {
-  const facts = extractGoFacts(tree);
+  return projectGo(extractGoFacts(tree));
+}
+
+/** Inventory's view of one Go extract (the same extract Connect's graph facts come from). */
+export function projectGo(facts: GoExtract): GoParsedExtract {
   const imports: ParsedImport[] = facts.imports.map((entry) => ({
     source: entry.source,
     specifiers: entry.name ? [entry.name] : [],

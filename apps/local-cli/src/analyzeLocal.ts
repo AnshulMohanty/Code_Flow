@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { createDirectoryFactsStore } from "./factsCache.js";
+import { factsStoreStats, setFactsStore, type FactsStore } from "@codeflow/parsers";
 import {
   createAnalyzeStage,
   createConnectStage,
@@ -68,6 +70,12 @@ export interface LocalAnalysisOptions {
   indexDir?: string;
   /** Skip the RAG index build (deterministic analysis only). */
   skipIndex?: boolean;
+  /**
+   * Per-file parse cache (incremental analysis). Default: a directory store at `<indexDir>/cache`, so
+   * a re-run parses only changed files. `false` disables it; a store can be passed to share one
+   * across analyses in one process (`impact` analyses head and base).
+   */
+  factsCache?: FactsStore | false;
   /** Injectable clock, for deterministic tests. */
   now?: () => number;
   onProgress?(message: string): void;
@@ -244,14 +252,25 @@ export async function analyzeLocal(options: LocalAnalysisOptions): Promise<Local
 
   report(`analysing ${repoPath} on-device (parser: web-tree-sitter WASM, embedder: ${LOCAL_EMBEDDING_MODEL})`);
 
-  const { result } = await runPipeline(stages, input, {
+  setFactsStore(
+    options.factsCache === false ? null : (options.factsCache ?? createDirectoryFactsStore(path.join(indexDir, "cache"))),
+  );
+  let pipeline: Awaited<ReturnType<typeof runPipeline>>;
+  try {
+    pipeline = await runPipeline(stages, input, {
     now,
     emit: (event) => report(`  ${event.stage}: ${event.status}${event.detail ? ` — ${event.detail}` : ""}`),
     // Layered scheduling is ON here without an env flag: a local run has no shared cache to
     // invalidate and no second replica to disagree with, and the slices are proven byte-identical
     // either way — so the only thing it changes is how long a developer waits.
     schedule: "layered",
-  });
+    });
+  } finally {
+    const { hits, misses } = factsStoreStats();
+    if (hits + misses > 0) report(`  parse cache: ${hits} file(s) reused, ${misses} parsed`);
+    setFactsStore(null);
+  }
+  const { result } = pipeline;
 
   return {
     result,

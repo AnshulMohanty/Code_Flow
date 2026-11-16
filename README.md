@@ -305,6 +305,20 @@ synthesis needs a model and there is no keyless local one, so rather than degrad
 looks like a summary and is not, it says what it cannot do. Search is lexical — shared identifiers
 and path words, not meaning.
 
+**Speed.** Each file's parse is cached under its content hash in `.codeflow/cache` (add `.codeflow/` to
+your `.gitignore`), so a re-run parses only what changed; `--no-cache` turns it off. Measured on
+Kubernetes (26,558 files) on an Apple M5 laptop, Node 26:
+
+| Run | Wall time | Peak memory |
+|---|---:|---:|
+| Full analysis, no cache | 20.7 s | 1.07 GB |
+| First run, filling the cache | 25.6 s | 1.01 GB |
+| Re-run, nothing changed | 7.7 s | 0.74 GB |
+| Re-run after editing one file (2 files parsed) | 7.8 s | — |
+
+The graph is identical across all four — checked edge for edge. `impact` analyses the head and the
+base of a PR in one process and parses every untouched file once.
+
 ---
 
 ## Check an answer or a PR

@@ -1,6 +1,7 @@
 import type { Node, Tree } from "web-tree-sitter";
 import type { ParsedExport, ParsedImport, ParsedSymbol } from "@codeflow/shared-types";
-import { endLine, field, namedChildrenOf, signatureOf, startLine } from "./ast.js";
+import { scanCIncludes } from "../utils/importScan.js";
+import { collectByType, endLine, field, namedChildrenOf, signatureOf, startLine } from "./ast.js";
 
 /**
  * C and C++, from one tree-sitter pass (the C++ grammar parses both).
@@ -56,11 +57,12 @@ const TYPE_KINDS: Record<string, CType["kind"]> = {
   enum_specifier: "enum",
 };
 
-export function extractCFamilyFacts(tree: Tree): CFamilyExtract {
+export function extractCFamilyFacts(tree: Tree, content: string): CFamilyExtract {
   const out: CFamilyExtract = { includes: [], functions: [], types: [], calls: [], inheritance: [] };
   const root = tree.rootNode;
+  const pick = collectByType(root, ["preproc_include", "function_definition", ...Object.keys(TYPE_KINDS), "call_expression"]);
 
-  for (const node of root.descendantsOfType("preproc_include")) {
+  for (const node of pick("preproc_include")) {
     const path = node ? field(node, "path") : undefined;
     if (!node || !path) continue;
     if (path.type === "system_lib_string") {
@@ -71,8 +73,22 @@ export function extractCFamilyFacts(tree: Tree): CFamilyExtract {
     }
     // An identifier (`#include CONFIG_HEADER`) is decided by a macro — never guessed.
   }
+  // `#include` is a line-level preprocessor directive, and the C++ grammar can lose its place in a
+  // preprocessor condition (`#if FMT_HAS_INCLUDE(<version>)` reads `<version>` as a template argument
+  // and swallows the next includes — fmt's format-test.cc). The line scan is the backstop; a line the
+  // tree places inside a comment is not an include.
+  const seenLines = new Set(out.includes.map((entry) => entry.line));
+  const lines = content.split(/\r\n|\r|\n/);
+  for (const entry of scanCIncludes(content)) {
+    if (seenLines.has(entry.line)) continue;
+    const text = lines[entry.line - 1] ?? "";
+    const node = root.descendantForPosition({ row: entry.line - 1, column: Math.max(0, text.indexOf("#")) });
+    if (node?.type === "comment") continue;
+    out.includes.push(entry);
+  }
+  out.includes.sort((a, b) => a.line - b.line);
 
-  for (const node of root.descendantsOfType("function_definition")) {
+  for (const node of pick("function_definition")) {
     if (!node) continue;
     const declarator = functionDeclarator(field(node, "declarator"));
     const nameNode = declarator ? field(declarator, "declarator") : undefined;
@@ -84,7 +100,7 @@ export function extractCFamilyFacts(tree: Tree): CFamilyExtract {
     out.functions.push({ name, qualifiedName, isStatic, line: startLine(node), lineEnd: endLine(node), signature: signatureOf(node) });
   }
 
-  for (const node of root.descendantsOfType(Object.keys(TYPE_KINDS))) {
+  for (const node of pick(Object.keys(TYPE_KINDS))) {
     if (!node) continue;
     const name = field(node, "name");
     if (!name || !field(node, "body")) continue; // a declaration or forward reference, not a definition
@@ -97,7 +113,7 @@ export function extractCFamilyFacts(tree: Tree): CFamilyExtract {
     }
   }
 
-  for (const call of root.descendantsOfType("call_expression")) {
+  for (const call of pick("call_expression")) {
     const callee = call ? field(call, "function") : undefined;
     if (!call || !callee) continue;
     if (callee.type === "identifier") {
@@ -121,8 +137,12 @@ function functionDeclarator(node: Node | undefined): Node | undefined {
 
 // ── ParsedFile projection (Inventory) ──────────────────────────────────────────────
 
-export function extractCFamily(tree: Tree): { imports: ParsedImport[]; exports: ParsedExport[]; symbols: ParsedSymbol[] } {
-  const facts = extractCFamilyFacts(tree);
+export function extractCFamily(tree: Tree, content: string): { imports: ParsedImport[]; exports: ParsedExport[]; symbols: ParsedSymbol[] } {
+  return projectCFamily(extractCFamilyFacts(tree, content));
+}
+
+/** Inventory's view of one C/C++ extract. */
+export function projectCFamily(facts: CFamilyExtract): { imports: ParsedImport[]; exports: ParsedExport[]; symbols: ParsedSymbol[] } {
   const imports: ParsedImport[] = facts.includes.map((entry) => ({
     source: entry.path,
     specifiers: [],

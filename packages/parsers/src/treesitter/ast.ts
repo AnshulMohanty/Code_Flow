@@ -112,3 +112,17 @@ export function calleeTail(name: string): string {
   const dot = name.lastIndexOf(".");
   return dot === -1 ? name : name.slice(dot + 1);
 }
+
+/**
+ * One walk for many node types. Each `descendantsOfType` call is a full tree walk inside wasm; an
+ * extractor that asks for ten node types one at a time walks the tree ten times. This walks once and
+ * hands back, per query, the matching nodes in document order — exactly what `descendantsOfType`
+ * would have returned.
+ */
+export function collectByType(root: Node, types: readonly string[]): (type: string | readonly string[]) => Node[] {
+  const all = root.descendantsOfType([...types]).filter((node): node is Node => node !== null);
+  return (type) => {
+    const wanted = typeof type === "string" ? [type] : type;
+    return all.filter((node) => wanted.includes(node.type));
+  };
+}

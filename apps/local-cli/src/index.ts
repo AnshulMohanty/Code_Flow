@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { createMemoryFactsStore } from "@codeflow/parsers";
+import { writeJsonFile } from "./jsonOut.js";
 import path from "node:path";
 import { buildReferenceIndex, formatVerificationReport, verifyReferences } from "@codeflow/analyzers";
 import { analyzeLocal, queryLocal } from "./analyzeLocal.js";
@@ -25,7 +27,7 @@ import {
  * searchable index. Everything that does not need a model — the graph, the metrics, the communities,
  * the cycles, and grounded retrieval — works offline.
  *
- *   codeflow-local analyze <repo-path> [--out result.json] [--no-index] [--index-dir DIR]
+ *   codeflow-local analyze <repo-path> [--out result.json] [--no-index] [--no-cache] [--index-dir DIR]
  *   codeflow-local ask <repo-path> "<question>" [--index-dir DIR] [-k N]
  *   codeflow-local verify <repo-path> [text-file | -] [--text "…"] [--format text|markdown|json]
  *   codeflow-local impact <repo-path> [--base REF] [--files a,b] [--format text|markdown|json]
@@ -73,6 +75,7 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
       --out FILE          also write the AnalysisResult JSON here
       --index-dir DIR     where the searchable index lives (default <repo>/.codeflow)
       --no-index          deterministic analysis only; skip the searchable index
+      --no-cache          parse every file (default: reuse unchanged files' parses from .codeflow/cache)
 
   codeflow-local ask <repo-path> "<question>" [options]
       --index-dir DIR     the index built by \`analyze\` (default <repo>/.codeflow)
@@ -123,6 +126,7 @@ async function main(): Promise<number> {
       repoPath,
       ...(typeof flags["index-dir"] === "string" ? { indexDir: flags["index-dir"] } : {}),
       skipIndex: flags["no-index"] === true,
+      ...(flags["no-cache"] === true ? { factsCache: false as const } : {}),
       onProgress: (message) => console.log(message),
     });
 
@@ -146,7 +150,7 @@ async function main(): Promise<number> {
     console.log("note:         no AI summary in local mode (no keyless local LLM). Everything above is deterministic.");
 
     if (typeof flags.out === "string") {
-      await writeFile(path.resolve(flags.out), `${JSON.stringify(analysis.result, null, 2)}\n`, "utf8");
+      writeJsonFile(path.resolve(flags.out), analysis.result);
       console.log(`wrote:        ${flags.out}`);
     }
     return 0;
@@ -241,13 +245,15 @@ async function main(): Promise<number> {
       changed = await changedFilesSince(root, base);
     }
 
-    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    // One in-memory parse cache for both sides: every file the PR did not touch is parsed once.
+    const shared = createMemoryFactsStore();
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, factsCache: shared, onProgress: () => {} });
     let baseResult;
     if (base) {
       try {
         const checkout = await checkoutToTemp(root, base);
         try {
-          baseResult = (await analyzeLocal({ repoPath: checkout.dir, skipIndex: true, onProgress: () => {} })).result;
+          baseResult = (await analyzeLocal({ repoPath: checkout.dir, skipIndex: true, factsCache: shared, onProgress: () => {} })).result;
         } finally {
           await checkout.cleanup();
         }

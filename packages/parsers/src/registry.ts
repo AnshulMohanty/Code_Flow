@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { ParsedFile } from "@codeflow/shared-types";
 import { discoverSourceFiles } from "./filesystem/fileDiscovery.js";
+import { throughFactsStore } from "./factsStore.js";
 import { grammarsFor } from "./language.js";
 import { genericParser } from "./parsers/genericParser.js";
 import { cParser, cppParser } from "./parsers/cFamilyParser.js";
@@ -55,7 +56,8 @@ export class ParserRegistry {
   }
 
   parseFile(input: ParseFileInput) {
-    return this.getParserForPath(input.path).parseFile(input);
+    const parser = this.getParserForPath(input.path);
+    return throughFactsStore("parsed", parser.language, input.path, input.content, () => parser.parseFile(input));
   }
 
   async parseRepository(repoRoot: string, options: ParseRepositoryOptions = {}): Promise<ParsedFile[]> {

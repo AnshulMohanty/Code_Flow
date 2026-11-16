@@ -1,6 +1,6 @@
 import type { Node, Tree } from "web-tree-sitter";
 import type { HttpRouteMethod, ParsedExport, ParsedImport, ParsedSymbol } from "@codeflow/shared-types";
-import { endLine, field, namedChildrenOf, startLine } from "./ast.js";
+import { collectByType, endLine, field, namedChildrenOf, startLine } from "./ast.js";
 
 /**
  * Java, from one tree-sitter pass.
@@ -105,6 +105,23 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
     routes: [],
   };
   const root = tree.rootNode;
+  const pick = collectByType(root, [
+    ...Object.keys(TYPE_DECLARATIONS),
+    "method_declaration",
+    "constructor_declaration",
+    "type_parameter",
+    "type_identifier",
+    "scoped_type_identifier",
+    "method_invocation",
+    "method_reference",
+    "field_access",
+    "object_creation_expression",
+    "marker_annotation",
+    "annotation",
+    "superclass",
+    "super_interfaces",
+    "extends_interfaces",
+  ]);
   const refs = new Set<string>();
   const qualified = new Set<string>();
   const locals = new Set<string>();
@@ -127,7 +144,7 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
   }
 
   // Declared types, with their nesting, and the methods inside them.
-  for (const node of root.descendantsOfType(Object.keys(TYPE_DECLARATIONS))) {
+  for (const node of pick(Object.keys(TYPE_DECLARATIONS))) {
     if (!node) continue;
     const name = field(node, "name");
     if (!name) continue;
@@ -142,7 +159,7 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
     });
     locals.add(name.text);
   }
-  for (const node of root.descendantsOfType(["method_declaration", "constructor_declaration"])) {
+  for (const node of pick(["method_declaration", "constructor_declaration"])) {
     if (!node) continue;
     const name = field(node, "name");
     const owner = enclosingTypeName(node);
@@ -161,13 +178,13 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
       isMain,
     });
   }
-  for (const param of root.descendantsOfType("type_parameter")) {
+  for (const param of pick("type_parameter")) {
     const name = param ? namedChildrenOf(param).find((child) => child.type === "type_identifier" || child.type === "identifier") : undefined;
     if (name) locals.add(name.text);
   }
 
   // Type names mentioned anywhere: plain and scoped type identifiers.
-  for (const node of root.descendantsOfType(["type_identifier", "scoped_type_identifier"])) {
+  for (const node of pick(["type_identifier", "scoped_type_identifier"])) {
     if (!node || node.parent?.type === "scoped_type_identifier") continue; // the outermost scoped name covers it
     if (node.type === "type_identifier") {
       if (node.parent?.type !== "type_parameter") refs.add(node.text);
@@ -180,7 +197,7 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
   }
 
   // `Util.call()`, `Foo.BAR`, `new Foo()` (covered by type_identifier), annotations.
-  for (const call of root.descendantsOfType("method_invocation")) {
+  for (const call of pick("method_invocation")) {
     if (!call) continue;
     const name = field(call, "name");
     const object = field(call, "object");
@@ -197,20 +214,20 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
     }
   }
   // `CookieRoute::handle` — a method reference through a type name.
-  for (const reference of root.descendantsOfType("method_reference")) {
+  for (const reference of pick("method_reference")) {
     const target = reference ? namedChildrenOf(reference)[0] : undefined;
     if (target?.type === "identifier" && /^[A-Z]/.test(target.text)) refs.add(target.text);
   }
-  for (const access of root.descendantsOfType("field_access")) {
+  for (const access of pick("field_access")) {
     const object = access ? field(access, "object") : undefined;
     if (object?.type === "identifier" && /^[A-Z]/.test(object.text)) refs.add(object.text);
   }
-  for (const creation of root.descendantsOfType("object_creation_expression")) {
+  for (const creation of pick("object_creation_expression")) {
     const type = creation ? field(creation, "type") : undefined;
     const name = type ? simpleTypeName(type) : undefined;
     if (creation && name) out.calls.push({ binding: name.split(".")[0], symbol: name, line: startLine(creation) });
   }
-  for (const annotation of root.descendantsOfType(["marker_annotation", "annotation"])) {
+  for (const annotation of pick(["marker_annotation", "annotation"])) {
     if (!annotation) continue;
     const name = field(annotation, "name");
     if (!name) continue;
@@ -221,7 +238,7 @@ export function extractJavaFacts(tree: Tree): JavaExtract {
   }
 
   // extends / implements.
-  for (const node of root.descendantsOfType(["superclass", "super_interfaces", "extends_interfaces"])) {
+  for (const node of pick(["superclass", "super_interfaces", "extends_interfaces"])) {
     if (!node) continue;
     const kind = node.type === "super_interfaces" ? "implements" : "extends";
     for (const type of node.descendantsOfType(["type_identifier", "scoped_type_identifier"])) {
@@ -295,7 +312,11 @@ export interface JavaParsedExtract {
 }
 
 export function extractJava(tree: Tree): JavaParsedExtract {
-  const facts = extractJavaFacts(tree);
+  return projectJava(extractJavaFacts(tree));
+}
+
+/** Inventory's view of one Java extract. */
+export function projectJava(facts: JavaExtract): JavaParsedExtract {
   const imports: ParsedImport[] = facts.imports.map((entry) => ({
     source: entry.source,
     specifiers: [entry.source.split(".").pop() ?? entry.source],

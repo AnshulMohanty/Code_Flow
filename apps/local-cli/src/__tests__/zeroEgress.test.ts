@@ -261,7 +261,8 @@ describe("codeflow-local sends nothing anywhere", () => {
 describe("the CLI source tree has no surprises", () => {
   it("contains only the modules it is supposed to", async () => {
     const files = (await readdir(CLI_ROOT)).filter((name) => name.endsWith(".ts"));
-    expect(files.sort()).toEqual(["analyzeLocal.ts", "impact.ts", "index.ts"]);
+    // factsCache.ts (the incremental parse cache) and jsonOut.ts (streamed --out) touch only fs and crypto.
+    expect(files.sort()).toEqual(["analyzeLocal.ts", "factsCache.ts", "impact.ts", "index.ts", "jsonOut.ts"]);
   });
 
   it("spawns only local git (read-only subcommands) and tar — never anything that can fetch", async () => {
@@ -277,5 +278,12 @@ describe("the CLI source tree has no surprises", () => {
       expect(gitSubcommands).not.toContain(forbidden);
     }
     for (const network of ["curl", "wget", "ssh"]) expect(source).not.toContain(`"${network}"`);
+  });
+
+  it("analyzeLocal starts exactly one process: `git ls-files`, to know which files git tracks", async () => {
+    const source = await readFile(path.join(CLI_ROOT, "analyzeLocal.ts"), "utf8");
+    const calls = [...source.matchAll(/execFile\(\s*"([^"]+)",\s*\[([^\]]*)\]/g)].map((m) => [m[1], m[2]]);
+    expect(calls).toEqual([["git", ' "-C", repoPath, "ls-files", "-z"']].map(([cmd, args]) => [cmd, args.trimStart()]));
+    expect(source).not.toMatch(/\bspawn\(|shell:\s*true/);
   });
 });

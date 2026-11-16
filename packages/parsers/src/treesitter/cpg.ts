@@ -14,9 +14,11 @@ import {
 import type { ParseFileInput } from "../types.js";
 import { PARSER_VERSION, TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { calleeName, calleeTail, field, namedChildrenOf, parseableSource, startLine, stringValue } from "./ast.js";
-import { extractGoFacts } from "./go.js";
-import { extractCFamilyFacts } from "./cfamily.js";
-import { extractJavaFacts } from "./java.js";
+import { throughFactsStore } from "../factsStore.js";
+import { extractKey, takeExtract } from "./extractCache.js";
+import { extractGoFacts, type GoExtract } from "./go.js";
+import { extractCFamilyFacts, type CFamilyExtract } from "./cfamily.js";
+import { extractJavaFacts, type JavaExtract } from "./java.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
 
 /**
@@ -153,16 +155,23 @@ const PY_ROUTE_METHODS: Record<string, HttpRouteMethod> = {
  */
 export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): CpgFacts {
   const lang = language ?? detectLanguage(input.path);
+  return throughFactsStore("facts", lang, input.path, input.content, () => computeCpgFacts(input, lang));
+}
+
+function computeCpgFacts(input: ParseFileInput, lang: LanguageId): CpgFacts {
   if (hasGrammar(lang) && input.content.length <= TREE_SITTER_MAX_BYTES) {
+    // Go / Java / C/C++: Inventory may already have parsed this exact content — take its extract.
+    if (SHARED_EXTRACT.has(lang)) {
+      const cached = takeExtract<unknown>(extractKey(lang, input.path, input.content));
+      if (cached !== undefined) return factsFromExtract(lang, cached);
+    }
     const parser = grammarParser(lang);
     if (parser) {
       const tree = parser.parse(parseableSource(input.content));
       if (tree) {
         try {
           if (lang === "python") return pythonFacts(tree);
-          if (lang === "go") return goFacts(tree);
-          if (lang === "java") return javaFacts(tree);
-          if (lang === "c" || lang === "cpp") return cFamilyFacts(tree, input.content);
+          if (SHARED_EXTRACT.has(lang)) return factsFromExtract(lang, extractFor(lang, tree, input.content));
           return jsLikeFacts(tree);
         } finally {
           tree.delete();
@@ -171,6 +180,22 @@ export function extractCpgFacts(input: ParseFileInput, language?: LanguageId): C
     }
   }
   return regexFallbackFacts(input, lang);
+}
+
+/** Languages whose Inventory symbols and Connect facts come from ONE extract (so one parse). */
+export const SHARED_EXTRACT = new Set<string>(["go", "java", "c", "cpp"]);
+
+/** The raw extract for a shared-extract language — what `parseTreeSitterFile` caches for Connect. */
+export function extractFor(language: string, tree: Tree, content: string): unknown {
+  if (language === "go") return extractGoFacts(tree);
+  if (language === "java") return extractJavaFacts(tree);
+  return extractCFamilyFacts(tree, content);
+}
+
+function factsFromExtract(language: string, extract: unknown): CpgFacts {
+  if (language === "go") return goFacts(extract as GoExtract);
+  if (language === "java") return javaFacts(extract as JavaExtract);
+  return cFamilyFacts(extract as CFamilyExtract);
 }
 
 // ── JS / TS / JSX / TSX ───────────────────────────────────────────────────────────────
@@ -540,8 +565,7 @@ const PY_ROUTE_METHODS_BY_LABEL: Record<string, HttpRouteMethod> = {
 
 // ── Go ────────────────────────────────────────────────────────────────────────────────
 
-function goFacts(tree: Tree): CpgFacts {
-  const extract = extractGoFacts(tree);
+function goFacts(extract: GoExtract): CpgFacts {
   return {
     // `specifiers` carries the explicit name only (alias, `.` or `_`); the default binding is
     // the TARGET package's name, which only the resolver knows.
@@ -563,8 +587,7 @@ function goFacts(tree: Tree): CpgFacts {
 
 // ── Java ──────────────────────────────────────────────────────────────────────────────
 
-function javaFacts(tree: Tree): CpgFacts {
-  const extract = extractJavaFacts(tree);
+function javaFacts(extract: JavaExtract): CpgFacts {
   return {
     imports: extract.imports.map((entry) => ({
       source: entry.source,
@@ -590,21 +613,7 @@ function javaFacts(tree: Tree): CpgFacts {
 
 // ── C / C++ ───────────────────────────────────────────────────────────────────────────
 
-function cFamilyFacts(tree: Tree, content: string): CpgFacts {
-  const extract = extractCFamilyFacts(tree);
-  // `#include` is a line-level preprocessor directive, and the C++ grammar can lose its place in a
-  // preprocessor condition (`#if FMT_HAS_INCLUDE(<version>)` reads `<version>` as a template argument
-  // and swallows the next includes — fmt's format-test.cc). The line scan is the backstop; a line the
-  // tree places inside a comment is not an include.
-  const seen = new Set(extract.includes.map((entry) => entry.line));
-  for (const entry of scanCIncludes(content)) {
-    if (seen.has(entry.line)) continue;
-    const text = content.split(/\r\n|\r|\n/, entry.line)[entry.line - 1] ?? "";
-    const node = tree.rootNode.descendantForPosition({ row: entry.line - 1, column: Math.max(0, text.indexOf("#")) });
-    if (node?.type === "comment") continue;
-    extract.includes.push(entry);
-  }
-  extract.includes.sort((a, b) => a.line - b.line);
+function cFamilyFacts(extract: CFamilyExtract): CpgFacts {
   return {
     imports: extract.includes.map((entry) => ({
       source: entry.path,

@@ -7,9 +7,11 @@ import { TREE_SITTER_PARSER_VERSION } from "../types.js";
 import { countLoc } from "../utils/lineUtils.js";
 import { extensionOf } from "../utils/pathUtils.js";
 import { parseableSource } from "./ast.js";
-import { extractCFamily } from "./cfamily.js";
-import { extractGo } from "./go.js";
-import { extractJava } from "./java.js";
+import { projectCFamily } from "./cfamily.js";
+import { extractFor, SHARED_EXTRACT } from "./cpg.js";
+import { extractKey, rememberExtract } from "./extractCache.js";
+import { projectGo, type GoExtract } from "./go.js";
+import { projectJava } from "./java.js";
 import { extractJsLike } from "./jsLike.js";
 import { extractPython } from "./python.js";
 import { grammarParser, hasGrammar } from "./runtime.js";
@@ -36,9 +38,14 @@ export function parseTreeSitterFile(input: ParseFileInput, language: LanguageId)
   if (!tree) return null;
   try {
     if (language === "python") return pythonParsedFile(tree, input);
-    if (language === "go") return goParsedFile(tree, input);
-    if (language === "java") return typedParsedFile(tree, input, "java", extractJava);
-    if (language === "c" || language === "cpp") return typedParsedFile(tree, input, language, extractCFamily);
+    if (SHARED_EXTRACT.has(language)) {
+      // One extract serves both views: kept for Connect (parse once), projected here for Inventory.
+      const extract = extractFor(language, tree, input.content);
+      rememberExtract(extractKey(language, input.path, input.content), extract);
+      if (language === "go") return goParsedFile(projectGo(extract as GoExtract), input);
+      const project = language === "java" ? projectJava : projectCFamily;
+      return typedParsedFile(project(extract as never), input, language);
+    }
     return jsLikeParsedFile(tree, input, language);
   } finally {
     // The tree lives in the wasm heap — releasing it is not optional on a big repo.
@@ -84,12 +91,10 @@ function pythonParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
 
 /** Java (and the other symbol-indexed languages): imports name types; they resolve in Connect. */
 function typedParsedFile(
-  tree: Tree,
+  result: { imports: ParsedImport[]; exports: ParsedFile["exports"]; symbols: ParsedFile["symbols"] },
   input: ParseFileInput,
   language: LanguageId,
-  extract: (tree: Tree) => { imports: ParsedImport[]; exports: ParsedFile["exports"]; symbols: ParsedFile["symbols"] },
 ): ParsedFile {
-  const result = extract(tree);
   return {
     path: input.path,
     language,
@@ -105,8 +110,7 @@ function typedParsedFile(
 }
 
 /** Go import paths name packages; they resolve in Connect, against go.mod and the repo's directories. */
-function goParsedFile(tree: Tree, input: ParseFileInput): ParsedFile {
-  const extract = extractGo(tree);
+function goParsedFile(extract: ReturnType<typeof projectGo>, input: ParseFileInput): ParsedFile {
   return {
     path: input.path,
     language: "go",
