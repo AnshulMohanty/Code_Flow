@@ -104,7 +104,7 @@ export function createGetCallersTool(): AgentTool {
       return {
         text:
           `${callers.length} file(s) call into ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""}: ` +
-          `${renderList(callers)}.` +
+          `${renderList(callers, context.listLimit)}.` +
           (callers.length === 0 ? " Note: only call/inheritance edges resolvable through imports are known." : ""),
         fileIds: callers,
         empty: callers.length === 0,
@@ -146,10 +146,10 @@ export function createFindReferencesTool(): AgentTool {
       return {
         text:
           `References for ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""}:\n` +
-          `- imported by: ${renderList(importedBy)}\n` +
-          `- imports: ${renderList(imports)}\n` +
-          `- called by: ${renderList(calledBy)}\n` +
-          `- calls: ${renderList(calls)}`,
+          `- imported by: ${renderList(importedBy, context.listLimit)}\n` +
+          `- imports: ${renderList(imports, context.listLimit)}\n` +
+          `- called by: ${renderList(calledBy, context.listLimit)}\n` +
+          `- calls: ${renderList(calls, context.listLimit)}`,
         fileIds: all,
         empty: all.length === 0,
       };
@@ -182,7 +182,7 @@ export function createBlastRadiusTool(): AgentTool {
       return {
         text:
           `Changing ${fileId}${fromMemory ? " (resolved from the previous turn)" : ""} transitively affects ` +
-          `${affected.length} file(s): ${renderList(affected)}.`,
+          `${affected.length} file(s): ${renderList(affected, context.listLimit)}.`,
         fileIds: affected,
         empty: affected.length === 0,
       };
@@ -272,7 +272,7 @@ export function createFindUsagesTool(): AgentTool {
       const raw = args.name ?? args.symbol ?? args.query;
       const name = typeof raw === "string" ? raw.trim() : "";
       if (!name) return { text: "find_usages needs a `name` argument.", empty: true };
-      return runFindUsages(name, context.result);
+      return runFindUsages(name, context.result, context.listLimit ?? 40);
     },
   };
 }
@@ -283,7 +283,7 @@ function leafOf(symbol: string): string {
   return parts[parts.length - 1] ?? symbol;
 }
 
-function runFindUsages(name: string, result: AnalysisResult): ToolResult {
+function runFindUsages(name: string, result: AnalysisResult, limit: number): ToolResult {
   const leaf = leafOf(name);
   const symbols = result.inventory?.symbols ?? [];
   const declarations = symbols
@@ -298,7 +298,7 @@ function runFindUsages(name: string, result: AnalysisResult): ToolResult {
     return { text: `No declaration of "${name}" and no resolved use of it in the code graph.`, empty: true };
   }
   const declared = declarations.slice(0, 10).map((symbol) => `- ${symbol.filePath}:${symbol.line} ${symbol.name} (${symbol.kind})`);
-  const shown = uses.slice(0, 40).map(
+  const shown = uses.slice(0, limit).map(
     (edge) => `- ${edge.from}:${edge.line} → ${edge.to} — ${edge.kind} \`${edge.symbol}\`${edge.count > 1 ? ` (×${edge.count})` : ""}`,
   );
   const callers = sorted(uses.map((edge) => edge.from));

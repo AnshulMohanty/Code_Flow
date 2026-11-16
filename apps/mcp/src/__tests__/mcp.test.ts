@@ -212,6 +212,15 @@ describe("tool surface — a denied tool is ABSENT, not present-and-refusing", (
     expect(names).not.toContain("verify_answer");
   });
 
+  it("instructions route question phrasing to tools — and name only tools that are enabled", () => {
+    const graphOnly = core(["graph"]).instructions();
+    expect(graphOnly).toContain("- get_blast_radius:");
+    expect(graphOnly).toContain("- find_usages:");
+    expect(graphOnly).not.toContain("verify_citations");
+    expect(core(["graph", "verify"]).instructions()).toContain("- verify_citations:");
+    expect(core([]).instructions()).toBe("");
+  });
+
   it("omits search_code when the retrieval scope is on but no provider is wired", () => {
     // A search tool that always fails for want of a key is worse than an absent one.
     expect(core(["retrieval"]).listTools()).toEqual([]);

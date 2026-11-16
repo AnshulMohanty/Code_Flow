@@ -69,8 +69,12 @@ export interface McpToolDefinition {
  *  stateless, so there is no "it" to resolve, and a tool that silently reused another caller's
  *  entity would answer about the wrong file. */
 function statelessContext(result: AnalysisResult): ToolContext {
-  return { result, memory: emptySession("mcp", result.id) };
+  // The whole list (up to 1000): an MCP client has no shared tool-result budget, and a truncated list
+  // sends it off to search for the rest — measured in the agent benchmark (see DESIGN.md §7).
+  return { result, memory: emptySession("mcp", result.id), listLimit: MCP_LIST_LIMIT };
 }
+
+const MCP_LIST_LIMIT = 1000;
 
 /** Adapt one shared `AgentTool` into an MCP tool. */
 function fromAgentTool(
@@ -133,8 +137,9 @@ export function buildMcpTools(deps: McpToolDeps, allows: (scope: McpScope) => bo
         name: "get_blast_radius",
         scope: "graph",
         description:
-          "Every file transitively affected if a file changes (reverse reachability over the dependency graph). " +
-          "Answers 'what breaks if I touch this'.",
+          "Every file that could be affected if a file changes — everything that depends on it directly OR " +
+          "indirectly (reverse reachability over the resolved dependency graph), in one call. Answers 'what breaks " +
+          "if I touch this' without searching hop by hop.",
         inputSchema: FILE_ID_SCHEMA,
       }),
       fromAgentTool(createSymbolSearchTool(), {

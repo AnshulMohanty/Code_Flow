@@ -37,16 +37,14 @@ const SAMPLES = Number(arg("--samples", "20"));
 const TEST_CMD = arg("--test-cmd", RUNNER === "go" ? "go test -json ./..." : RUNNER === "jest" ? "npx jest" : "npx vitest run");
 
 const nodes = new Map((result.graph?.nodes ?? []).map((node) => [node.id, node]));
-const tests = [...nodes.values()].filter((node) => node.layer === "test" && isTestFile(node.id)).map((node) => node.id).sort();
 const reverse = new Map();
 for (const edge of result.graph?.edges ?? []) {
   if (!reverse.has(edge.to)) reverse.set(edge.to, new Set());
   reverse.get(edge.to).add(edge.from);
 }
-
-function isTestFile(file) {
-  return RUNNER === "go" ? file.endsWith("_test.go") : /\.(test|spec)\.[cm]?[jt]sx?$/.test(file);
-}
+// The universe of tests is whatever the RUNNER reports (filled from the baseline run below), never
+// CodeFlow's own file-role guess — the measurement must not depend on the thing being measured.
+let tests = [];
 
 /** CodeFlow's selection: test files whose import closure reaches `file`. */
 function selectedFor(file) {
@@ -71,21 +69,25 @@ function failingTests() {
   const extra = RUNNER === "vitest" ? ["--reporter=json", `--outputFile=${report}`] : RUNNER === "jest" ? ["--json", `--outputFile=${report}`] : [];
   const run = spawnSync(command, [...rest, ...extra], { cwd: repo, encoding: "utf8", maxBuffer: 512 * 1024 * 1024, timeout: 30 * 60 * 1000 });
   const failing = new Set();
+  const all = new Set();
   if (RUNNER === "go") {
     for (const line of run.stdout.split("\n")) {
       if (!line.startsWith("{")) continue;
       const event = JSON.parse(line);
+      if (event.Package && !event.Test && (event.Action === "pass" || event.Action === "fail")) all.add(event.Package);
       // A package whose tests fail (or fail to build or init) — every _test.go file in it is "failing".
       if ((event.Action === "fail" && !event.Test) || event.Action === "build-fail") failing.add(event.ImportPath ?? event.Package);
     }
-    return failing;
+    return { all, failing };
   }
   if (!existsSync(report)) throw new Error(`the test runner wrote no report:\n${(run.stderr || run.stdout).slice(-2000)}`);
   const json = JSON.parse(readFileSync(report, "utf8"));
   for (const file of json.testResults ?? []) {
-    if (file.status !== "passed") failing.add(path.relative(repo, file.name).split(path.sep).join("/"));
+    const relative = path.relative(repo, file.name).split(path.sep).join("/");
+    all.add(relative);
+    if (file.status !== "passed") failing.add(relative);
   }
-  return failing;
+  return { all, failing };
 }
 
 /** Go judges per PACKAGE: map test files to their package import path via their directory. */
@@ -103,19 +105,23 @@ function inject(file) {
   return () => writeFileSync(full, original);
 }
 
+const baselineRun = failingTests();
+const baseline = baselineRun.failing;
+tests = RUNNER === "go" ? [...nodes.keys()].filter((file) => file.endsWith("_test.go")) : [...baselineRun.all].sort();
+const testSet = new Set(tests);
+
 // Candidates: production source files some test reaches (a file no test reaches cannot be judged).
 const sources = [...nodes.values()]
-  .filter((node) => node.layer === "source" && (RUNNER === "go" ? node.id.endsWith(".go") : /\.[cm]?[jt]sx?$/.test(node.id)))
+  .filter((node) => !testSet.has(node.id) && !node.id.endsWith("_test.go") && (RUNNER === "go" ? node.id.endsWith(".go") : /\.[cm]?[jt]sx?$/.test(node.id)) && node.layer !== "docs")
   .map((node) => node.id)
   .filter((file) => selectedFor(file).length > 0)
   .sort();
 const sample = [];
 for (let i = 0; i < SAMPLES && sources.length; i += 1) sample.push(sources[Math.floor(((i + 0.5) * sources.length) / SAMPLES)]);
 
-console.log(`${tests.length} test files; ${sources.length} source files reached by a test; judging ${sample.length}`);
-const baseline = failingTests();
+console.log(`${tests.length} test files (per the runner); ${sources.length} source files reached by a test; judging ${sample.length}`);
 console.log(`baseline: ${baseline.size} test unit(s) already failing (excluded)`);
-const allUnits = new Set(tests.map(unitOf));
+const allUnits = RUNNER === "go" ? new Set([...baselineRun.all]) : new Set(tests);
 
 const rows = [];
 for (const file of sample) {
@@ -123,7 +129,7 @@ for (const file of sample) {
   const restore = inject(file);
   let failing;
   try {
-    failing = failingTests();
+    failing = failingTests().failing;
   } finally {
     restore();
   }

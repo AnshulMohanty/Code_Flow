@@ -404,3 +404,27 @@ describe("find_usages — a symbol's declaration and every resolved use, at file
     expect(out.text).toContain("No declaration");
   });
 });
+
+describe("list limit — the internal agent truncates, an MCP client gets the whole list", () => {
+  function wideResult() {
+    const result = fixtureResult();
+    for (let i = 0; i < 30; i += 1) {
+      const id = `src/feature${String(i).padStart(2, "0")}.ts`;
+      result.graph!.nodes.push({ id, path: id, name: id.split("/").pop()!, layer: "source", language: "TypeScript", lines: 5, symbolCount: 1 });
+      result.graph!.edges.push({ from: id, to: "src/util.ts", kind: "import", specifier: "./util" });
+    }
+    return result;
+  }
+
+  it("keeps the default cap of 25 for the internal agent's small context budget", async () => {
+    const out = await createBlastRadiusTool().run({ fileId: "src/util.ts" }, { ...context(), result: wideResult() });
+    expect(out.text).toMatch(/\(\+\d+ more of \d+\)/);
+  });
+
+  it("lists every affected file when the caller asks for it (MCP)", async () => {
+    const out = await createBlastRadiusTool().run({ fileId: "src/util.ts" }, { ...context(), result: wideResult(), listLimit: 1000 });
+    expect(out.text).not.toMatch(/more of/);
+    expect(out.text).toContain("src/feature29.ts");
+    expect(out.fileIds).toHaveLength(32); // 30 features + auth.ts + index.ts (through auth.ts)
+  });
+});

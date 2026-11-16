@@ -245,6 +245,8 @@ function isTest(base: string, segments: string[]): boolean {
     return true;
   }
   return (
+    // `test.ts` / `spec.js` beside the code it tests (date-fns: `src/addDays/test.ts`).
+    /^(test|tests|spec)\.[cm]?[jt]sx?$/.test(base) ||
     /\.(test|spec)\.[^.]+$/.test(base) ||
     /(^|[._])test_[^/]*\.py$/.test(base) ||
     /_test\.(go|py|rb)$/.test(base)

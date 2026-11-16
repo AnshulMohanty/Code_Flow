@@ -119,6 +119,14 @@ describe("map-structure — ignores", () => {
     expect(structure.files.map((f) => f.path)).toEqual(["src/index.ts"]);
   });
 
+  it("recognises a test file named plainly test.ts beside the code (date-fns layout)", async () => {
+    const roles = rolesByPath(await mapStructure({ "src/addDays/index.ts": 1, "src/addDays/test.ts": 1, "src/lib/spec.js": 1, "src/latest.ts": 1 }));
+    expect(roles["src/addDays/test.ts"]).toBe("test");
+    expect(roles["src/lib/spec.js"]).toBe("test");
+    expect(roles["src/addDays/index.ts"]).toBe("source");
+    expect(roles["src/latest.ts"]).toBe("source");
+  });
+
   it("keeps a build/out/coverage directory that is a Go package (Kubernetes' pkg/test/coverage)", async () => {
     const structure = await mapStructure({
       "pkg/test/coverage/coverage.go": 1,

@@ -40,6 +40,13 @@ export interface ToolContext {
   readonly result: AnalysisResult;
   /** Session memory, for tools that resolve a reference ("its callers"). */
   readonly memory: SessionMemory;
+  /**
+   * How many items a tool lists before writing "(+N more of M)". The internal agent keeps the default
+   * (25) because every tool result shares a small context budget. An MCP client has no such budget,
+   * and a truncated list makes it go and search for the rest: in the agent benchmark, impact sets over
+   * 25 files cost 2–6× the turns of those under it. So MCP asks for the whole list.
+   */
+  readonly listLimit?: number;
 }
 
 /** A tool's arguments as parsed from the model's JSON — untrusted until the tool validates. */

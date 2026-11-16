@@ -155,7 +155,8 @@ const CODEFLOW_NOTE =
 function runClaude(question, arm) {
   const argv = [
     "-p", question.prompt,
-    "--output-format", "json",
+    "--output-format", "stream-json",
+    "--verbose",
     "--model", MODEL,
     "--strict-mcp-config",
     "--mcp-config", arm === "codeflow" ? mcpConfigPath : emptyMcpPath,
@@ -167,14 +168,26 @@ function runClaude(question, arm) {
   ];
   return new Promise((resolve) => {
     const started = Date.now();
-    execFile("claude", argv, { cwd: repo, maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 }, (error, stdout) => {
+    execFile("claude", argv, { cwd: repo, maxBuffer: 256 * 1024 * 1024, timeout: 15 * 60 * 1000 }, (error, stdout) => {
+      // stream-json: one event per line. Tool calls come from assistant messages; the final `result`
+      // event carries what `--output-format json` would (result, usage, cost, turns).
       let parsed = null;
-      try {
-        parsed = JSON.parse(stdout);
-      } catch {
-        parsed = null;
+      const tools = {};
+      for (const line of stdout.split("\n")) {
+        if (!line.startsWith("{")) continue;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (event.type === "assistant") {
+          for (const block of event.message?.content ?? []) {
+            if (block.type === "tool_use") tools[block.name] = (tools[block.name] ?? 0) + 1;
+          }
+        } else if (event.type === "result") parsed = event;
       }
-      resolve({ wallMs: Date.now() - started, error: error && !parsed ? String(error.message).slice(0, 300) : null, json: parsed });
+      resolve({ wallMs: Date.now() - started, error: error && !parsed ? String(error.message).slice(0, 300) : null, json: parsed, tools });
     });
   });
 }
@@ -235,6 +248,10 @@ for (const question of questions) {
       inputTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
       outputTokens: usage.output_tokens ?? null,
       costUsd: json.total_cost_usd ?? null,
+      toolCalls: run.tools ?? {},
+      codeflowCalls: Object.entries(run.tools ?? {})
+        .filter(([name]) => name.startsWith("mcp__codeflow"))
+        .reduce((sum, [, count]) => sum + count, 0),
       ...graded,
       error: run.error,
     };
@@ -242,7 +259,8 @@ for (const question of questions) {
     writeFileSync(path.join(OUT, `${rows.length}-${arm}.json`), JSON.stringify({ question, run: json, row }, null, 2));
     console.log(
       `${arm.padEnd(9)} ${question.id.slice(0, 60).padEnd(60)} P ${row.precision.toFixed(2)} R ${row.recall.toFixed(2)} ` +
-        `invented ${row.invented.length}  ${(row.wallMs / 1000).toFixed(0)}s  turns ${row.turns}  $${row.costUsd?.toFixed(3) ?? "?"}`,
+        `invented ${row.invented.length}  ${(row.wallMs / 1000).toFixed(0)}s  turns ${row.turns}  $${row.costUsd?.toFixed(3) ?? "?"}  ` +
+        `tools ${Object.entries(row.toolCalls).map(([name, count]) => `${name.replace("mcp__codeflow__", "cf:")}×${count}`).join(" ") || "none"}`,
     );
   }
 }
@@ -266,6 +284,8 @@ const summary = Object.fromEntries(
         medianSeconds: median(mine.map((row) => row.wallMs / 1000)),
         medianTurns: median(mine.map((row) => row.turns)),
         medianInputTokens: median(mine.map((row) => row.inputTokens)),
+        medianToolCalls: median(mine.map((row) => Object.values(row.toolCalls).reduce((a, b) => a + b, 0))),
+        runsUsingCodeflow: mine.filter((row) => row.codeflowCalls > 0).length,
         totalCostUsd: mine.reduce((sum, row) => sum + (row.costUsd ?? 0), 0),
       },
     ];

@@ -111,7 +111,7 @@ async function main(): Promise<void> {
 
   const server = new Server(
     { name: "codeflow", version: "0.0.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: core.instructions() },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: core.listTools() }));
