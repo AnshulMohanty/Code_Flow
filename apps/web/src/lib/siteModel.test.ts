@@ -248,14 +248,66 @@ describe("buildSiteModel — grounding is the run's REAL delivered scope", () =>
     expect(model.grounding.detail).toContain("AI stages did not run");
   });
 
-  it("PARTIAL surfaces a recorded degradation VERBATIM", () => {
+  it("PARTIAL surfaces a recorded degradation in PLAIN WORDS — never the operator's env-var advice", () => {
+    // The worker's `detail` is written for whoever runs the server ("Check MONGO_URI"). A visitor
+    // gets the same fact restated: the run is in memory only and will not be saved.
     const model = buildSiteModel(
       resultWith({
-        degradations: [{ reason: "mongo-unavailable", detail: "The database is unavailable, so this run is held in memory only." }],
+        degradations: [
+          {
+            reason: "mongo-unavailable",
+            detail: "The database is unavailable, so this run is held in memory only. Check MONGO_URI.",
+          },
+        ],
       }),
       meta,
     );
-    expect(model.grounding.detail).toContain("held in memory only");
+    expect(model.grounding.state).toBe("partial");
+    expect(model.grounding.detail).toContain("kept in memory only");
+    expect(model.grounding.detail).not.toContain("MONGO_URI");
+    expect(model.grounding.cause).toMatch(/storage down/i);
+  });
+
+  it("a MAP-ONLY run says the visitor chose it, and how to get the rest", () => {
+    const model = buildSiteModel(
+      resultWith({
+        runMode: "deterministic-only",
+        degradations: [{ reason: "map-only", detail: "withAi=false" }],
+        ai: undefined,
+        pipeline: {
+          status: "completed",
+          startedAt: "2026-08-31T00:00:00.000Z",
+          completedAt: "2026-08-31T00:00:05.000Z",
+          stages: [
+            stage("ingest", "completed", 620),
+            stage("connect", "completed", 940),
+            stage("synthesize", "skipped"),
+            stage("rag", "skipped"),
+          ],
+        },
+      }),
+      meta,
+    );
+    expect(model.grounding.state).toBe("partial");
+    expect(model.grounding.cause).toBe("map only — AI not requested");
+    expect(model.grounding.next).toMatch(/switch to Map \+ AI/i);
+    // The AI rows say "not requested", not "not configured" — the second would blame the server.
+    const embed = model.rows.find((row) => row.id === "embed")!;
+    expect(embed.status).toBe("skipped");
+    expect(embed.detail).toBe("map only — AI not requested");
+  });
+
+  it("drops warnings that name an environment variable, keeps the rest verbatim", () => {
+    const model = buildSiteModel(
+      resultWith({
+        warnings: [
+          "Synthesis skipped: set ANTHROPIC_API_KEY or GEMINI_API_KEY to enable it.",
+          "2 files over the size limit were skipped.",
+        ],
+      }),
+      meta,
+    );
+    expect(model.warnings).toEqual(["2 files over the size limit were skipped."]);
   });
 
   it("REFUSED when a required stage failed — nothing to cite from", () => {

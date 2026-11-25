@@ -23,6 +23,38 @@ export function tokensOf(actual: number | TokenUsage): number {
 const DEFAULT_UNIT: BudgetUnit = "chat";
 
 /**
+ * A daily ceiling: one number for every unit (the historical form), or one per unit. Chat and
+ * embedding tokens differ in price by ~20x, so a deployment on a small prepaid budget wants a tight
+ * chat ceiling and a looser embedding one; a unit left out falls back to `DAILY_LLM_BUDGET`.
+ */
+export type BudgetLimits = number | Partial<Record<BudgetUnit, number>>;
+
+function limitFor(limits: BudgetLimits, unit: BudgetUnit): number {
+  if (typeof limits === "number") return limits;
+  return limits[unit] ?? DAILY_LLM_BUDGET;
+}
+
+/** A positive whole number from an env string, else undefined (unset, blank, 0, junk). */
+function positiveTokens(raw: string | undefined): number | undefined {
+  if (!raw?.trim()) return undefined;
+  const value = Number(raw.trim().replace(/_/g, ""));
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * The daily ceilings from env: `DAILY_LLM_BUDGET` (chat tokens per UTC day) and
+ * `DAILY_EMBEDDING_BUDGET` (embedding tokens per UTC day). Unset ⇒ the `DAILY_LLM_BUDGET` constant
+ * for that unit, which is what every deployment got before these were configurable. Both the API
+ * and the worker call this, so they enforce the SAME numbers on the shared Redis counter.
+ */
+export function budgetLimitsFromEnv(env: Record<string, string | undefined>): Record<BudgetUnit, number> {
+  return {
+    chat: positiveTokens(env.DAILY_LLM_BUDGET) ?? DAILY_LLM_BUDGET,
+    embedding: positiveTokens(env.DAILY_EMBEDDING_BUDGET) ?? DAILY_LLM_BUDGET,
+  };
+}
+
+/**
  * In-memory `BudgetHandle` — the test/default implementation. Tracks cumulative tokens per
  * unit for the current UTC day and resets when the day rolls over. `now` is injectable so
  * tests can advance the UTC day deterministically.
@@ -31,7 +63,7 @@ const DEFAULT_UNIT: BudgetUnit = "chat";
  * `createRedisBudgetHandle` or the ceiling is enforced twice at half strength.
  */
 export function createInMemoryBudgetHandle(
-  limitTokens: number = DAILY_LLM_BUDGET,
+  limitTokens: BudgetLimits = DAILY_LLM_BUDGET,
   now: () => number = Date.now,
 ): BudgetHandle {
   let day = utcDay(now());
@@ -48,7 +80,7 @@ export function createInMemoryBudgetHandle(
   return {
     async check(estimatedTokens: number, unit: BudgetUnit = DEFAULT_UNIT): Promise<boolean> {
       rollover();
-      return (spentByUnit.get(unit) ?? 0) + estimatedTokens <= limitTokens;
+      return (spentByUnit.get(unit) ?? 0) + estimatedTokens <= limitFor(limitTokens, unit);
     },
     async record(actual: number | TokenUsage, unit: BudgetUnit = DEFAULT_UNIT): Promise<void> {
       rollover();
@@ -75,7 +107,7 @@ export interface BudgetRedisLike {
 }
 
 export interface RedisBudgetOptions {
-  limitTokens?: number;
+  limitTokens?: BudgetLimits;
   now?: () => number;
   /** Key namespace, so two deployments can share one Redis without colliding. */
   keyPrefix?: string;
@@ -124,7 +156,7 @@ export function createRedisBudgetHandle(
     async check(estimatedTokens: number, unit: BudgetUnit = DEFAULT_UNIT): Promise<boolean> {
       const spent = await readSpent(unit);
       if (spent === null) return true; // fail OPEN — documented above
-      return spent + estimatedTokens <= limitTokens;
+      return spent + estimatedTokens <= limitFor(limitTokens, unit);
     },
     async record(actual: number | TokenUsage, unit: BudgetUnit = DEFAULT_UNIT): Promise<void> {
       const amount = tokensOf(actual);

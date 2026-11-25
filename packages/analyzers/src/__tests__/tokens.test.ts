@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BudgetRedisLike } from "../budget/budgetHandle.js";
-import { createInMemoryBudgetHandle, createRedisBudgetHandle, tokensOf } from "../budget/budgetHandle.js";
+import { budgetLimitsFromEnv, createInMemoryBudgetHandle, createRedisBudgetHandle, tokensOf } from "../budget/budgetHandle.js";
+import { DAILY_LLM_BUDGET } from "@codeflow/config";
 import {
   estimateTokens,
   estimatedUsage,
@@ -222,5 +223,49 @@ describe("redis budget handle (the SHARED production ledger)", () => {
     const b = createRedisBudgetHandle(redis, { keyPrefix: "envB", now: () => 0 });
     await a.record(10, "chat");
     expect(await b.spent?.("chat")).toBe(0);
+  });
+});
+
+describe("daily ceilings from env (a small prepaid budget needs its own numbers)", () => {
+  it("reads DAILY_LLM_BUDGET for chat and DAILY_EMBEDDING_BUDGET for embeddings", () => {
+    expect(budgetLimitsFromEnv({ DAILY_LLM_BUDGET: "400000", DAILY_EMBEDDING_BUDGET: "3_000_000" })).toEqual({
+      chat: 400_000,
+      embedding: 3_000_000,
+    });
+  });
+
+  it("falls back to the constant for anything unset, blank, zero or junk", () => {
+    const fallback = { chat: DAILY_LLM_BUDGET, embedding: DAILY_LLM_BUDGET };
+    expect(budgetLimitsFromEnv({})).toEqual(fallback);
+    expect(budgetLimitsFromEnv({ DAILY_LLM_BUDGET: " ", DAILY_EMBEDDING_BUDGET: "0" })).toEqual(fallback);
+    expect(budgetLimitsFromEnv({ DAILY_LLM_BUDGET: "-5", DAILY_EMBEDDING_BUDGET: "lots" })).toEqual(fallback);
+  });
+
+  it("enforces each unit against its own ceiling (in-memory and Redis)", async () => {
+    const memory = createInMemoryBudgetHandle({ chat: 100, embedding: 1_000 });
+    await memory.record(90, "chat");
+    await memory.record(90, "embedding");
+    expect(await memory.check(20, "chat")).toBe(false);
+    expect(await memory.check(20, "embedding")).toBe(true);
+
+    const values = new Map<string, number>();
+    const redis: BudgetRedisLike = {
+      async incrby(key, amount) {
+        values.set(key, (values.get(key) ?? 0) + amount);
+        return values.get(key)!;
+      },
+      async get(key) {
+        return values.has(key) ? String(values.get(key)) : null;
+      },
+      async expire() {
+        return 1;
+      },
+    };
+    const shared = createRedisBudgetHandle(redis, { limitTokens: { chat: 100 } });
+    await shared.record(90, "chat");
+    await shared.record(90, "embedding");
+    expect(await shared.check(20, "chat")).toBe(false);
+    // A unit with no explicit ceiling keeps the historical default.
+    expect(await shared.check(20, "embedding")).toBe(true);
   });
 });

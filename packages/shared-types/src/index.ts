@@ -60,6 +60,12 @@ export interface AnalysisJobPayload {
   repositoryRef: RepositoryRef;
   commitSha: string;
   analyzerVersion: string;
+  /**
+   * Whether the visitor asked for the AI stages (onboarding guide + Q&A index). `false` is a
+   * "map only" run: the deterministic stages only, nothing spent. Absent means true, which is what
+   * every job queued before this field existed meant.
+   */
+  withAi?: boolean;
 }
 
 export interface AnalysisSummary {
@@ -924,6 +930,12 @@ export interface Rag {
   /** Chunks dropped by grounding (fileId not a node, or line range out of file).
    *  Omitted entirely when none (absent ≠ empty) — a non-zero count is a quality signal. */
   droppedChunks?: { count: number; fileIds: string[] };
+  /**
+   * Present when the index was CAPPED to a chunk budget (`MAX_INDEX_CHUNKS`): only the most
+   * connected files' chunks were embedded, so Q&A covers `indexedFiles` of `totalFiles`. Absent ⇒
+   * every chunk of every indexable file is in the index.
+   */
+  capped?: { chunkCap: number; totalChunks: number; indexedFiles: number; totalFiles: number };
   /** V3-P2: where the vectors + text for these chunks live. Absent ⇒ a pre-P2 inline index. */
   store?: RagStoreRef;
 }
@@ -1296,7 +1308,11 @@ export type DegradationReason =
   | "no-embedding-provider"
   | "mongo-unavailable"
   | "redis-unavailable"
-  | "budget-exhausted";
+  | "budget-exhausted"
+  /** The visitor chose "map only": the AI stages were not requested. */
+  | "map-only"
+  /** An AI stage ran and failed (provider error, credit exhausted); the map is complete. */
+  | "ai-unavailable";
 
 /** One reason this run delivered less than a full analysis. */
 export interface DegradationNotice {

@@ -5,6 +5,7 @@ import { getAnalysisById } from "../services/analysisCacheService.js";
 import { getAskHandler } from "../services/ragQaService.js";
 import { recordAnswerLatency } from "../services/answerLatency.js";
 import { ApiError } from "../middleware/errorHandler.js";
+import type { DailyCaps } from "../middleware/dailyCap.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
 /**
@@ -33,7 +34,7 @@ export type AskResponse = RagAnswer & {
  * per-IP rate limit (429) + the daily budget (honest "demo at capacity"). 404 for an unknown
  * job; a clear "Q&A unavailable" (not 500) when the run built no index. Non-streamed JSON.
  */
-export function askRouter(rateLimit: RequestHandler): Router {
+export function askRouter(rateLimit: RequestHandler, dailyCaps?: DailyCaps): Router {
   const router = Router();
 
   router.post(
@@ -65,6 +66,20 @@ export function askRouter(rateLimit: RequestHandler): Router {
       if (!cached.result.ai?.rag) {
         res.json(unavailable("Q&A is unavailable for this analysis (no searchable index was built — e.g. a deterministic-only or partial run)."));
         return;
+      }
+
+      // Charged only for a question that will reach the model: the "unavailable" answers above are
+      // free, so they do not use up a visitor's daily questions.
+      if (dailyCaps) {
+        const cap = await dailyCaps.consume("question", req.ip ?? "unknown");
+        if (!cap.allowed) {
+          throw new ApiError(
+            429,
+            "DAILY_LIMIT",
+            `You have asked today's ${cap.limit} questions. Questions reset at midnight UTC; the map stays available.`,
+            { limit: cap.limit, resetAt: cap.resetAt },
+          );
+        }
       }
 
       try {

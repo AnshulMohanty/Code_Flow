@@ -271,7 +271,7 @@ function geminiSystemInstruction(request: LlmCompletionRequest): Record<string, 
 
 export interface OpenAiClientOptions {
   apiKey: string;
-  /** Defaults to "gpt-4.1" — see DEFAULT_OPENAI_MODEL for why that tier and not a cheaper one. */
+  /** Defaults to "gpt-4.1-mini" — see DEFAULT_OPENAI_MODEL. */
   model?: string;
   /** Override for tests/proxies, and for an Azure/OpenRouter-compatible gateway. */
   baseUrl?: string;
@@ -281,10 +281,11 @@ export interface OpenAiClientOptions {
 }
 
 /**
- * The frontier default. Chosen to match what `SYNTHESIS_MODEL` means for Anthropic (the model whose
- * output a user reads), not the cheapest one that answers — `FAST_MODEL` is where cheap belongs.
+ * The mini tier by default: a hosted demo runs on a few dollars of prepaid credit, and gpt-4.1-mini
+ * costs a fifth of gpt-4.1 per token (OpenAI's price list, 2026-11-25: $0.40 in / $1.60 out per 1M)
+ * while keeping tool calling and JSON output. `OPENAI_MODEL=gpt-4.1` buys the larger model.
  */
-const DEFAULT_OPENAI_MODEL = "gpt-4.1";
+const DEFAULT_OPENAI_MODEL = "gpt-4.1-mini";
 /** Rows per completion when `maxTokens` is unset. Same number the Anthropic adapter defaults to. */
 const OPENAI_DEFAULT_MAX_TOKENS = 2048;
 

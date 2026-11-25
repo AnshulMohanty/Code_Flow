@@ -8,16 +8,18 @@
       name="description"
       content="Cartograph resolves a repository into a real dependency map, then answers questions with the file and line it read."
     />
-    <!-- The design's three voices: a heavy grotesque for display, a transitional serif italic for
-         asides, a monospace for data. Preconnected because a FOUT on 10rem display type is the most
-         visible layout shift on the page; every stack has a real system fallback in styles.css, so a
-         blocked font request degrades rather than breaks. -->
+    <!-- The design's four voices: Bricolage Grotesque for display (optical-size axis on, as the
+         design loads it — at 196px it draws the tighter display cut), Hanken Grotesk for body,
+         Spectral italic for asides, Martian Mono for data. Preconnected because a FOUT on display
+         type this large is the most visible layout shift on the page; every stack has a real system
+         fallback in styles.css, so a blocked font request degrades rather than breaks. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700;900&family=Newsreader:ital,wght@0,400;1,400;1,500&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Hanken+Grotesk:ital,wght@0,300..800;1,400&family=Martian+Mono:wght@300..700&family=Spectral:ital,wght@0,300;0,600;1,300&display=swap"
       rel="stylesheet"
     />
+    <meta name="theme-color" content="#F2EDE3" />
     <!-- Runtime config (API base URL) — overwritten by the container entrypoint at start.
          Loaded BEFORE the app bundle so window.__CODEFLOW_CONFIG__ is available. -->
     <script src="/config.js"></script>

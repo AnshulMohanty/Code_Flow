@@ -29,7 +29,7 @@ export interface DemoStripProps {
 export function DemoStrip({ onAnalyze, activeFullName, caption }: DemoStripProps) {
   return (
     <div className="demo-strip">
-      <p className="eyebrow demo-strip-caption">{caption ?? "Already indexed — open one instantly"}</p>
+      <p className="demo-strip-caption">{caption ?? "indexed — open one instantly:"}</p>
       <div className="demo-strip-items">
         {DEMO_REPOS.map((demo) => (
           <DemoButton
@@ -46,10 +46,20 @@ export function DemoStrip({ onAnalyze, activeFullName, caption }: DemoStripProps
 
 function DemoButton({ demo, active, onSelect }: { demo: DemoRepo; active: boolean; onSelect(): void }) {
   return (
-    <button type="button" className="demo-item" onClick={onSelect} aria-current={active} data-language={demo.language}>
+    <button
+      type="button"
+      className="demo-item"
+      onClick={onSelect}
+      aria-current={active}
+      data-language={demo.language}
+      title={`${demo.note} (${demo.language})`}
+    >
       <span className="demo-item-label">{demo.label}</span>
-      <span className="demo-item-note">{demo.note}</span>
-      <span className="demo-item-lang">{demo.language}</span>
+      {/* The fact about the repository, for a screen reader; sighted readers get it on hover. */}
+      <span className="demo-item-note sr-only">
+        {" "}
+        — {demo.note} {demo.language}.
+      </span>
     </button>
   );
 }

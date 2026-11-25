@@ -1,49 +1,20 @@
-# CodeFlow — Render Blueprint, FREE TIER.
+# CodeFlow — Render Blueprint for the hosted demo (2026-11-25).
 #
-# NOTHING HERE HAS BEEN APPLIED. Same status as render.yaml: this is the deployment described so it
-# can be reviewed. Creating the services and filling the secrets are owner steps; DESIGN.md
-# Appendix C is the walkthrough.
+# This mirrors the deployment that actually runs: ONE Docker web service (API + analysis worker in one
+# process) and ONE static site on Render, with the three data stores on external free tiers that do not
+# expire — MongoDB Atlas (M0), Neon (Postgres + pgvector) and Upstash (Redis). Render's own free
+# Postgres is deleted after 30 days and its free Key Value needs a card, which is why they are not
+# used here. DESIGN.md §3.5 is the step-by-step walkthrough.
 #
-# ── Why this file exists separately ───────────────────────────────────────────────────────────
+# PLAN CHOICE (the one decision that changes how the demo feels):
+#   free     $0. Sleeps after 15 min idle; the first visit wakes it in ~30–60 s (the site shows
+#            "Warming…" meanwhile). 0.1 CPU, so a live analysis is slow. Open the site a couple of
+#            minutes before showing it.
+#   starter  $7/month (render.com/pricing, 2026-11-25). Never sleeps, 0.5 CPU: answers instantly and
+#            analyses ~5x faster. Same 512 MB, so MAX_REPO_FILES stays the same.
 #
-# render.yaml is the RIGHT architecture: an API that scales on request volume and a worker that
-# scales on queue depth, separated so either can move without the other. It is also not deployable
-# for free — Render has no free `worker` service type — and an architecture nobody can run is not
-# better than one they can.
-#
-# So this is the same system folded into ONE web service, with the tradeoffs stated rather than
-# discovered. It is not a "lite" version: every stage, every guard and every grounding pass is
-# identical. What changes is the process topology.
-#
-# ── What you give up, in order of how much it will bother you ─────────────────────────────────
-#
-#  1. ONE EVENT LOOP for parsing and HTTP. Parsing is CPU-bound, so p99 on every endpoint gets worse
-#     while a job runs. Concurrency is forced to 1 in code (apps/api/src/config/embeddedWorker.ts)
-#     for exactly this reason, and WORKER_CONCURRENCY is ignored with a log line saying so.
-#  2. ALL-OR-NOTHING SCALING. More capacity means more copies of both halves — the coupling the
-#     split exists to remove.
-#  3. A WORKER CRASH TAKES THE API WITH IT. In split mode BullMQ re-delivers to another instance.
-#  4. THE FREE POSTGRES EXPIRES AFTER 30 DAYS. See the note on the database below; this is the one
-#     that arrives without warning.
-#
-# ── What is actually BETTER here, and it is not nothing ───────────────────────────────────────
-#
-# The API and the worker share a heap, so they can be handed the SAME retrieval store object. With
-# no Postgres, retrieval falls back to a per-process in-memory index — which in split mode means the
-# worker writes an index the API cannot read and every question is refused. In one process, Q&A
-# works with no database at all. It does not survive a restart, and /health says so
-# (`retrieval.mode: "memory"` with the reason).
-#
-# ── Cold start, and why there is no pinger ────────────────────────────────────────────────────
-#
-# A free web service sleeps after ~15 minutes idle and wakes in 30-50 seconds. The frontend is a
-# STATIC SITE, so it is always on and paints its whole shell with no API call; a real visitor's
-# first page load fires one `GET /health` that wakes the backend (apps/web/src/lib/useWake.ts).
-#
-# There is deliberately NO scheduled keep-alive. A 10-minute cron ping is ~4,300 requests a month
-# that hold the container RUNNING, which exhausts the free ~750 instance-hours and SUSPENDS the
-# service for the rest of the month — strictly worse than sleeping, because a suspended service does
-# not wake at all.
+# There is deliberately NO keep-alive pinger on the free plan: holding the container awake burns the
+# free ~750 instance-hours and Render then SUSPENDS the service for the rest of the month.
 
 services:
   # ── API + the analysis worker, in one process ───────────────────────────────────────────────
@@ -52,124 +23,99 @@ services:
     runtime: docker
     dockerfilePath: ./apps/api/Dockerfile
     dockerContext: .
-    plan: free
-    region: oregon
-    # /health, not /ready. Render restarts an instance that fails its health check, and /ready is
-    # 503 while warm-up loads the tree-sitter grammars — pointing the check there would restart
-    # every instance for being cold, forever.
+    plan: free # or "starter" — see PLAN CHOICE above
+    region: singapore # near the Atlas (Mumbai), Neon (Singapore) and Upstash (Mumbai) instances
+    # /health, not /ready: /ready is 503 while warm-up loads the parsers, and Render restarts an
+    # instance that fails its check — pointing it at /ready would restart every cold instance forever.
     healthCheckPath: /health
     envVars:
       - fromGroup: codeflow-shared
       - key: NODE_ENV
         value: production
-      # THE ONE LINE THAT MAKES THIS TOPOLOGY. Read by resolveEmbeddedWorker, which also forces
-      # concurrency to 1 and logs both facts at boot.
+      # Runs the BullMQ consumer inside this process (and forces job concurrency to 1).
       - key: RUN_WORKER_IN_PROCESS
         value: "true"
-      # API (≈ 110–150 MiB under load) and worker share 512 MB here; a job needs about 150 MiB + 30 KiB
-      # per file (measured), so refuse clones over 3,000 files rather than run out of memory mid-job.
+      # 512 MB is shared by the API (~110–150 MiB) and one job (≈150 MiB + 30 KiB per file, measured).
       - key: MAX_REPO_FILES
         value: "3000"
-      # PORT is assigned by Render and read by apps/api/src/config/port.ts. API_PORT is deliberately
-      # NOT set: it takes precedence, so setting it would bind a port the proxy is not routing to.
-      - key: POSTGRES_URL
-        fromDatabase:
-          name: codeflow-postgres-free
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: codeflow-keyvalue-free
-          property: connectionString
-      # Needs the static site's URL, which does not exist until the first deploy. Owner step.
-      - key: CORS_ORIGINS
-        sync: false
-      # Render terminates TLS in ONE proxy hop. Without this every visitor shares the proxy's IP,
-      # so the per-IP rate limit becomes one global bucket.
+      # Render terminates TLS in one proxy hop; without this every visitor shares one rate-limit bucket.
       - key: TRUST_PROXY_HOPS
         value: "1"
+      # The website's URL (it does not exist until its first deploy). Owner step.
+      - key: CORS_ORIGINS
+        sync: false
+      # PORT is assigned by Render. API_PORT must NOT be set: it wins over PORT and breaks routing.
 
-  # ── Web (static SPA) — free, always on, never sleeps ────────────────────────────────────────
+  # ── Website (static SPA) — free, always on ─────────────────────────────────────────────────
   - type: web
     name: codeflow-web
     runtime: static
-    # Only the two packages the SPA imports are built; `pnpm -r build` here would also build the
-    # api, the worker and the MCP server to produce a folder of static files.
-    # VITE_API_BASE_URL is set in the BUILD COMMAND, not in envVars: Render does not expand `$VAR`
-    # inside an envVar `value:`, so it would bake the literal string into the bundle.
+    # `npm install -g pnpm`, not `corepack enable`: Render's static builder has a read-only /usr/bin
+    # and corepack fails there with EROFS. Only the two packages the SPA imports are built.
+    # VITE_API_BASE_URL is baked in at BUILD time, so changing it needs "Clear build cache & deploy".
     buildCommand: >-
-      corepack enable &&
+      npm install -g pnpm@9.15.4 &&
       pnpm install --frozen-lockfile &&
       pnpm --filter @codeflow/shared-types --filter @codeflow/config build &&
-      VITE_API_BASE_URL="https://$CODEFLOW_API_HOST"
       pnpm --filter @codeflow/web build
     staticPublishPath: apps/web/dist
     pullRequestPreviewsEnabled: false
     envVars:
-      - key: CODEFLOW_API_HOST
+      # The API's public URL, no trailing slash, e.g. https://code-flow-8r09.onrender.com
+      - key: VITE_API_BASE_URL
         sync: false
     routes:
-      # SPA fallback. Every unmatched path is the app's own router's problem, not a 404.
       - type: rewrite
         source: /*
         destination: /index.html
 
-  # ── Redis — the queue, the shared rate limit, the shared daily budget ───────────────────────
-  - type: keyvalue
-    name: codeflow-keyvalue-free
-    plan: free
-    region: oregon
-    # REQUIRED, not tuning. BullMQ keeps job state in Redis; under any `allkeys-*` policy the store
-    # evicts keys when it fills and jobs vanish mid-flight with no error anywhere.
-    maxmemoryPolicy: noeviction
-    ipAllowList: []
-
-databases:
-  # ── Postgres + pgvector — the Q&A index ─────────────────────────────────────────────────────
-  #
-  # RENDER'S FREE POSTGRES EXPIRES AFTER 30 DAYS and is then deleted. That is not a footnote: on day
-  # 31 POSTGRES_URL points at nothing, `createRetrievalStores` degrades to an in-memory index and
-  # SAYS SO on /health, and — because this topology runs both halves in one process — Q&A keeps
-  # working from that in-memory index rather than failing. It stops surviving restarts, which is a
-  # real loss and a survivable one.
-  #
-  # pgvector needs 15+. The extension is created by the APPLICATION, not here:
-  # `createPgvectorStore.ensureSchema()` runs CREATE EXTENSION IF NOT EXISTS vector and the
-  # dimension-typed table on first use.
-  - name: codeflow-postgres-free
-    plan: free
-    region: oregon
-    postgresMajorVersion: "16"
-    ipAllowList: []
-
-# MongoDB is NOT here. Atlas M0 is free forever and external; `MONGO_URI` is a secret the owner
-# fills in the shared env group. Create the cluster FIRST — the API refuses to boot without it.
 envVarGroups:
   - name: codeflow-shared
     envVars:
-      - key: MONGO_URI
+      # ── Data stores (external free tiers) ────────────────────────────────────────────────
+      - key: MONGO_URI # Atlas SRV URI ending in /codeflow; Network Access must allow 0.0.0.0/0
         sync: false
-      # One Gemini key powers both chat and embeddings, which is the cheapest configuration and the
-      # reason it is the documented default. The two roles are INDEPENDENT, so this is a pin and not
-      # a limit: LLM_PROVIDER also takes anthropic / openai and EMBEDDING_PROVIDER also takes
-      # voyage / openai, each reading its own key. Changing the EMBEDDING one changes the pgvector
-      # table (codeflow_vectors_<dim>: gemini 768, voyage 1024, openai 1536 or 3072), so the existing
-      # index does not transfer and repositories need re-analysing in the new space.
+      - key: POSTGRES_URL # Neon connection string with sslmode=require
+        sync: false
+      - key: REDIS_URL # Upstash TCP URL: rediss://default:<password>@<host>:6379?family=0
+        sync: false
+      # ── AI: one OpenAI key powers chat and embeddings. Leave the key unset for "map only". ──
+      - key: OPENAI_API_KEY
+        sync: false
       - key: LLM_PROVIDER
-        value: gemini
+        value: openai
       - key: EMBEDDING_PROVIDER
-        value: gemini
-      - key: GEMINI_API_KEY
-        sync: false
-      # OFF on free, deliberately. The fan-out is 5N+1 provider calls where the single-shot stage is
-      # 1 — the right trade for a real onboarding guide and the wrong one for a free demo. Turning it
-      # on is a single variable; see DESIGN.md.
+        value: openai
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      # ── Spending guards for a few dollars of prepaid credit (the hard cap is the credit itself,
+      #    with auto-recharge OFF on platform.openai.com) ──────────────────────────────────────
+      # Chat tokens per UTC day for ALL visitors: ≈ $0.25/day at most on gpt-4.1-mini.
+      - key: DAILY_LLM_BUDGET
+        value: "400000"
+      # Embedding tokens per UTC day: ≈ $0.06/day on text-embedding-3-small.
+      - key: DAILY_EMBEDDING_BUDGET
+        value: "3000000"
+      # Per visitor per UTC day. "Map only" analyses are free and never capped.
+      - key: DAILY_AI_ANALYSES_PER_IP
+        value: "5"
+      - key: DAILY_QUESTIONS_PER_IP
+        value: "25"
+      # Q&A index size per analysis. Uncapped, a ~2,800-file repository ran the 512 MB instance out of
+      # heap; capped at 4,000 chunks it peaked at 316 MiB (measured 2026-11-25). Over the cap, the most
+      # connected files are indexed first and the result says how much of the repository Q&A covers.
+      - key: MAX_INDEX_CHUNKS
+        value: "4000"
+      # The vectors already live in Postgres; a second copy per chunk in Mongo (~20 KB each) would fill
+      # the free 512 MB Atlas cluster after a few repositories.
+      - key: EMBEDDING_CACHE
+        value: "false"
+      # Dollar figures for runs (OpenAI's list prices on 2026-11-25; update if they change).
+      - key: LLM_PRICING
+        value: '{"gpt-4.1-mini":{"inputPerMillion":0.4,"outputPerMillion":1.6,"cacheReadPerMillion":0.1},"text-embedding-3-small":{"inputPerMillion":0.02,"outputPerMillion":0}}'
+      # Off on purpose: the multi-agent guide is 5N+1 model calls instead of 1, and parallel stages
+      # buy nothing on a fraction of a CPU.
       - key: FANOUT_SYNTHESIS
         value: "false"
-      # Also off: it touches the deterministic spine, and on a 0.1-CPU free instance there is no
-      # parallelism to win anyway.
       - key: PARALLEL_STAGES
         value: "false"
-      # Set it to turn `usd: null` into a real number. Format and current values in DESIGN.md (Deploy).
-      - key: LLM_PRICING
-        sync: false

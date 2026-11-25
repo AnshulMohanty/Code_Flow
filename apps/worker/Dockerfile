@@ -9,7 +9,9 @@ RUN corepack enable
 WORKDIR /repo
 COPY . .
 RUN pnpm install --frozen-lockfile
-RUN pnpm -r build
+# Only this app and the workspace packages it depends on ("..."), one at a time: a parallel build
+# raced on the shared packages' dist folders (CI moved to serial for the same reason).
+RUN pnpm --filter "@codeflow/worker..." --workspace-concurrency=1 build
 RUN pnpm --filter=@codeflow/worker deploy --prod /prod
 
 FROM node:20-slim AS runtime

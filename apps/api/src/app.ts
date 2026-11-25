@@ -1,5 +1,5 @@
 import express from "express";
-import { analyzeRouter } from "./routes/analyze.js";
+import { createAnalyzeRouter } from "./routes/analyze.js";
 import { healthRouter } from "./routes/health.js";
 import { metaRouter } from "./routes/meta.js";
 import { jobsRouter } from "./routes/jobs.js";
@@ -9,6 +9,7 @@ import { errorHandler } from "./middleware/errorHandler.js";
 import { notFound } from "./middleware/notFound.js";
 import { createRateLimitMiddleware, type RateLimitOptions } from "./middleware/rateLimit.js";
 import { createCorsMiddleware } from "./middleware/cors.js";
+import { createDailyCaps, type DailyCaps } from "./middleware/dailyCap.js";
 
 export interface CreateAppOptions {
   /** Per-IP rate-limit config (Guard 4). Defaults to an in-memory store + @codeflow/config
@@ -22,6 +23,9 @@ export interface CreateAppOptions {
    * count, never `true`: trusting every hop lets a client pick its own IP via X-Forwarded-For.
    */
   trustProxyHops?: number;
+  /** Per-visitor daily caps on AI analyses and questions. Defaults to env
+   *  (`DAILY_AI_ANALYSES_PER_IP`, `DAILY_QUESTIONS_PER_IP`) on the rate limiter's store. */
+  dailyCaps?: DailyCaps;
 }
 
 /** `TRUST_PROXY_HOPS` → a hop count; anything that is not a whole number ≥ 0 means 0 (trust nothing). */
@@ -43,15 +47,17 @@ export function createApp(options: CreateAppOptions = {}) {
   // Guard 4 — per-IP rate limit on the SPENDING endpoints (analyze enqueue + ask), sharing one
   // store so a caller's budget is consistent across both. Reads (health/results/jobs) are free.
   const rateLimit = createRateLimitMiddleware(options.rateLimit);
+  const dailyCaps =
+    options.dailyCaps ?? createDailyCaps(options.rateLimit?.store ? { store: options.rateLimit.store } : {});
 
   app.use(healthRouter);
   // Read-only chrome facts (version, build, measured p50, real recents). Not rate-limited: it spends
   // nothing, and the UI reads it on every page load.
-  app.use(metaRouter);
+  app.use(metaRouter(dailyCaps.limits));
   app.use("/api/analyze", rateLimit);
-  app.use(analyzeRouter);
+  app.use(createAnalyzeRouter(dailyCaps));
   app.use(jobsRouter);
-  app.use(askRouter(rateLimit)); // POST /api/result/:id/ask (rate-limited)
+  app.use(askRouter(rateLimit, dailyCaps)); // POST /api/result/:id/ask (rate-limited)
   app.use(resultsRouter);
 
   app.use(notFound);

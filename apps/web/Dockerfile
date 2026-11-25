@@ -10,7 +10,9 @@ RUN corepack enable
 WORKDIR /repo
 COPY . .
 RUN pnpm install --frozen-lockfile
-RUN pnpm -r build
+# Only this app and the workspace packages it depends on ("..."), one at a time: a parallel build
+# raced on the shared packages' dist folders (CI moved to serial for the same reason).
+RUN pnpm --filter "@codeflow/web..." --workspace-concurrency=1 build
 # → apps/web/dist (static SPA, incl. the default public/config.js)
 
 FROM nginx:1.27-alpine AS runtime

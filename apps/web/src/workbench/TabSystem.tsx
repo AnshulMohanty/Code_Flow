@@ -1,15 +1,20 @@
 import type { AnalysisResult, FileRole } from "@codeflow/shared-types";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   ARCHITECTURE_RULES,
   CONTAINER_LANES,
   LANE_LABELS,
   LANE_NOTES,
   assignLanes,
+  buildAdjacency,
   classifyEdges,
+  hopTieredDependents,
   type ContainerLane,
   type LaneMatch,
 } from "../lib/architecture";
+import { BOARD_H, BOARD_W, buildSystemDiagram, placeLabels, type SystemDiagram } from "../lib/systemDiagram";
+import { edgeKey } from "../lib/radial";
+import { heroLabel } from "../lib/heroGraph";
 import type { GraphModel } from "../lib/graphModel";
 import { moduleLabel } from "../lib/citation";
 import { count } from "../lib/siteModel";
@@ -38,6 +43,8 @@ export interface TabSystemProps {
   graph: GraphModel;
   selectedId: string | null;
   onSelect(fileId: string | null): void;
+  /** Click-through from a container box to TAB 03 for that module — the design's "click for impact". */
+  onOpenImpact?(fileId: string): void;
 }
 
 /** Modules listed per lane. Render-only — the lane's COUNT is always the full one. */
@@ -53,7 +60,7 @@ const LANE_RENDER_CAP = 14;
  */
 const SHOWN_ROLES: FileRole[] = ["source", "build", "config", "test", "docs"];
 
-export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProps) {
+export function TabSystem({ result, graph, selectedId, onSelect, onOpenImpact }: TabSystemProps) {
   const roleCounts = useMemo(() => {
     const tally = new Map<string, number>();
     for (const file of result.structure?.files ?? []) {
@@ -81,6 +88,35 @@ export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProp
   );
 
   const classified = useMemo(() => classifyEdges(graph, lanes), [graph, lanes]);
+
+  const adjacency = useMemo(() => buildAdjacency(graph), [graph]);
+  const diagram = useMemo(() => {
+    const cache = new Map<string, number>();
+    const downstream = (fileId: string) => {
+      let value = cache.get(fileId);
+      if (value === undefined) {
+        value = hopTieredDependents(adjacency, fileId).total;
+        cache.set(fileId, value);
+      }
+      return value;
+    };
+    // One specifier per pair; a value import wins over a type-only one, because it is the import
+    // that actually loads the module.
+    const specifiers = new Map<string, { specifier?: string; typeOnly?: boolean }>();
+    for (const edge of result.graph?.edges ?? []) {
+      const key = edgeKey(edge.from, edge.to);
+      const existing = specifiers.get(key);
+      if (!existing || (existing.typeOnly && !edge.typeOnly)) {
+        specifiers.set(key, { specifier: edge.specifier, typeOnly: edge.typeOnly });
+      }
+    }
+    return buildSystemDiagram({
+      lanes,
+      edges: classified.edges,
+      downstream,
+      specifier: (from, to) => specifiers.get(edgeKey(from, to)),
+    });
+  }, [adjacency, classified, lanes, result]);
 
   const fan = useMemo(() => {
     const inbound = new Map<string, number>();
@@ -136,7 +172,7 @@ export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProp
       </p>
       <div className="wb-head">
         <h2 className="display display-m">
-          {repoName(result)} — as built<span className="dot" aria-hidden="true" />
+          {repoName(result)} — as built
         </h2>
         <p className="wb-head-note">
           {count(graph.nodeCount)} modules · {rendered.length} lanes
@@ -162,6 +198,14 @@ export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProp
         )}
       </div>
 
+      <SystemBoard
+        diagram={diagram}
+        selectedId={selectedId}
+        onOpen={(fileId) => (onOpenImpact ? onOpenImpact(fileId) : onSelect(fileId))}
+      />
+
+      {/* Narrow screens: the same lanes as a list. The board needs ~1100px to be legible, and a
+          diagram you must pan sideways on a phone is worse than an honest list of the same facts. */}
       <div className="c4" data-selected={selectedId !== null}>
         {rendered.map((lane) => {
           const members = lanes.byLane.get(lane) ?? [];
@@ -256,6 +300,147 @@ export function TabSystem({ result, graph, selectedId, onSelect }: TabSystemProp
         these are available on every run — including one with no provider key.
       </p>
     </>
+  );
+}
+
+const LANE_HUES: Record<ContainerLane, string> = {
+  "clients-entry": "#6B5B45",
+  "edge-transport": "#8C4038",
+  application: "#41626A",
+  "domain-engine": "#37484F",
+  "data-configuration": "#4F4A38",
+  "platform-libraries": "#42504A",
+  unclassified: "#4A423C",
+};
+
+/**
+ * The routed board. Hovering or focusing a box isolates every link it has among the shown modules;
+ * clicking opens it on IMPACT. Boxes are real buttons, so the board is fully keyboard-operable.
+ */
+function SystemBoard({
+  diagram,
+  selectedId,
+  onOpen,
+}: {
+  diagram: SystemDiagram;
+  selectedId: string | null;
+  onOpen(fileId: string): void;
+}) {
+  const [hovered, setHovered] = useState<string | null>(null);
+  const onBoard = (id: string | null) => (id && diagram.boxes.some((box) => box.id === id) ? id : null);
+  const focus = onBoard(hovered) ?? onBoard(selectedId);
+  const visible = useMemo(
+    () => (focus ? diagram.links.filter((link) => link.from === focus || link.to === focus) : diagram.links.filter((link) => link.primary)),
+    [diagram, focus],
+  );
+  const labels = useMemo(() => placeLabels(diagram, visible), [diagram, visible]);
+  const labelByLink = new Map(labels.map((label) => [`${label.from}>${label.to}`, label]));
+  const linked = new Set<string>();
+  if (focus) {
+    linked.add(focus);
+    for (const link of visible) {
+      linked.add(link.from);
+      linked.add(link.to);
+    }
+  }
+  const pct = (value: number, of: number) => `${((value / of) * 100).toFixed(3)}%`;
+  const primaryCount = diagram.links.filter((link) => link.primary).length;
+
+  return (
+    <div className="sysmap-wrap">
+      <div className="sysmap-scroll">
+        <div className="sysmap" data-focus={focus !== null}>
+          <svg viewBox={`0 0 ${BOARD_W} ${BOARD_H}`} preserveAspectRatio="none" aria-hidden="true" className="sysmap-svg">
+            {diagram.groups.map((group) => (
+              <rect key={group.lane} className="sysmap-frame" x={group.x} y={group.y} width={group.w} height={group.h} rx={4} />
+            ))}
+            {visible.map((link) => (
+              <g key={`${link.from}>${link.to}`} className="sysmap-link" data-class={link.cls} data-isolated={focus !== null}>
+                <path d={link.d} />
+                <circle cx={link.head.x} cy={link.head.y} r={3} />
+              </g>
+            ))}
+          </svg>
+
+          {diagram.groups.map((group) => (
+            <div
+              key={group.lane}
+              className="sysmap-group-title"
+              style={{ left: pct(group.x + 10, BOARD_W), top: pct(group.y + 8, BOARD_H), width: pct(group.w - 20, BOARD_W) }}
+            >
+              <span>{LANE_LABELS[group.lane]}</span>
+              <span className="sysmap-group-meta">
+                {group.shown < group.total ? `top ${count(group.shown)} of ${count(group.total)}` : `${count(group.total)}`}
+              </span>
+            </div>
+          ))}
+
+          {visible.map((link) => {
+            const label = labelByLink.get(`${link.from}>${link.to}`);
+            if (!label) return null;
+            return (
+              <span
+                key={`label:${link.from}>${link.to}`}
+                className="sysmap-label"
+                data-class={link.cls}
+                data-isolated={focus !== null}
+                style={{ left: pct(label.x, BOARD_W), top: pct(label.y, BOARD_H) }}
+                aria-hidden="true"
+              >
+                {link.label}
+              </span>
+            );
+          })}
+
+          {diagram.boxes.map((box) => {
+            const isFocus = box.id === focus;
+            const dimmed = focus !== null && !linked.has(box.id);
+            return (
+              <button
+                type="button"
+                key={box.id}
+                className="sysmap-box"
+                data-focus={isFocus}
+                data-dim={dimmed}
+                data-selected={box.id === selectedId}
+                style={{
+                  left: pct(box.x, BOARD_W),
+                  top: pct(box.y, BOARD_H),
+                  width: pct(box.w, BOARD_W),
+                  height: pct(box.h, BOARD_H),
+                  borderLeftColor: LANE_HUES[box.lane],
+                }}
+                onMouseEnter={() => setHovered(box.id)}
+                onMouseLeave={() => setHovered(null)}
+                onFocus={() => setHovered(box.id)}
+                onBlur={() => setHovered(null)}
+                onClick={() => onOpen(box.id)}
+                title={box.id}
+                aria-label={`${box.id}: ${count(box.downstream)} modules downstream. Open impact.`}
+              >
+                <span className="sysmap-box-top">
+                  <span className="sysmap-box-name">{heroLabel(box.id)}</span>
+                  <span className="sysmap-box-blast" data-heavy={box.downstream >= 12}>
+                    ↯{count(box.downstream)}
+                  </span>
+                </span>
+                <span className="sysmap-box-sub">{box.id}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <p className="sysmap-notes">
+        <span>↯ = modules downstream of a change here</span>
+        <span>
+          {focus
+            ? `${count(visible.length)} link${visible.length === 1 ? "" : "s"} of ${heroLabel(focus)} among the modules shown`
+            : `${count(primaryCount)} of ${count(diagram.candidateCount)} links between the modules shown are drawn`}
+        </span>
+        <span>labels are the import specifier as written</span>
+        <span>hover or focus a container to isolate its links · click for impact</span>
+      </p>
+    </div>
   );
 }
 

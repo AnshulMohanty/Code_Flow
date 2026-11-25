@@ -1,4 +1,5 @@
 import type { GraphModel, GraphModelNode } from "./graphModel";
+import { heroLabel } from "./heroGraph";
 
 /**
  * RADIAL LAYOUT — "RINGS = HOW FOUNDATIONAL" (V3-FINAL).
@@ -36,6 +37,8 @@ export interface RadialNode {
   role: string;
   /** Shown as a text label. Only the most foundational few get one; the rest would be unreadable. */
   labelled: boolean;
+  /** Which side of the dot the label sits on: outward from the centre, so labels fan out. */
+  labelAnchor: "start" | "end";
 }
 
 export interface RadialEdge {
@@ -56,8 +59,8 @@ export interface RadialLayout {
 
 /** Rings, including the centre. More than this and the outer rings crowd. */
 export const RADIAL_RINGS = 5;
-/** How many nodes get a text label. The most foundational ones — the rest are dots. */
-export const RADIAL_LABELS = 6;
+/** How many nodes get a text label. The most foundational ones that have room — the rest are dots. */
+export const RADIAL_LABELS = 8;
 /** Nodes drawn. Beyond this the picture stops being readable; the count shown is always the FULL
  *  one, so "31 modules" never becomes "31 modules, some of which we drew". */
 export const RADIAL_MAX_NODES = 64;
@@ -84,16 +87,18 @@ export function radialLayout(model: GraphModel, size = 560): RadialLayout {
   );
   const drawn = ranked.slice(0, RADIAL_MAX_NODES);
 
-  // Ring by RANK, in equal-sized bands. Rank rather than raw fan-in because one hub with 200
-  // importers would otherwise put every other module on the rim and the rings would encode nothing.
-  const perRing = Math.max(1, Math.ceil(drawn.length / RADIAL_RINGS));
+  // Ring by RANK. Rank rather than raw fan-in because one hub with 200 importers would otherwise put
+  // every other module on the rim and the rings would encode nothing. Ring k takes a share
+  // proportional to k+1: an outer ring has more circumference, so equal bands would crowd the
+  // centre into one blot and leave the rim sparse.
+  const weightSum = (RADIAL_RINGS * (RADIAL_RINGS + 1)) / 2;
   const byRing = new Map<number, GraphModelNode[]>();
-  drawn.forEach((node, index) => {
-    const ring = Math.min(RADIAL_RINGS - 1, Math.floor(index / perRing));
-    const bucket = byRing.get(ring) ?? [];
-    bucket.push(node);
-    byRing.set(ring, bucket);
-  });
+  let cursor = 0;
+  for (let ring = 0; ring < RADIAL_RINGS && cursor < drawn.length; ring++) {
+    const size = ring === RADIAL_RINGS - 1 ? drawn.length - cursor : Math.max(1, Math.round((drawn.length * (ring + 1)) / weightSum));
+    byRing.set(ring, drawn.slice(cursor, cursor + size));
+    cursor += size;
+  }
 
   const nodes: RadialNode[] = [];
   const position = new Map<string, { x: number; y: number }>();
@@ -101,7 +106,7 @@ export function radialLayout(model: GraphModel, size = 560): RadialLayout {
   for (const [ring, members] of [...byRing.entries()].sort((a, b) => a[0] - b[0])) {
     // The centre ring sits at a small non-zero radius: stacking several nodes at the exact centre
     // would overlap them into one dot and lose the thing the middle is meant to show.
-    const radius = ring === 0 ? maxRadius * 0.1 : (maxRadius * (ring + 0.55)) / RADIAL_RINGS;
+    const radius = ringRadius(ring, maxRadius);
     members.forEach((node, index) => {
       // A per-ring angular offset so adjacent rings do not line up into visual spokes.
       const angle = (index / members.length) * Math.PI * 2 - Math.PI / 2 + ring * 0.35;
@@ -111,18 +116,36 @@ export function radialLayout(model: GraphModel, size = 560): RadialLayout {
       const inbound = fanIn.get(node.id) ?? 0;
       nodes.push({
         id: node.id,
-        label: node.name,
+        label: heroLabel(node.path),
         ring,
         angle,
         x,
         y,
-        radius: 2.6 + Math.min(5.4, Math.sqrt(inbound) * 1.5),
+        radius: 4 + Math.min(6, Math.sqrt(inbound) * 1.6),
         fanIn: inbound,
         fanOut: fanOut.get(node.id) ?? 0,
         role: node.role,
-        labelled: nodes.length < RADIAL_LABELS,
+        labelled: false,
+        labelAnchor: Math.cos(angle) >= 0 ? "start" : "end",
       });
     });
+  }
+
+  // Labels: the most foundational nodes, in rank order, each only if its label box clears every
+  // label already placed — a pile of overlapping names in the centre reads as nothing at all.
+  const boxes: Array<{ x: number; y: number; w: number }> = [];
+  for (const node of nodes) {
+    if (boxes.length >= RADIAL_LABELS) break;
+    // Label width in layout units: 12px Martian Mono advances ~7.9 units a character.
+    const w = node.label.length * 7.9 + 4;
+    const x = node.labelAnchor === "start" ? node.x + node.radius + 5 : node.x - node.radius - 5 - w;
+    const clear =
+      x > 4 &&
+      x + w < size - 4 &&
+      boxes.every((box) => x + w + 6 < box.x || x > box.x + box.w + 6 || Math.abs(node.y - box.y) > 16);
+    if (!clear) continue;
+    boxes.push({ x, y: node.y, w });
+    node.labelled = true;
   }
 
   const drawnIds = new Set(nodes.map((node) => node.id));
@@ -145,11 +168,14 @@ export function radialLayout(model: GraphModel, size = 560): RadialLayout {
       };
     });
 
-  const rings = Array.from({ length: RADIAL_RINGS }, (_, ring) =>
-    ring === 0 ? maxRadius * 0.1 : (maxRadius * (ring + 0.55)) / RADIAL_RINGS,
-  );
+  const rings = [...byRing.keys()].map((ring) => ringRadius(ring, maxRadius));
 
   return { nodes, edges, rings, size };
+}
+
+/** Ring 0 sits off the exact centre so its few nodes do not stack into one dot. */
+function ringRadius(ring: number, maxRadius: number): number {
+  return ring === 0 ? maxRadius * 0.17 : maxRadius * (0.17 + (0.83 * ring) / (RADIAL_RINGS - 1));
 }
 
 /** One decimal. Keeps the emitted path short and — more usefully — byte-identical across runs. */

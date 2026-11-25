@@ -7,6 +7,7 @@ import {
   createOrientStage,
   createRagStage,
   createSynthesizeStage,
+  lacksAvailableAi,
   runPipeline,
   type CachedAnalysisLookup,
   type EmbeddingClient,
@@ -57,6 +58,10 @@ export interface PipelineJobDependencies {
   /** Guard 1 caps (default: MAX_FILES / MAX_BYTES). Size them to the worker's memory — see .env.example. */
   maxRepoFiles?: number;
   maxRepoBytes?: number;
+  /** Q&A index chunk cap (MAX_INDEX_CHUNKS). Unset ⇒ no cap. */
+  maxIndexChunks?: number;
+  /** false ⇒ skip the per-chunk embedding cache (EMBEDDING_CACHE=false). Default true. */
+  embeddingCache?: boolean;
   /** Guard 5 — global daily LLM-spend ceiling, passed to the AI stages via ctx.budget. */
   budget?: BudgetHandle;
   /** SSE replay buffer (#20): every emitted ProgressEvent + the terminal done is appended
@@ -129,9 +134,13 @@ export interface PipelineJobOutcome {
 /** Human-readable note per skippable AI stage, appended to result.warnings. */
 const AI_STAGE_NOTES: Record<"synthesize" | "rag", string> = {
   synthesize:
-    'AI stage "synthesize" was skipped: no chat provider configured (set ANTHROPIC_API_KEY or GEMINI_API_KEY). The onboarding guide is unavailable; the deterministic analysis is complete.',
-  rag: 'AI stage "rag" was skipped: no embedding provider configured (set VOYAGE_API_KEY or GEMINI_API_KEY). Ask-the-repo Q&A is unavailable; the deterministic analysis is complete.',
+    'AI stage "synthesize" was skipped: this server has no chat provider configured (LLM_PROVIDER and its key). The onboarding guide is unavailable; the map is complete.',
+  rag: 'AI stage "rag" was skipped: this server has no embedding provider configured (EMBEDDING_PROVIDER and its key). Ask-the-repo Q&A is unavailable; the map is complete.',
 };
+
+/** The note for a run where the visitor chose "map only" (2026-11-25): skipped by request, not by
+ *  configuration, so it must not tell anyone to set a key. */
+const MAP_ONLY_NOTE = "Map-only run: the AI stages (onboarding guide and Q&A index) were not requested, so nothing was spent. The map is complete.";
 
 /**
  * Which AI stages produced nothing because their provider was never configured?
@@ -142,10 +151,10 @@ const AI_STAGE_NOTES: Record<"synthesize" | "rag", string> = {
  * from "never going to run"; without it stages 7-8 sit at "pending" forever while the run
  * reports "completed".
  */
-function skippedAiStages(deps: PipelineJobDependencies, result: AnalysisResult): PipelineStageId[] {
+function skippedAiStages(deps: PipelineJobDependencies, result: AnalysisResult, withAi: boolean): PipelineStageId[] {
   const skipped: PipelineStageId[] = [];
-  if (!deps.synthesisClient && !result.ai?.synthesis) skipped.push("synthesize");
-  if (!deps.embeddingClient && !result.ai?.rag) skipped.push("rag");
+  if ((!withAi || !deps.synthesisClient) && !result.ai?.synthesis) skipped.push("synthesize");
+  if ((!withAi || !deps.embeddingClient) && !result.ai?.rag) skipped.push("rag");
   return skipped;
 }
 
@@ -169,10 +178,26 @@ const AI_STAGE_DEGRADATION: Record<"synthesize" | "rag", DegradationReason> = {
 function classifyRun(
   skippedStages: PipelineStageId[],
   statusReason: PipelineStatusReason | undefined,
+  options: { mapOnly?: boolean; failedAiStages?: PipelineStageId[] } = {},
 ): { runMode: RunMode; degradations: DegradationNotice[] } {
-  const degradations: DegradationNotice[] = skippedStages
-    .filter((stage): stage is "synthesize" | "rag" => stage === "synthesize" || stage === "rag")
-    .map((stage) => ({ reason: AI_STAGE_DEGRADATION[stage], detail: AI_STAGE_NOTES[stage] }));
+  const skippedAi = skippedStages.filter((stage): stage is "synthesize" | "rag" => stage === "synthesize" || stage === "rag");
+  const degradations: DegradationNotice[] = options.mapOnly
+    ? skippedAi.length
+      ? [{ reason: "map-only", detail: MAP_ONLY_NOTE }]
+      : []
+    : skippedAi.map((stage) => ({ reason: AI_STAGE_DEGRADATION[stage], detail: AI_STAGE_NOTES[stage] }));
+
+  // An AI stage that RAN and FAILED (a provider error, an exhausted prepaid credit) leaves the run
+  // "partial" with the map intact. Without its own reason it read as a full run in the UI, which then
+  // offered a guide and Q&A that did not exist.
+  if (options.failedAiStages?.length) {
+    degradations.push({
+      reason: "ai-unavailable",
+      detail: `AI stage${options.failedAiStages.length === 1 ? "" : "s"} ${options.failedAiStages.join(", ")} failed, so ${
+        options.failedAiStages.includes("rag") ? "Q&A is unavailable for this run" : "the onboarding guide is unavailable"
+      }. The map is complete.`,
+    });
+  }
 
   if (statusReason === "budget-exhausted") {
     degradations.push({
@@ -214,10 +239,16 @@ export async function runAnalysisJob(
     },
   };
 
+  // `withAi: false` is a "map only" run: the AI stages are not registered at all, so nothing is spent.
+  const withAi = payload.withAi !== false;
   const cacheLookup: CachedAnalysisLookup = {
     findCached: async ({ commitSha }) => {
       const cached = await deps.service.findCachedAnalysis({ payload: { ...payload, commitSha }, commitSha });
-      return cached?.result ?? null;
+      if (!cached) return null;
+      // A map-only result is a miss for an AI request this worker can serve (re-saved under the same
+      // key, so the next AI request is a hit). A map request accepts any result.
+      const available = { chat: Boolean(deps.synthesisClient), embeddings: Boolean(deps.embeddingClient && deps.vectorStore && deps.textStore) };
+      return withAi && lacksAvailableAi(cached.result, available) ? null : cached.result;
     },
   };
 
@@ -305,7 +336,7 @@ export async function runAnalysisJob(
     // Synthesize (AI) is registered only when an LLM client is configured (owner's keys).
     // Without it the pipeline runs deterministic-only; with it, an AI failure degrades to
     // "partial" (deterministic slices intact), never "failed".
-    if (deps.synthesisClient) {
+    if (withAi && deps.synthesisClient) {
       const singleShot = createSynthesizeStage({ client: deps.synthesisClient, now });
       if (deps.fanOutSynthesis) {
         stages.push(
@@ -322,13 +353,15 @@ export async function runAnalysisJob(
     // RAG (AI, stage 8) registers only when an embedding client is configured. It reuses
     // the same readFile abstraction (disk path) and the same cache handle (both the
     // embedding cache and the SHA-keyed chunk-plan cache live there, namespaced).
-    if (deps.embeddingClient && deps.vectorStore && deps.textStore) {
+    if (withAi && deps.embeddingClient && deps.vectorStore && deps.textStore) {
       stages.push(
         createRagStage({
           client: deps.embeddingClient,
           vectorStore: deps.vectorStore,
           textStore: deps.textStore,
           readFile: deps.readFile,
+          ...(deps.maxIndexChunks ? { maxChunks: deps.maxIndexChunks } : {}),
+          ...(deps.embeddingCache === false ? { embeddingCache: false } : {}),
           now,
         }),
       );
@@ -412,13 +445,22 @@ export async function runAnalysisJob(
     // An unconfigured AI stage is recorded on the result itself (warnings, persisted with
     // the analysis) as well as on the job record below, so the omission survives a reload
     // and a cache hit instead of living only in this process's stdout.
-    const skippedStages = skippedAiStages(deps, ranResult);
+    const skippedStages = skippedAiStages(deps, ranResult, withAi);
     // `warnings` is required by the contract but a cached document persisted by an older
     // analyzer may predate it, so treat it as optional here rather than trusting the type.
     const existingWarnings = ranResult.warnings ?? [];
-    const notes = skippedStages
-      .map((stage) => AI_STAGE_NOTES[stage as "synthesize" | "rag"])
-      .filter((note) => note && !existingWarnings.includes(note));
+    // A run whose DETERMINISTIC part failed (too large, clone error) has no map, so the AI notes —
+    // which all end "the map is complete" — would be false there. Its own error says what happened.
+    const deterministicFailed = ranResult.pipeline?.status === "failed" || ranResult.pipeline?.status === "aborted";
+    const notes = (
+      deterministicFailed
+        ? []
+        : withAi
+          ? skippedStages.map((stage) => AI_STAGE_NOTES[stage as "synthesize" | "rag"])
+          : skippedStages.length
+            ? [MAP_ONLY_NOTE]
+            : []
+    ).filter((note) => note && !existingWarnings.includes(note));
     const withWarnings: AnalysisResult = notes.length
       ? { ...ranResult, warnings: [...existingWarnings, ...notes] }
       : ranResult;
@@ -440,7 +482,17 @@ export async function runAnalysisJob(
     // V3-P0: classify the delivered SCOPE, not just the status. A no-key run is a legitimate
     // "completed" that is nonetheless not a full analysis; `runMode` says so in a form the UI
     // can branch on, and it rides the RESULT so it survives persistence and a later cache hit.
-    const { runMode, degradations } = classifyRun(skippedStages, statusReasonForMode);
+    const failedAiStages = cached
+      ? []
+      : (withWarnings.pipeline?.stages ?? [])
+          .filter((stage) => stage.status === "failed" && (stage.stage === "synthesize" || stage.stage === "rag"))
+          .map((stage) => stage.stage as PipelineStageId);
+    const classified = classifyRun(skippedStages, statusReasonForMode, { mapOnly: !withAi, failedAiStages });
+    const runMode = classified.runMode;
+    // Same reason as the notes above: on a failed run only a guardrail reason is true (e.g. budget).
+    const degradations = deterministicFailed
+      ? classified.degradations.filter((notice) => notice.reason === "budget-exhausted")
+      : classified.degradations;
     const result: AnalysisResult = {
       ...withWarnings,
       runMode,

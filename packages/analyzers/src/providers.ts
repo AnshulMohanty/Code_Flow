@@ -43,6 +43,14 @@ export interface ProviderEnv {
   OPENAI_EMBEDDING_MODEL?: string;
   /** Truncation override for the Matryoshka v3 models. Unset ⇒ the model's NATIVE width. */
   OPENAI_EMBEDDING_DIM?: string;
+  /** An OpenAI-compatible endpoint (a gateway, Azure, a local stand-in for tests). Unset ⇒ api.openai.com. */
+  OPENAI_BASE_URL?: string;
+}
+
+/** `OPENAI_BASE_URL` without a trailing slash (the clients append `/v1/...`), or nothing. */
+function openAiBaseUrl(env: ProviderEnv): { baseUrl: string } | Record<string, never> {
+  const raw = env.OPENAI_BASE_URL?.trim().replace(/\/+$/, "");
+  return raw ? { baseUrl: raw } : {};
 }
 
 const DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8";
@@ -126,7 +134,7 @@ export function createLlmClientFromEnv(env: ProviderEnv): LlmClient | undefined 
     // NOT read here on purpose: it defaults to an Anthropic model id, and a deployment that set it
     // for Anthropic and then flipped LLM_PROVIDER would otherwise send "claude-opus-4-8" to OpenAI
     // and get a 404 that reads like an outage.
-    return createOpenAiClient({ apiKey: env.OPENAI_API_KEY, ...(env.OPENAI_MODEL ? { model: env.OPENAI_MODEL } : {}) });
+    return createOpenAiClient({ apiKey: env.OPENAI_API_KEY, ...(env.OPENAI_MODEL ? { model: env.OPENAI_MODEL } : {}), ...openAiBaseUrl(env) });
   }
   if (!env.GEMINI_API_KEY) return undefined;
   return createGeminiClient({ apiKey: env.GEMINI_API_KEY, ...(env.GEMINI_MODEL ? { model: env.GEMINI_MODEL } : {}) });
@@ -163,6 +171,7 @@ export function createEmbeddingClientFromEnv(env: ProviderEnv): EmbeddingClient 
       apiKey: env.OPENAI_API_KEY,
       ...(env.OPENAI_EMBEDDING_MODEL ? { model: env.OPENAI_EMBEDDING_MODEL } : {}),
       ...(openAiDim !== undefined ? { dimension: openAiDim } : {}),
+      ...openAiBaseUrl(env),
     });
   }
   if (!env.GEMINI_API_KEY) return undefined;
@@ -198,4 +207,63 @@ function positiveInt(raw: string | undefined): number | undefined {
   if (!raw || raw.trim() === "") return undefined;
   const value = Number(raw);
   return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+/** What this deployment's AI can do, as reported to visitors (`/api/meta`) and used to pick a run's
+ *  scope. Plain data: no key, no URL, nothing secret — the model names are what a visitor sees. */
+export interface AiStatus {
+  /** At least one AI stage can run (an onboarding guide and/or a Q&A index). */
+  enabled: boolean;
+  /** Q&A can be answered: it needs BOTH a chat and an embedding provider. */
+  qaEnabled: boolean;
+  provider: string | null;
+  chatModel: string | null;
+  embeddingModel: string | null;
+  /** Set when the configuration cannot be resolved (e.g. two keys, no LLM_PROVIDER). */
+  configError?: string;
+}
+
+/**
+ * Resolve the AI status from env WITHOUT throwing. The selection helpers throw on an ambiguous
+ * configuration on purpose (the boot must fail loudly); a status endpoint must instead report it, or
+ * a misconfigured server would answer every page load with a 500.
+ */
+export function aiStatusFromEnv(env: ProviderEnv): AiStatus {
+  try {
+    const chat = createLlmClientFromEnv(env);
+    const embeddings = createEmbeddingClientFromEnv(env);
+    return {
+      enabled: Boolean(chat || embeddings),
+      qaEnabled: Boolean(chat && embeddings),
+      provider: chat?.provider ?? embeddings?.provider ?? null,
+      chatModel: chat?.model ?? null,
+      embeddingModel: embeddings?.model ?? null,
+    };
+  } catch (error: unknown) {
+    return {
+      enabled: false,
+      qaEnabled: false,
+      provider: null,
+      chatModel: null,
+      embeddingModel: null,
+      configError: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Does a cached result lack AI output that this server could produce now?
+ *
+ * A "map only" run (or one from before a key was configured) is a complete MAP, so it satisfies a
+ * map-only request; it does not satisfy a request for AI on a server that has AI, or the visitor who
+ * asked for the guide and Q&A would be handed a result with neither. Re-running is what they asked
+ * for — the result is re-saved under the same key, so the next request is a hit.
+ */
+export function lacksAvailableAi(
+  result: { ai?: { synthesis?: unknown; rag?: unknown } | null },
+  available: { chat: boolean; embeddings: boolean },
+): boolean {
+  if (available.chat && !result.ai?.synthesis) return true;
+  if (available.embeddings && !result.ai?.rag) return true;
+  return false;
 }

@@ -1,5 +1,7 @@
 import { Router } from "express";
+import { aiStatusFromEnv } from "@codeflow/analyzers";
 import { ANALYZER_VERSION } from "@codeflow/config";
+import type { DailyCapLimits } from "../middleware/dailyCap.js";
 import { answerLatency } from "../services/answerLatency.js";
 import { listIndexedAnalyses } from "../services/analysisCacheService.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -30,24 +32,34 @@ import { asyncHandler } from "../utils/asyncHandler.js";
  * per-stage durations on a result are for THAT repo at THAT size. The UI renders the real per-run
  * total when it has a result and says nothing when it does not.
  */
-export const metaRouter = Router();
-
 /** Recents shown by the workbench entry step. Bounded — this is a convenience list, not a feed. */
 export const META_INDEXED_LIMIT = 8;
 
-metaRouter.get(
-  "/api/meta",
-  asyncHandler(async (_req, res) => {
-    const indexed = await listIndexedAnalyses(META_INDEXED_LIMIT);
-    res.json({
-      analyzerVersion: ANALYZER_VERSION,
-      // Read from env, absent when unset. A deployment that wants a build shown supplies one;
-      // fabricating it from the process start time would put an unlookuppable id in the footer.
-      build: process.env.GIT_SHA || process.env.SOURCE_COMMIT || null,
-      answerLatency: answerLatency(),
-      indexed,
-      // Not a guess: `null` means this process has never been asked, and the UI says so.
-      serverTime: new Date().toISOString(),
-    });
-  }),
-);
+/**
+ * `ai` says which modes a visitor can pick (map only is always available; "map + AI" only when a
+ * provider key is configured) and which model answers — read from the same env the worker uses, so
+ * the badge cannot claim a model the pipeline is not running. `limits` are the per-visitor daily caps,
+ * so the UI can say "3 AI analyses a day" instead of surprising someone with a 429.
+ */
+export function metaRouter(limits: DailyCapLimits = { aiAnalyses: null, questions: null }): Router {
+  const router = Router();
+  router.get(
+    "/api/meta",
+    asyncHandler(async (_req, res) => {
+      const indexed = await listIndexedAnalyses(META_INDEXED_LIMIT);
+      res.json({
+        analyzerVersion: ANALYZER_VERSION,
+        // Read from env, absent when unset. A deployment that wants a build shown supplies one;
+        // fabricating it from the process start time would put an unlookuppable id in the footer.
+        build: process.env.GIT_SHA || process.env.SOURCE_COMMIT || null,
+        answerLatency: answerLatency(),
+        indexed,
+        // Not a guess: `null` means this process has never been asked, and the UI says so.
+        serverTime: new Date().toISOString(),
+        ai: aiStatusFromEnv(process.env),
+        limits: { dailyAiAnalysesPerIp: limits.aiAnalyses, dailyQuestionsPerIp: limits.questions },
+      });
+    }),
+  );
+  return router;
+}

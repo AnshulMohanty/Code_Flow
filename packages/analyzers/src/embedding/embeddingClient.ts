@@ -287,6 +287,14 @@ const OPENAI_EMBED_FALLBACK_DIM = 1536;
  * actually hits. The RAG stage batches by its own limits first, then this re-chunks under them.
  */
 const OPENAI_EMBED_MAX_BATCH = 256;
+/**
+ * Longest text sent per input. OpenAI's v3 embedding models reject an input over 8,192 tokens with a
+ * 400 (they do not truncate, unlike Gemini), and the RAG stage allows a chunk up to 32K estimated
+ * tokens — so one very large function would fail the whole index build. 12,000 characters is about
+ * 3–4K tokens of typical code, under the limit with room for dense text. Only the VECTOR is built from
+ * the head of an oversized chunk; the stored chunk text and its cited line range stay whole.
+ */
+export const OPENAI_EMBED_MAX_INPUT_CHARS = 12_000;
 
 /** The model's native vector width, exported so config resolution and tests agree on one answer. */
 export function openAiEmbeddingDimension(model: string): number {
@@ -331,7 +339,9 @@ export function createOpenAiEmbeddingClient(options: OpenAiEmbeddingClientOption
       const vectors: number[][] = [];
       const usageParts: TokenUsage[] = [];
       for (let offset = 0; offset < request.texts.length; offset += OPENAI_EMBED_MAX_BATCH) {
-        const batch = request.texts.slice(offset, offset + OPENAI_EMBED_MAX_BATCH);
+        const batch = request.texts
+          .slice(offset, offset + OPENAI_EMBED_MAX_BATCH)
+          .map((text) => (text.length > OPENAI_EMBED_MAX_INPUT_CHARS ? text.slice(0, OPENAI_EMBED_MAX_INPUT_CHARS) : text));
         const response = await fetch(`${baseUrl}/v1/embeddings`, {
           method: "POST",
           headers: {

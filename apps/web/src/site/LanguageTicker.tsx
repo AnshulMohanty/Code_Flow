@@ -1,52 +1,59 @@
 /**
  * THE LANGUAGE TICKER.
  *
- * The design runs a marquee of language names under the hero. What it lists is the truth about this
- * engine, which is more interesting than a list of logos anyway: the five languages tree-sitter
- * genuinely parses into a code property graph, and — separately marked — the ones that fall through
- * to the regex engine and therefore get imports but no call graph.
+ * The design runs a marquee of language names under the hero. What it lists here is the truth about
+ * this engine, in two groups that are never mixed:
  *
- * THAT DISTINCTION IS LEDGER #16, and putting it in the marquee rather than in a footnote is the
- * point. A ticker that listed twenty languages as though they were equally supported would be the
- * single easiest place in this UI to overclaim, and the honest version is not even less impressive:
- * "five parsed to a CPG, nine more resolved structurally" is a real capability statement.
+ *   FULLY PARSED  tree-sitter grammars plus a resolver per language, and every one of them is scored
+ *                 edge by edge against that language's OWN toolchain (tsc, go list, javac, Roslyn,
+ *                 clang, Python's import machinery) — see DESIGN.md §4.
+ *   STRUCTURAL    everything else: the file is counted (lines, role, place in the tree) but no
+ *                 imports are read, so it has no edges. Named honestly rather than listed as
+ *                 "supported".
  *
- * `aria-hidden`, because it is a duplicated marquee for the eye; the same facts are in the
- * `sr-only` sentence beside it.
+ * A ticker that listed twenty languages as though they were equally supported would be the single
+ * easiest place in this UI to overclaim. A language appears in FULLY_PARSED only once it has a
+ * resolver and a truth tool (DESIGN.md §3.4) — nothing aspirational goes in that list.
+ *
+ * `aria-hidden` on the moving track, because it is a duplicated marquee for the eye; the same facts
+ * are in the `sr-only` sentence beside it.
  */
 
-/** Parsed by tree-sitter into a full CPG (symbols + calls + inheritance). */
-const CPG_LANGUAGES = ["TypeScript", "JavaScript", "TSX", "JSX", "Python"] as const;
+/** Parsed and resolved, each measured against its own compiler/toolchain. */
+export const FULLY_PARSED_LANGUAGES = ["TypeScript", "JavaScript", "Python", "Go", "Java", "C#", "C", "C++"] as const;
 
-/** Recognised structurally by the regex/generic engine: nodes and (where the syntax allows) imports,
- *  but no symbols and no call graph. Named honestly rather than listed as "supported". */
-const STRUCTURAL_LANGUAGES = ["Go", "Rust", "Java", "Ruby", "PHP", "C#", "C", "C++", "Kotlin", "Swift", "Scala", "Elixir"] as const;
+/** Files are recognised and counted, but no imports are read — so no dependency edges. */
+export const STRUCTURAL_LANGUAGES = ["Rust", "Ruby", "PHP", "Kotlin", "Swift", "Scala", "Elixir"] as const;
 
 export function LanguageTicker() {
-  const items = [
-    ...CPG_LANGUAGES.map((name) => ({ name, cpg: true })),
-    ...STRUCTURAL_LANGUAGES.map((name) => ({ name, cpg: false })),
-  ];
+  const run = (copy: number) => (
+    <div className="ticker-run" key={copy}>
+      <span className="ticker-group">fully parsed</span>
+      {FULLY_PARSED_LANGUAGES.map((name) => (
+        <span key={`${copy}-${name}`} className="ticker-item" data-parsed="true">
+          {name}
+          <span className="ticker-mark">⌗</span>
+        </span>
+      ))}
+      <span className="ticker-group" data-parsed="false">structural only</span>
+      {STRUCTURAL_LANGUAGES.map((name) => (
+        <span key={`${copy}-${name}`} className="ticker-item" data-parsed="false">
+          {name}
+          <span className="ticker-mark">·</span>
+        </span>
+      ))}
+    </div>
+  );
 
   return (
     <div className="ticker">
       <p className="sr-only">
-        Parsed to a full code property graph: {CPG_LANGUAGES.join(", ")}. Recognised structurally only —
-        files and imports, no symbols or call graph: {STRUCTURAL_LANGUAGES.join(", ")}.
+        Fully parsed, each checked against its own compiler: {FULLY_PARSED_LANGUAGES.join(", ")}. Structural only —
+        files are counted but imports are not read: {STRUCTURAL_LANGUAGES.join(", ")}.
       </p>
       {/* Duplicated once so the -50% translate loops seamlessly. */}
       <div className="ticker-track" aria-hidden="true">
-        {[0, 1].map((copy) => (
-          <div key={copy} style={{ display: "flex" }}>
-            {items.map((item) => (
-              <span key={`${copy}-${item.name}`} className="ticker-item">
-                <span className="ticker-mark">{item.cpg ? "⌗" : "·"}</span>
-                {item.name}
-                {item.cpg ? null : <span className="ticker-mark">structural</span>}
-              </span>
-            ))}
-          </div>
-        ))}
+        {[0, 1].map(run)}
       </div>
     </div>
   );

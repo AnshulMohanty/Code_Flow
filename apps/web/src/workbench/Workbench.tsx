@@ -2,10 +2,13 @@ import type { AnalysisResult } from "@codeflow/shared-types";
 import { useCallback, useMemo, useState } from "react";
 import { CommandPalette, usePaletteHotkey, type PaletteItem } from "../components/CommandPalette";
 import { Hud } from "../components/Hud";
+import { ModeBadge } from "../components/ModeSwitch";
+import { mentionsEnvVar, visitorBanners, type AiAvailability, type AiChoice } from "../lib/aiMode";
 import { buildGraphModel } from "../lib/graphModel";
 import { buildSiteModel, count, formatMs, NOT_MEASURED } from "../lib/siteModel";
 import { askDisabledReason } from "../site/MarketingSite";
 import { RepoField } from "../site/RepoField";
+import { DemoStrip } from "../site/DemoStrip";
 import type { AnalysisState, AskState } from "../lib/useAnalysis";
 import type { MetaState } from "../lib/useMeta";
 import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
@@ -61,9 +64,14 @@ export interface WorkbenchProps {
   onAnalyze(input: { owner: string; repo: string }): void;
   onAsk(question: string): void;
   onExit(): void;
+  /** The Map only / Map + AI switch, or null when the server does not offer modes. */
+  mode?: WorkbenchMode | null;
+  modeBadge?: { label: string; title: string; ai: boolean } | null;
 }
 
-export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit }: WorkbenchProps) {
+export type WorkbenchMode = { choice: AiChoice; availability: AiAvailability; onChange(choice: AiChoice): void };
+
+export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit, mode, modeBadge }: WorkbenchProps) {
   const [tab, setTab] = useState<WorkbenchTab>("system");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -108,6 +116,7 @@ export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit 
   }, [result, onExit, jump]);
 
   const busy = analysis.phase === "starting" || analysis.phase === "running";
+  const banners = useMemo(() => visitorBanners(result), [result]);
 
   return (
     <div className="wb dark">
@@ -136,6 +145,7 @@ export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit 
         ) : null}
 
         <div className="wb-right">
+          <ModeBadge badge={modeBadge ?? null} />
           {model ? <Hud numbers={model.numbers} jobId={analysis.jobId} /> : null}
           <button type="button" className="kbd" onClick={() => setPaletteOpen(true)} aria-label="Open command palette">
             ⌘K
@@ -148,32 +158,45 @@ export function Workbench({ meta, wake, analysis, ask, onAnalyze, onAsk, onExit 
 
       <main className="wb-main">
         {analysis.phase === "failed" ? (
-          <div className="banner" data-tone="refused" role="alert">
+          <div className="banner" data-tone={analysis.errorCode === "DAILY_LIMIT" ? "partial" : "refused"} role="alert">
             <span className="banner-mark" aria-hidden="true">
-              ✕
+              {analysis.errorCode === "DAILY_LIMIT" ? "◐" : "✕"}
             </span>
             <span>{analysis.error ?? "The analysis failed."}</span>
+            {analysis.errorCode === "DAILY_LIMIT" && mode ? (
+              <button type="button" className="link-btn" onClick={() => mode.onChange("map-only")}>
+                Use Map only
+              </button>
+            ) : null}
           </div>
         ) : null}
 
-        {/* Honest degradation, carried from the run itself and shown before anything else. */}
-        {result?.degradations?.length ? (
-          <div className="banner" data-tone="partial">
+        {/* Honest degradation, carried from the run itself and shown before anything else — in this
+            app's own words, one line per reason. The worker's `detail` strings are operator text
+            (they can name environment variables) and are never rendered to a visitor. */}
+        {banners.map((banner) => (
+          <div className="banner" data-tone={banner.tone} key={banner.reason} role="note">
             <span className="banner-mark" aria-hidden="true">
-              ◐
+              {banner.tone === "info" ? "⌗" : "◐"}
             </span>
-            <span>{result.degradations.map((notice) => notice.detail).join(" ")}</span>
+            <span>{banner.text}</span>
           </div>
-        ) : null}
+        ))}
 
         {!result && !busy ? (
-          <EntryStep meta={meta} wake={wake} onAnalyze={onAnalyze} error={analysis.error} />
+          <EntryStep meta={meta} wake={wake} onAnalyze={onAnalyze} error={analysis.error} mode={mode ?? null} />
         ) : !result ? (
           <ResolvingStep analysis={analysis} meta={meta} />
         ) : graph && model ? (
           <>
             {activeTab === "system" ? (
-              <TabSystem result={result} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+              <TabSystem
+                result={result}
+                graph={graph}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                onOpenImpact={(fileId) => jump("impact", fileId)}
+              />
             ) : null}
             {activeTab === "explore" ? (
               <TabExplore
@@ -211,24 +234,30 @@ export function EntryStep({
   wake,
   onAnalyze,
   error,
+  mode,
 }: {
   meta: MetaState;
   wake: WakeState;
   onAnalyze(input: { owner: string; repo: string }): void;
   error: string | null;
+  mode?: WorkbenchMode | null;
 }) {
   const indexed = meta.facts?.indexed ?? [];
   return (
-    <>
+    <div className="wb-entry">
       <p className="wb-step">Step 01 — point at a repo</p>
-      <h1 className="display display-l" style={{ maxWidth: "22ch", marginBottom: 34 }}>
-        Give me a URL. I&rsquo;ll give you the map<span className="dot" aria-hidden="true" />
+      <h1 className="display display-entry">
+        Give me a URL. I&rsquo;ll give you the map.
       </h1>
-      <RepoField onAnalyze={onAnalyze} autoFocus error={error} notReady={analyzeBlockedReason(wake)} />
+      <RepoField onAnalyze={onAnalyze} autoFocus error={error} notReady={analyzeBlockedReason(wake)} mode={mode ?? null} />
       <p className="wb-recents">
         <span>indexed:</span>
         {meta.status === "loading" ? (
           <span className="chip-count">loading…</span>
+        ) : meta.status === "error" ? (
+          // Not "nothing yet": we do not know, because the server did not answer. Saying it has
+          // analysed nothing would be a claim about a server we could not reach.
+          <span className="chip-count">unknown — the server did not answer</span>
         ) : indexed.length === 0 ? (
           <span className="chip-count">
             nothing yet — this deployment has not analysed a repository
@@ -250,7 +279,8 @@ export function EntryStep({
           ))
         )}
       </p>
-    </>
+      <DemoStrip onAnalyze={onAnalyze} caption="cached demos — open one instantly:" />
+    </div>
   );
 }
 
@@ -340,12 +370,21 @@ export function liveRows(analysis: AnalysisState): LiveRow[] {
     else if (events.length > 0) status = "running";
 
     const durations = events.map((event) => event!.durationMs).filter((ms): ms is number => ms !== undefined);
-    const detail = events.map((event) => event!.detail).filter(Boolean).join(" · ");
+    // Stage details are written by the worker; one that names an environment variable is operator
+    // advice and is dropped here rather than shown to a visitor.
+    const detail = events
+      .map((event) => event!.detail)
+      .filter((text): text is string => Boolean(text) && !mentionsEnvVar(text!))
+      .join(" · ");
 
     return {
       id: row.id,
       label: row.label,
-      detail: allSkipped ? "not configured for this run" : detail || null,
+      detail: allSkipped
+        ? analysis.requestedWithAi === false
+          ? "map only — AI not requested"
+          : "not configured for this run"
+        : detail || null,
       durationMs: durations.length > 0 ? durations.reduce((sum, ms) => sum + ms, 0) : null,
       status,
     };

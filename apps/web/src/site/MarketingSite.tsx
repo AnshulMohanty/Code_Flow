@@ -2,17 +2,19 @@ import type { AnalysisResult } from "@codeflow/shared-types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AskBlock, PipelineCard } from "../components/PipelineCard";
 import { CommandPalette, usePaletteHotkey, type PaletteItem } from "../components/CommandPalette";
+import { copyWithToast } from "../components/Toast";
 import { buildGraphModel } from "../lib/graphModel";
-import { useMagnetic, useRevealAttrs } from "../lib/motion";
-import { buildSiteModel, count } from "../lib/siteModel";
-import { moduleLabel } from "../lib/citation";
+import { buildHeroGraph } from "../lib/heroGraph";
+import { hasFinePointer, useReveal, useRevealAttrs } from "../lib/motion";
+import { buildSiteModel, count, formatMs } from "../lib/siteModel";
 import { suggestedQuestions } from "../lib/questions";
 import type { MetaState } from "../lib/useMeta";
 import { analyzeBlockedReason, type WakeState } from "../lib/useWake";
 import type { AskState, AnalysisState } from "../lib/useAnalysis";
+import { BUDGET_COPY, isMapOnlyRun, visitorBanners, type AiAvailability, type AiChoice } from "../lib/aiMode";
 import { snapshotLabel, type DemoSnapshot } from "../lib/demoSnapshot";
 import { DemoStrip } from "./DemoStrip";
-import { HeroMesh } from "./HeroMesh";
+import { HeroGraph, type HeroHover } from "./HeroGraph";
 import { LanguageTicker } from "./LanguageTicker";
 import { RepoField } from "./RepoField";
 import { SectionGrounding } from "./SectionGrounding";
@@ -35,6 +37,11 @@ import { SiteNav } from "./SiteNav";
  * banner names the repository, the commit, the date it was produced and what it is MISSING, and it
  * is rendered wherever the snapshot is. A live analysis replaces it the moment one exists.
  *
+ * THE HERO GRAPH follows the same rule. It is the design's interactive map, drawn from that same
+ * result (live, else the snapshot) and LABELLED with its repository and commit. With neither there
+ * is no graph at all — an unlabelled decorative mesh on this page would be the product contradicting
+ * itself in its own hero.
+ *
  * A build with NO snapshot is unchanged — same empty state, same four em-dashes.
  */
 
@@ -49,22 +56,45 @@ export interface MarketingSiteProps {
   onAnalyze(input: { owner: string; repo: string }): void;
   onAsk(question: string): void;
   onOpenWorkbench(): void;
+  /** The Map only / Map + AI switch, or null when the server does not offer modes. */
+  mode?: { choice: AiChoice; availability: AiAvailability; onChange(choice: AiChoice): void } | null;
+  modeBadge?: { label: string; title: string; ai: boolean } | null;
 }
 
-export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAsk, onOpenWorkbench }: MarketingSiteProps) {
+/** The fully offline CLI. Same deterministic pipeline, no server and no key. */
+export const OFFLINE_CLI_COMMAND = "npx codeflow-local analyze .";
+
+export function MarketingSite({
+  meta,
+  wake,
+  demo,
+  analysis,
+  ask,
+  onAnalyze,
+  onAsk,
+  onOpenWorkbench,
+  mode,
+  modeBadge,
+}: MarketingSiteProps) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
+  const [heroHover, setHeroHover] = useState<HeroHover | null>(null);
+  const [finePointer, setFinePointer] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
-  // MOTION, applied to elements that already exist. Section heads wipe up (`clip`) because that is
-  // what heavy display type wants; the cards below them fade up after. Every one of these degrades
-  // to "already revealed" without an IntersectionObserver or under reduced motion — see lib/motion.
-  const resolveHead = useRevealAttrs<HTMLDivElement>("clip");
-  const resolveBody = useRevealAttrs<HTMLDivElement>();
-  const ctaHead = useRevealAttrs<HTMLDivElement>("clip");
-  const ctaButton = useMagnetic<HTMLButtonElement>();
+  // MOTION, applied to elements that already exist. Display lines wipe up (`clip`); the copy around
+  // them fades up after. Every one of these degrades to "already revealed" without an
+  // IntersectionObserver or under reduced motion — see lib/motion.
+  const heroIn = useReveal<HTMLHeadingElement>({ threshold: 0 });
+  const resolveHead = useRevealAttrs<HTMLDivElement>("up");
+  const resolveTitle = useRevealAttrs<HTMLHeadingElement>("clip");
+  const resolveAside = useRevealAttrs<HTMLParagraphElement>("up");
+  const resolveBody = useRevealAttrs<HTMLDivElement>("up");
+  const ctaHead = useRevealAttrs<HTMLSpanElement>("clip");
+  const ctaActions = useRevealAttrs<HTMLDivElement>("up");
 
   usePaletteHotkey(() => setPaletteOpen(true));
+  useEffect(() => setFinePointer(hasFinePointer()), []);
 
   // A LIVE run always wins. The snapshot is what fills the page before one exists — never something
   // that survives alongside one, which would leave two different repositories on screen at once.
@@ -73,6 +103,8 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
   const result = live ?? demo?.result ?? null;
   const graph = useMemo(() => (result ? buildGraphModel(result) : null), [result]);
   const model = useMemo(() => (result ? buildSiteModel(result, meta.facts) : null), [result, meta.facts]);
+  const heroLayout = useMemo(() => (graph && graph.linkCount > 0 ? buildHeroGraph(graph) : null), [graph]);
+  const banners = useMemo(() => visitorBanners(result), [result]);
 
   const navigate = useCallback((section: string) => {
     const target = section === "top" ? rootRef.current : document.getElementById(section);
@@ -110,9 +142,18 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
 
   const busy = analysis.phase === "starting" || analysis.phase === "running";
   const questions = useMemo(() => suggestedQuestions(result), [result]);
+  const lastIndex = model?.totalMs ?? null;
+  // For the snapshot, the PROVENANCE names the repository and commit — the same identity its banner
+  // states — so the map label and the banner can never disagree about which analysis this is.
+  const repoLabel =
+    showingSnapshot && demo
+      ? `${demo.provenance.repoFullName} @ ${demo.provenance.commitSha.slice(0, 7)}`
+      : model
+        ? `${model.repoFullName}${model.shortSha ? ` @ ${model.shortSha}` : ""}`
+        : null;
 
   return (
-    <div ref={rootRef}>
+    <div ref={rootRef} className="site">
       <SiteNav
         meta={meta}
         wake={wake}
@@ -120,44 +161,82 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
         onNavigate={navigate}
         onOpenPalette={() => setPaletteOpen(true)}
         onOpenWorkbench={onOpenWorkbench}
+        modeBadge={modeBadge ?? null}
       />
 
       {/* ── Hero ───────────────────────────────────────────────────────────── */}
-      <header className="hero">
-        <div className="shell hero-inner">
-          <HeroMesh />
-          <div className="hero-eyebrow">
-            <p className="eyebrow">⌗ Repository cartography</p>
+      <header className="hero" data-has-graph={heroLayout !== null}>
+        {heroLayout ? <HeroGraph layout={heroLayout} onHover={setHeroHover} /> : null}
+        <div className="hero-fade" aria-hidden="true" />
+        {heroLayout && repoLabel ? (
+          // What the graph IS, stated where the graph is. Never "representative": it is one real
+          // analysis, and this says which one and how much of it is drawn.
+          <p className="hero-graph-label" data-hero-graph-label="true">
+            <span className="hero-graph-label-key">map</span> {repoLabel}
+            <span className="hero-graph-label-sep"> · </span>
+            {showingSnapshot ? "pre-computed demo, not a live run" : "your run"}
+            <span className="hero-graph-label-sep"> · </span>
+            {count(heroLayout.drawn)} of {count(heroLayout.total)} modules drawn
+          </p>
+        ) : null}
+
+        <div className="hero-content">
+          <div className="hero-eyebrow" data-reveal="up" data-revealed={heroIn.revealed}>
+            <span className="hero-eyebrow-mark" aria-hidden="true">
+              ⌗
+            </span>
+            <span>Repository cartography</span>
             <span className="hero-eyebrow-rule" aria-hidden="true" />
-            <p className="eyebrow" style={{ color: "var(--oxblood)" }}>
-              Hover any module ↗
-            </p>
+            {/* Only claimed when it is true: there is a graph to hover, and a pointer to hover with. */}
+            {heroLayout && finePointer ? (
+              <span className="hero-hover" data-active={heroHover !== null} aria-hidden="true">
+                {heroHover
+                  ? `${heroHover.label}  →  ${count(heroHover.downstream)} downstream · ${heroHover.hops} hop${heroHover.hops === 1 ? "" : "s"} · ${heroHover.area}`
+                  : "hover any module ↗"}
+              </span>
+            ) : null}
           </div>
 
-          <h1 className="display display-xl">
-            See what breaks
-            <br />
-            before you <span className="accent">ship it</span>
-            <span className="dot" aria-hidden="true" />
+          <h1 className="display display-hero" ref={heroIn.ref}>
+            <span className="hero-line" data-reveal="clip" data-revealed={heroIn.revealed}>
+              See what breaks
+            </span>{" "}
+            <span className="hero-line" data-reveal="clip" data-revealed={heroIn.revealed} style={{ transitionDelay: "130ms" }}>
+              before you <span className="accent">ship it.</span>
+            </span>
           </h1>
 
           <div className="hero-grid">
-            <p className="aside">
+            <p className="aside aside-hero" data-reveal="up" data-revealed={heroIn.revealed} style={{ transitionDelay: "320ms" }}>
               Cartograph resolves your repo into a real dependency map — foundations at the centre — then
               answers questions with the file and line it read.
             </p>
-            <div>
-              <RepoField onAnalyze={onAnalyze} busy={busy} error={analysis.error} notReady={analyzeBlockedReason(wake)} />
-              <DemoStrip onAnalyze={onAnalyze} activeFullName={showingSnapshot ? demo.provenance.repoFullName : null} />
+            <div className="hero-cta" data-reveal="up" data-revealed={heroIn.revealed} style={{ transitionDelay: "420ms" }}>
+              <RepoField
+                onAnalyze={onAnalyze}
+                busy={busy}
+                error={analysis.error}
+                notReady={analyzeBlockedReason(wake)}
+                mode={mode ?? null}
+                errorAction={
+                  analysis.errorCode === "DAILY_LIMIT" && mode
+                    ? { label: "Use Map only", run: () => mode.onChange("map-only") }
+                    : null
+                }
+              />
               <p className="subline">
                 <span className="subline-ok">✓ deterministic pass first</span>
-                {model?.totalMs !== undefined && model?.totalMs !== null ? (
-                  <span>~{Math.round(model.totalMs / 1000)}s last index</span>
+                {lastIndex !== null ? (
+                  <span>
+                    {lastIndex >= 1000 ? `~${Math.round(lastIndex / 1000)}s` : formatMs(lastIndex)} last index
+                    {repoLabel ? ` · ${model!.repoFullName}` : ""}
+                  </span>
                 ) : (
                   <span>index time is reported after a run, not promised before one</span>
                 )}
-                {meta.facts?.build ? <span>⌗{meta.facts.build.slice(0, 7)}</span> : null}
+                {meta.facts?.build ? <span className="subline-faint">⌗{meta.facts.build.slice(0, 7)}</span> : null}
               </p>
+              <DemoStrip onAnalyze={onAnalyze} activeFullName={showingSnapshot ? demo.provenance.repoFullName : null} />
             </div>
           </div>
         </div>
@@ -168,24 +247,32 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
       {/* ── 01 Resolve ─────────────────────────────────────────────────────── */}
       <section className="section" id="resolve">
         <div className="shell">
-          <p className="eyebrow" style={{ marginBottom: 20 }}>
-            01 — Resolve
-          </p>
-          <div className="section-head" {...resolveHead}>
-            <h2 className="display display-l">
-              Six passes,
-              <br />
-              then it speaks<span className="dot" aria-hidden="true" />
-            </h2>
-            <p className="aside">
+          <div className="section-head">
+            <div {...resolveHead}>
+              <p className="eyebrow eyebrow-accent">01 — Resolve</p>
+              <h2 className="display display-l" {...resolveTitle}>
+                Six passes,
+                <br />
+                then it speaks.
+              </h2>
+            </div>
+            <p className="aside" {...resolveAside} style={{ transitionDelay: "180ms" }}>
               Nothing is generated until the graph is sealed. Watch the rail fill — the answer waits for
               it.
             </p>
           </div>
 
           {showingSnapshot && demo ? <SnapshotBanner snapshot={demo} /> : null}
+          {banners.map((banner) => (
+            <p className="banner banner-light" data-tone={banner.tone} key={banner.reason} role="note">
+              <span className="banner-mark" aria-hidden="true">
+                {banner.tone === "info" ? "⌗" : "◐"}
+              </span>
+              <span>{banner.text}</span>
+            </p>
+          ))}
 
-          <div {...resolveBody}>
+          <div {...resolveBody} style={{ transitionDelay: "120ms" }}>
           {model && graph && result ? (
             <PipelineCard
               model={model}
@@ -230,42 +317,50 @@ export function MarketingSite({ meta, wake, demo, analysis, ask, onAnalyze, onAs
 
       <SectionGrounding grounding={model?.grounding ?? null} />
 
-      <SectionNumbers
-        numbers={model?.numbers ?? null}
-        provenance={model ? `${model.repoFullName}${model.shortSha ? ` @ ${model.shortSha}` : ""}` : null}
-      />
+      <SectionNumbers numbers={model?.numbers ?? null} provenance={repoLabel} />
 
       {/* ── CTA ────────────────────────────────────────────────────────────── */}
       <section className="cta dark">
-        <div className="shell" {...ctaHead}>
-          <h2 className="display display-xl">
-            Paste a repo<span className="dot" aria-hidden="true" />
+        <div className="shell">
+          <h2 className="display display-cta">
+            <span className="hero-line" {...ctaHead}>
+              Paste a repo<span className="stop">.</span>
+            </span>
           </h2>
-          <div className="cta-actions">
-            <button type="button" className="btn btn-primary" ref={ctaButton} onClick={onOpenWorkbench}>
+          <div className="cta-actions" {...ctaActions} style={{ transitionDelay: "240ms" }}>
+            <button type="button" className="btn btn-light" data-magnetic="true" onClick={onOpenWorkbench}>
               Open the workbench <span aria-hidden="true">→</span>
             </button>
             <p className="cta-note">
-              no signup for public repos ·{" "}
-              {model?.totalMs != null ? `${Math.round(model.totalMs / 1000)}s last index` : "index time reported per run"} ·
-              ⌘K anywhere
+              no signup for public repos · {lastIndex !== null ? `${formatMs(lastIndex)} last index` : "index time reported per run"} · ⌘K
+              anywhere
             </p>
           </div>
+          <p className="cta-cli">
+            <span>Fully offline, no server and no key:</span>
+            <code>{OFFLINE_CLI_COMMAND}</code>
+            <button
+              type="button"
+              className="chip-btn"
+              onClick={() => void copyWithToast(OFFLINE_CLI_COMMAND, "⌗ copied — runs the same deterministic map locally")}
+            >
+              copy
+            </button>
+          </p>
+
+          <footer className="footer">
+            <span aria-hidden="true">⌗</span>
+            <span>CodeFlow · engine Cartograph</span>
+            {/* Identity, and only what is real. A missing build or index sha renders as `—` rather
+                than as an invented hash — a footer is exactly where a fabricated id reads as provenance. */}
+            <span>build ⌗{meta.facts?.build?.slice(0, 7) ?? "—"}</span>
+            <span>analyzer v{meta.facts?.analyzerVersion ?? "—"}</span>
+            <span>index ⌗{model?.shortSha ?? "—"}</span>
+            <span>graph {graph ? `${count(graph.nodeCount)}n · ${count(graph.linkCount)}e` : "—"}</span>
+            <span className="footer-right">Read the code, not the vibes.</span>
+          </footer>
         </div>
       </section>
-
-      <footer className="footer dark">
-        <span>⌗ CodeFlow · engine Cartograph</span>
-        {/* Identity, and only what is real. A missing build or index sha renders as `—` rather than
-            as an invented hash — a footer is exactly where a fabricated id reads as provenance. */}
-        <span>build ⌗{meta.facts?.build?.slice(0, 7) ?? "—"}</span>
-        <span>analyzer v{meta.facts?.analyzerVersion ?? "—"}</span>
-        <span>index ⌗{model?.shortSha ?? "—"}</span>
-        <span>
-          graph {graph ? `${count(graph.nodeCount)}n · ${count(graph.linkCount)}e` : "—"}
-        </span>
-        <span className="footer-right">Read the code, not the vibes.</span>
-      </footer>
 
       <CommandPalette
         open={paletteOpen}
@@ -315,10 +410,11 @@ export function usePaletteItems(
  */
 export function askDisabledReason(result: AnalysisResult, ask: AskState): string | null {
   if (ask.error) return ask.error;
-  if (ask.answer?.atCapacity) {
-    return "Demo at capacity — the daily AI budget has been reached. The deterministic map above is unaffected.";
-  }
+  if (ask.answer?.atCapacity) return BUDGET_COPY;
   if (ask.answer?.unavailable) return ask.answer.answer;
+  if (!result.ai?.rag && isMapOnlyRun(result)) {
+    return "Map only run — no Q&A index was built, so there is nothing to ask against. Switch to Map + AI and analyze again to ask questions.";
+  }
   if (!result.ai?.rag) {
     return "No Q&A index was built for this run, so there is nothing to ask against. The map above is the deterministic pass, which does not need a provider key.";
   }
@@ -346,6 +442,9 @@ function SnapshotBanner({ snapshot }: { snapshot: DemoSnapshot }) {
   return (
     <aside className="snapshot-banner" data-snapshot="true" role="note">
       <p className="snapshot-banner-title">
+        <span className="snapshot-banner-mark" aria-hidden="true">
+          ◐
+        </span>
         Pre-computed demo — not a live run
       </p>
       <p className="snapshot-banner-body">

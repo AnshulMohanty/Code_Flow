@@ -1,5 +1,6 @@
 import {
   answerQuestion,
+  budgetLimitsFromEnv,
   createEmbeddingClientFromEnv,
   createInMemoryBudgetHandle,
   createLlmClientFromEnv,
@@ -14,6 +15,7 @@ import {
   entitiesFrom,
   type AgentAnswer,
 } from "@codeflow/agents";
+import { createHash } from "node:crypto";
 import { RAG_TOP_K } from "@codeflow/config";
 import {
   createMemoryRepoStore,
@@ -77,7 +79,7 @@ async function resolveBudget(): Promise<BudgetHandle> {
   if (sharedBudget) return sharedBudget;
   const redis = await getSharedRedis();
   if (redis) {
-    sharedBudget = createRedisBudgetHandle(redis);
+    sharedBudget = createRedisBudgetHandle(redis, { limitTokens: budgetLimitsFromEnv(process.env) });
   } else {
     if (isSharedRedisEnabled()) {
       console.warn(
@@ -85,7 +87,7 @@ async function resolveBudget(): Promise<BudgetHandle> {
           "The daily LLM budget is no longer shared with the worker.",
       );
     }
-    sharedBudget = createInMemoryBudgetHandle();
+    sharedBudget = createInMemoryBudgetHandle(budgetLimitsFromEnv(process.env));
   }
   return sharedBudget;
 }
@@ -370,14 +372,26 @@ function createProductionAskHandler(): AskHandler {
       k: RAG_TOP_K,
     });
 
-    const answer = await askAgent({
-      question,
-      result,
-      chatClient,
-      budget,
-      tools: [...createGraphTools(), searchTool, createWhatChangedTool({ store: await resolveRepoStore() })],
-      ...(memory ? { memory } : {}),
-    });
+    // ANSWER CACHE on the agent path (2026-11-25). The single-shot path above always had one; this one
+    // did not, so a demo's repeated question was paid for every time. Only a question with NO prior
+    // turns is cached: in a conversation the same words can mean something else ("and its callers?").
+    // Keyed by everything that shapes the answer — the analysis, its commit, both models, the question.
+    const cacheable = !memory || memory.turns.length === 0;
+    const answerKey = cacheable ? agentAnswerKey(scopedAnalysisId, result.commitSha, chatClient.model, embeddingClient.model, question) : null;
+    const hit = answerKey ? await cache.get<Awaited<ReturnType<typeof askAgent>>>(answerKey) : null;
+    const answer =
+      hit ??
+      (await askAgent({
+        question,
+        result,
+        chatClient,
+        budget,
+        tools: [...createGraphTools(), searchTool, createWhatChangedTool({ store: await resolveRepoStore() })],
+        ...(memory ? { memory } : {}),
+      }));
+    // Only an ANSWERED result is cached: a refusal may be a transient miss, and caching it would
+    // repeat the refusal for a week after the cause went away.
+    if (answerKey && !hit && answer.answered) await cache.set(answerKey, answer);
 
     // Persist the turn ONLY when the client is running a session. A stateless ask must not create
     // one, or a shared store would fill with single-turn sessions nobody can address.
@@ -480,4 +494,11 @@ export async function warmQaDependencies(): Promise<QaWarmupDescriptors> {
 /** True when BOTH a chat and an embedding provider are configured, i.e. the Q&A path can run. */
 export function isQaConfigured(env: Record<string, string | undefined> = process.env): boolean {
   return Boolean(createLlmClientFromEnv(env) && createEmbeddingClientFromEnv(env));
+}
+
+/** Bounded, separator-free cache key for an agent answer (the question is hashed, not embedded). */
+function agentAnswerKey(analysisId: string, commitSha: string | undefined, chatModel: string, embeddingModel: string, question: string): string {
+  const normalized = question.trim().replace(/\s+/g, " ").toLowerCase();
+  const digest = createHash("sha256").update(normalized).digest("hex").slice(0, 32);
+  return `qa:agent:v1:${analysisId}:${commitSha ?? "-"}:${chatModel}:${embeddingModel}:${digest}`;
 }

@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Cursor } from "./components/Cursor";
+import { Toast } from "./components/Toast";
+import { aiAvailability, effectiveChoice, modeBadge, withAiFor, type AiChoice } from "./lib/aiMode";
 import { MarketingSite } from "./site/MarketingSite";
 import { Workbench } from "./workbench/Workbench";
 import { useAnalysis } from "./lib/useAnalysis";
@@ -32,6 +34,11 @@ import { useWake } from "./lib/useWake";
  * property of the page, not of either surface, and remounting it on every crossing would restart
  * its trail from the origin. It renders nothing at all without a fine pointer or under reduced
  * motion.
+ *
+ * THE MODE (Map only / Map + AI) LIVES HERE TOO. It is one choice the visitor makes, shown in three
+ * places — the hero switch, the workbench switch and the badge in both headers — and three copies
+ * would disagree the first time someone flipped one of them. The server's `/api/meta` decides what
+ * is possible; the visitor's pick decides what is asked for; the result says what actually ran.
  */
 
 type Surface = "site" | "workbench";
@@ -43,6 +50,15 @@ export function App() {
   const demo = useDemoSnapshot();
   const { state, ask, analyze, askQuestion } = useAnalysis();
   const [surface, setSurface] = useState<Surface>(() => readSurface());
+  const availability = useMemo(() => aiAvailability(meta), [meta]);
+  const [picked, setPicked] = useState<AiChoice | null>(null);
+  const choice = effectiveChoice(picked, availability);
+  const badge = modeBadge(choice, availability);
+  const mode = availability.offerSwitch ? { choice, availability, onChange: setPicked } : null;
+  const runAnalysis = useCallback(
+    (input: { owner: string; repo: string }) => analyze(input, { withAi: withAiFor(choice, availability) }),
+    [analyze, choice, availability],
+  );
 
   // Keep the hash and the surface in step, in both directions, so Back works.
   useEffect(() => {
@@ -64,10 +80,10 @@ export function App() {
   // run is actually watchable. The card on the marketing page still fills in — it is the same state.
   const analyzeAndOpen = useCallback(
     (input: { owner: string; repo: string }) => {
-      void analyze(input);
+      void runAnalysis(input);
       go("workbench");
     },
-    [analyze, go],
+    [runAnalysis, go],
   );
 
   if (surface === "workbench") {
@@ -79,10 +95,13 @@ export function App() {
           wake={wake}
           analysis={state}
           ask={ask}
-          onAnalyze={(input) => void analyze(input)}
+          onAnalyze={(input) => void runAnalysis(input)}
           onAsk={(question) => void askQuestion(question)}
           onExit={() => go("site")}
+          mode={mode}
+          modeBadge={badge}
         />
+        <Toast />
       </>
     );
   }
@@ -99,7 +118,10 @@ export function App() {
         onAnalyze={analyzeAndOpen}
         onAsk={(question) => void askQuestion(question)}
         onOpenWorkbench={() => go("workbench")}
+        mode={mode}
+        modeBadge={badge}
       />
+      <Toast />
     </>
   );
 }

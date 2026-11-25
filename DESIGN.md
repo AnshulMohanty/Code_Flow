@@ -254,9 +254,28 @@ API and worker install `git` + `ca-certificates` (without them every https clone
 6. Run one analysis, then ask a question — a cited answer proves worker and API share Postgres and Redis.
 7. Optional: `node scripts/prewarm-demos.mjs <api-url>` (spends money; re-run after a version bump).
 
-**Render free (`render.free.yaml`)**: one API with `RUN_WORKER_IN_PROCESS=true`, static web, free Key
-Value and Postgres, Gemini for chat and embeddings. Set `CODEFLOW_API_HOST` on the site and
-`CORS_ORIGINS` on the API by hand.
+**Hosted demo (`render.free.yaml`; what runs today)**: one Render Docker web service (API with
+`RUN_WORKER_IN_PROCESS=true`), one Render static site, and three external free stores that do not
+expire: Atlas M0 (Mongo), Neon (Postgres + pgvector), Upstash (Redis). AI: one OpenAI key for chat
+(`gpt-4.1-mini`) and embeddings (`text-embedding-3-small`); no key = "map only".
+1. Atlas: cluster running (a free cluster pauses after weeks with no connections — resume it),
+   Network Access `0.0.0.0/0`, URI ending `/codeflow`. Neon: `CREATE EXTENSION vector` once. Upstash:
+   the TCP `rediss://` URL with `?family=0` (IPv4; Render cannot reach it over IPv6).
+2. OpenAI: prepaid credit with auto-recharge OFF (the hard spending cap), a project, a key.
+3. API service env (all in `render.free.yaml`'s group): `MONGO_URI`, `POSTGRES_URL`, `REDIS_URL`,
+   `OPENAI_API_KEY`, `LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`, `OPENAI_MODEL`, the four
+   `DAILY_*` guards, `LLM_PRICING`, `MAX_REPO_FILES=3000`, `MAX_INDEX_CHUNKS=4000`, `EMBEDDING_CACHE=false`,
+   `TRUST_PROXY_HOPS=1`, `NODE_ENV`,
+   `RUN_WORKER_IN_PROCESS`, `CORS_ORIGINS` = the site URL. **Remove any other vendor's key** (two keys
+   without `LLM_PROVIDER` stop the boot, and the log says so). Never set `API_PORT`.
+4. Static site: build command from the blueprint (`npm install -g pnpm`, not corepack — EROFS on
+   Render's builder), publish `apps/web/dist`, rewrite `/*` → `/index.html`, `VITE_API_BASE_URL` = API
+   URL (baked at build: change it ⇒ "Clear build cache & deploy").
+5. Deploy from `main`; check `/health` (`warmedUp: true`, `retrieval.mode: postgres`) and `/api/meta`
+   (`ai.enabled: true`, the model names). Then `node scripts/prewarm-demos.mjs <api-url>` so the demo
+   repositories open instantly (spends cents; re-run after an `ANALYZER_VERSION` bump).
+6. Free plan sleeps after 15 min (wake ≈ 30–60 s, the site shows "Warming…"); `starter` ($7/month)
+   never sleeps and has 5x the CPU. No keep-alive pinger — it exhausts free hours and suspends the service.
 
 **Demo snapshot**: `node scripts/build-demo-snapshot.mjs --repo <path> --name owner/repo` (offline;
 refuses a dirty tree without `--allow-dirty`), commit `apps/web/src/demo/snapshot.json`.
@@ -273,10 +292,12 @@ refuses a dirty tree without `--allow-dirty`), commit `apps/web/src/demo/snapsho
 | Flags | `FANOUT_SYNTHESIS`, `PARALLEL_STAGES`, `SPECULATIVE_PREFETCH`, `FAST_MODEL`, `RUN_WORKER_IN_PROCESS` (all off by default) |
 | API/web | `API_PORT` → `PORT` → 4000, `CORS_ORIGINS`, `TRUST_PROXY_HOPS`, `WEB_PORT`, `API_BASE_URL`, `VITE_API_BASE_URL` (build time) |
 | Worker | `WORKER_CONCURRENCY` (default 2, max 8), `MAX_REPO_FILES` / `MAX_REPO_BYTES` (size to memory: ≈ 150 MiB + 30 KiB per file per job), `WORKER_HEALTH_PORT`, `CODEFLOW_GIT_TIMEOUT_MS`, `CODEFLOW_TMP_DIR`, `CODEFLOW_KEEP_TMP` |
+| Memory/storage guards | `MAX_INDEX_CHUNKS` (Q&A index cap; most connected files first; 4,000 on a 512 MB host), `EMBEDDING_CACHE=false` (no second copy of every vector in Mongo) |
+| Spending guards | `DAILY_LLM_BUDGET` / `DAILY_EMBEDDING_BUDGET` (tokens per UTC day, all visitors; default 5,000,000 each), `DAILY_AI_ANALYSES_PER_IP` / `DAILY_QUESTIONS_PER_IP` (per visitor per UTC day; unset = no cap; "map only" is never capped) |
 | Cost/observability | `LLM_PRICING`, `LANGFUSE_*`, `HELICONE_*`, `GIT_SHA` |
 | MCP/eval | `CODEFLOW_MCP_SCOPES`, `CODEFLOW_MCP_RESULT`/`_API`/`_JOB`, `EVAL_DATASET`, `EVAL_FAIL_ON_THRESHOLD` |
 
-Constants, not env vars (`constants.ts`): `DAILY_LLM_BUDGET` 5,000,000 · `RATE_MAX` 30 per 60 s ·
+Constants, not env vars (`constants.ts`): `DAILY_LLM_BUDGET` 5,000,000 (the default; env overrides) · `RATE_MAX` 30 per 60 s ·
 `MAX_FILES` 25,000 and `MAX_BYTES` 512 MB (checked after clone) · `FILE_TIMEOUT_MS` 5 s · RAG and agent caps.
 
 ### 3.7 Operating
@@ -361,13 +382,33 @@ architecture, but every part must earn its place with a number. Two modes: offli
 online = explanation (the user's own Claude/Cursor over MCP, or a built-in AI with their key).
 Out of scope: an AI line-by-line reviewer, auto-fixing, production tracing, an IDE plugin, migration tools.
 
-**Where things stand (2026-11-16):** everything that can be done in code is done and measured, except
-two languages (Rust, PHP — Phase 1). What remains otherwise needs the owner: merging, a key, secrets,
-a deploy, a recording (Phases 0 and 5).
+**Where things stand (2026-11-25):** the priority is the hosted demo; Rust and PHP (Phase 1) wait until
+after it. Deploy-readiness work done on `feat/languages`, all verified in the API image under a 512 MB
+limit with the worker in-process (Mongo/Redis/pgvector local; AI against a local OpenAI-compatible stub,
+so no money spent):
+- **Two modes**: "Map only" (free, no AI, never capped) and "Map + AI", chosen per analysis (`withAi`);
+  `/api/meta` reports `ai` + `limits`; an AI result replaces a stored map-only one for the same commit
+  (it used to be discarded: first write won).
+- **Cost guards for a few dollars of prepaid credit**: OpenAI default `gpt-4.1-mini`; env daily token
+  ceilings (`DAILY_LLM_BUDGET`, `DAILY_EMBEDDING_BUDGET`); per-visitor daily caps (`DAILY_AI_ANALYSES_PER_IP`,
+  `DAILY_QUESTIONS_PER_IP`, 429 `DAILY_LIMIT`); an answer cache on the agent Q&A path (a repeated
+  question made 0 model calls); prices via `LLM_PRICING`.
+- **Memory on 512 MB (measured)**: map only — nestjs/nest 2,811 files, 12 s, peak 280 MiB. With AI the
+  same repository **ran the process out of heap** (V8 limit ≈ 256 MB) because every vector was held
+  at once; with `MAX_INDEX_CHUNKS=4000` (most connected files first) it finished in 32 s at 316 MiB.
+  Embedding-cache round trips now run 16 at a time instead of one by one; `EMBEDDING_CACHE=false` keeps
+  vectors out of Mongo; `llmcache` entries expire after 30 days.
+- **Boot failures are logged** (they exited silently); OpenAI inputs over the embedding limit are trimmed;
+  Dockerfiles build only their app, one package at a time; `OPENAI_BASE_URL` for compatible endpoints.
+- **Website** rebuilt to the owner's design (fonts, colours, full-height hero with the real snapshot graph,
+  scroll-driven pipeline replay, routed C4 diagram), with the mode switch and plain-language banners;
+  no sample number from the design ships.
+What remains needs the owner: data stores awake, an OpenAI key and credit, Render env, merge, `NPM_TOKEN`
++ tag (the site shows `npx codeflow-local`), a recording.
 
 | Phase | Status | What is left |
 |---|---|---|
-| **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it | Owner: merge PRs; provide an API key (Gemini free tier) so the AI half and the scored eval run for the first time; grow eval sets from 8/10 to ~50 questions |
+| **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it (fast-forward of `main`, no conflicts) | Owner: merge; an OpenAI key (the owner has no Gemini key) so the AI half runs against a real model for the first time; grow eval sets from 8/10 to ~50 questions |
 | **1. Languages** | **Go, Java, C# and C/C++ done**, Python benchmarked too (above). C#: 100% recall on 5 repositories against Roslyn, CI on MediatR. Entry points also come from the code itself (`main-function` evidence: Go `func main` in `package main`, Java/C# `static void main`, C/C++/Rust `main`, Python `if __name__ == "__main__":`) | **Rust** — truth: `rust-analyzer lsif` (JSON lines: every reference → its definition's file) in the official `rust` image after `cargo fetch`; count `use` paths and type/function paths, not method calls (type inference, as with Java/C# member access). Resolver: the `mod` tree (`foo.rs` / `foo/mod.rs` / `#[path]`), `crate::`/`super::`/`self::`, Cargo workspaces, and `pub use` re-export chains (the hard part). **PHP** — truth: composer's class map + nikic/php-parser's NameResolver (`php:cli` image) over every file; resolver: PSR-4/PSR-0 from `composer.json`, `use` and namespaces, plus legacy `include`/`require` paths. Kotlin later. Follow §3.4; each is the size of the C# work. |
 | **2. Speed & scale** | **Done.** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); a one-file change re-analyses it in 7.8 s; graph identical throughout. Load test (`scripts/load-test.sh`: 26 repos as PR bots, 20 browsing users), 2026-11-16: 1 / 2 / 4 workers → 26/26 jobs each, 26.7 / 52.5 / 91.1 jobs/min (1.97x, 3.4x), job p50 25.7 / 14.8 / 7.6 s, API read p95 ≤ 50 ms, slowest request 115 ms, 0 errors in 15,549 requests; a worker at concurrency 2 peaked at 499 MiB. The first run's anomalies did not recur (`urfave/cli` completed in all 3 runs — its old error was never recorded, so which fix resolved it is unknown; no request exceeded 5 s — the old 205 s request is unexplained, and the 30 s deadline + slow-request log would now catch one). Memory per analysis ≈ 150 MiB + 30 KiB per file (MediatR 224 files 148 MiB, Hugo 2,615 / 264 MiB, django 7,030 / 293 MiB, Kubernetes 26,595 / 890 MiB; CLI, fresh cache), so the repo cap is a per-worker memory budget (`MAX_REPO_FILES` / `MAX_REPO_BYTES`, default 25,000); the Render blueprints are sized to 512 MB. Speculative prefetch is opt-in; fan-out/best-of-N off. | Optional: re-run the load test against the deployed demo (real network, real instances), and add one 10k+-file repository to the burst. |
 | **3. Online beats Claude alone** | **Pilot done** (README table, 76 runs, $4.02). Impact questions: + CodeFlow takes half the turns at 40–46% lower cost with equal accuracy; direct questions: a tie. Tuned from the runs: MCP server instructions (CodeFlow adoption 2/4 → 8/8), `listLimit` (MCP gets full lists; the 25-item cap had sent the client searching). `find_usages` added. | Scale the benchmark to large repositories (Kubernetes: Go truth is package-level, so impact questions per package) and more questions per kind; repeat runs to report variance. Ask the owner before spending on it. |

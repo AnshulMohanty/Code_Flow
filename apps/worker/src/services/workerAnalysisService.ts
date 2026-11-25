@@ -56,6 +56,12 @@ export const env = {
    */
   maxRepoFiles: positiveInt(process.env.MAX_REPO_FILES),
   maxRepoBytes: positiveInt(process.env.MAX_REPO_BYTES),
+  /** Chunks embedded per Q&A index (`MAX_INDEX_CHUNKS`); over it, the most connected files first.
+   *  Unset ⇒ no cap. Bounds memory, embedding spend and vector storage on a small host. */
+  maxIndexChunks: positiveInt(process.env.MAX_INDEX_CHUNKS),
+  /** `EMBEDDING_CACHE=false` skips the per-chunk embedding cache in Mongo (a second copy of every
+   *  vector; see the RAG stage). Default on. */
+  embeddingCache: (process.env.EMBEDDING_CACHE || "").trim().toLowerCase() !== "false",
   /** V3-P5 model routing: the cheap/fast model. Falls back to the single configured model. */
   fastModel: process.env.FAST_MODEL || "",
 };
@@ -171,6 +177,9 @@ const jobSchema = new Schema(
   { strict: true, timestamps: true },
 );
 
+/** How long an LLM/embedding cache entry lives in Mongo (see the TTL index below). */
+export const LLM_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
+
 // LLM-output cache (PLAN §6): keyed on (commitSha + assembled-prompt hash), SEPARATE from
 // the producedBy result-cache above. This is the wallet defense — re-runs of an AI stage
 // with an identical prompt hit this cache instead of the paid API.
@@ -181,6 +190,10 @@ const llmCacheSchema = new Schema(
   },
   { strict: true, timestamps: { createdAt: true, updatedAt: false } },
 );
+// Entries expire after 30 days (2026-11-25). The cache holds every embedding vector it was ever
+// handed (~20 KB each at 1536 dims), so without an expiry a free 512 MB Atlas cluster fills after a
+// handful of repositories. An expired entry is only a miss: the next run re-embeds, at cents.
+llmCacheSchema.index({ createdAt: 1 }, { expireAfterSeconds: LLM_CACHE_TTL_SECONDS });
 
 // SSE replay buffer (#20): one doc per emitted ProgressMessage; `seq` preserves emit order.
 // The API reads this same "jobevents" collection to replay a job from Ingest.
@@ -314,26 +327,28 @@ export function createMongoWorkerAnalysisService(): WorkerAnalysisService {
       );
 
       const completedAt = new Date();
+      const identity = {
+        repoFullName,
+        repositoryRef: payload.repositoryRef,
+        commitSha: actualCommitSha,
+        branch,
+        mode: payload.mode,
+        analyzerVersion: payload.analyzerVersion,
+      };
+      const content = { result, summary: result.summary, completedAt, durationMs };
+      // First write wins — EXCEPT that a result carrying AI output replaces one without it
+      // (2026-11-25). Two runs of one commit used to be identical, so keeping the first was safe; with
+      // "map only" and "map + AI" modes they are not, and keeping the first meant an AI run's guide and
+      // Q&A index were thrown away whenever a map-only result for that commit already existed. A
+      // map-only result never replaces anything: it is a subset of whatever is stored.
+      const hasAi = Boolean(result.ai?.synthesis || result.ai?.rag);
       const doc = await AnalysisModel.findOneAndUpdate(
         {
           repoFullName,
           commitSha: actualCommitSha,
           analyzerVersion: payload.analyzerVersion,
         },
-        {
-          $setOnInsert: {
-            repoFullName,
-            repositoryRef: payload.repositoryRef,
-            commitSha: actualCommitSha,
-            branch,
-            mode: payload.mode,
-            analyzerVersion: payload.analyzerVersion,
-            result,
-            summary: result.summary,
-            completedAt,
-            durationMs,
-          },
-        },
+        hasAi ? { $setOnInsert: identity, $set: content } : { $setOnInsert: { ...identity, ...content } },
         { returnDocument: "after", upsert: true },
       ).lean();
 

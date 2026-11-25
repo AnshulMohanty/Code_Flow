@@ -17,6 +17,10 @@ import { hasFinePointer, prefersReducedMotion } from "../lib/motion";
  * The position is written straight to `style.transform` inside a rAF loop. Routing 60 pointer
  * positions a second through React state would re-render the whole page on every mouse move, which
  * is a real cost paid for a decoration.
+ *
+ * MAGNETIC BUTTONS ride on the same listener. Any element marked `data-magnetic` leans toward the
+ * pointer (the design's 16% / 28% pull, bounded to 8px) — delegated here rather than wired per
+ * button, so it has exactly the same gate as the ring: a fine pointer and no reduced motion.
  */
 export function Cursor() {
   const ringRef = useRef<HTMLDivElement>(null);
@@ -40,10 +44,28 @@ export function Cursor() {
     let ringY = targetY;
     let frame = 0;
 
+    let magnet: HTMLElement | null = null;
+    const releaseMagnet = () => {
+      if (magnet) magnet.style.translate = "";
+      magnet = null;
+    };
+
     const onMove = (event: PointerEvent) => {
       targetX = event.clientX;
       targetY = event.clientY;
+      ring.dataset.on = "true";
+      dot.dataset.on = "true";
       dot.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
+      const pull = (event.target as Element | null)?.closest?.("[data-magnetic]") as HTMLElement | null;
+      if (magnet && magnet !== pull) releaseMagnet();
+      if (pull && !(pull as HTMLButtonElement).disabled) {
+        magnet = pull;
+        const rect = pull.getBoundingClientRect();
+        const clamp = (n: number) => Math.max(-8, Math.min(8, n));
+        const dx = clamp((event.clientX - (rect.left + rect.width / 2)) * 0.16);
+        const dy = clamp((event.clientY - (rect.top + rect.height / 2)) * 0.28);
+        pull.style.translate = `${dx.toFixed(1)}px ${dy.toFixed(1)}px`;
+      }
       // "Interactive" is asked of the DOM rather than tracked in state, so it is right for anything
       // clickable — including elements this component has never heard of.
       const over = (event.target as Element | null)?.closest?.("a, button, input, [role='button'], [tabindex]");
@@ -51,17 +73,26 @@ export function Cursor() {
     };
 
     const tick = () => {
-      // Critically damped enough to feel attached rather than elastic.
-      ringX += (targetX - ringX) * 0.18;
-      ringY += (targetY - ringY) * 0.18;
+      // The design's lag: 14% of the remaining distance per frame — a trail, not a spring.
+      ringX += (targetX - ringX) * 0.14;
+      ringY += (targetY - ringY) * 0.14;
       ring.style.transform = `translate3d(${ringX.toFixed(2)}px, ${ringY.toFixed(2)}px, 0)`;
       frame = requestAnimationFrame(tick);
     };
 
+    const onLeaveWindow = () => {
+      ring.dataset.on = "false";
+      dot.dataset.on = "false";
+      releaseMagnet();
+    };
+
     window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.addEventListener("pointerleave", onLeaveWindow);
     frame = requestAnimationFrame(tick);
     return () => {
       window.removeEventListener("pointermove", onMove);
+      document.documentElement.removeEventListener("pointerleave", onLeaveWindow);
+      releaseMagnet();
       cancelAnimationFrame(frame);
     };
   }, [enabled]);

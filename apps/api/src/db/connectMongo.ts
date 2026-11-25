@@ -12,7 +12,11 @@ export async function connectMongo() {
     });
     console.log("MongoDB connected for CodeFlow analysis cache.");
   } catch (error) {
-    console.error("MongoDB connection failed. Start Docker Desktop and run docker compose up -d.");
+    console.error(
+      "MongoDB connection failed. Locally: start Docker and run `docker compose up -d`. Deployed: check the " +
+        "database is running (a free Atlas cluster pauses after weeks with no connections; resume it in Atlas) " +
+        "and that its network access list allows this server.",
+    );
     throw error;
   }
 }
