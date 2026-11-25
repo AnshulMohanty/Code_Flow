@@ -398,17 +398,27 @@ so no money spent):
   at once; with `MAX_INDEX_CHUNKS=4000` (most connected files first) it finished in 32 s at 316 MiB.
   Embedding-cache round trips now run 16 at a time instead of one by one; `EMBEDDING_CACHE=false` keeps
   vectors out of Mongo; `llmcache` entries expire after 30 days.
-- **Boot failures are logged** (they exited silently); OpenAI inputs over the embedding limit are trimmed;
+- **Boot failures are logged** (they exited silently); OpenAI embedding inputs are cut to 8,000 UTF-8 bytes;
   Dockerfiles build only their app, one package at a time; `OPENAI_BASE_URL` for compatible endpoints.
 - **Website** rebuilt to the owner's design (fonts, colours, full-height hero with the real snapshot graph,
   scroll-driven pipeline replay, routed C4 diagram), with the mode switch and plain-language banners;
   no sample number from the design ships.
-What remains needs the owner: data stores awake, an OpenAI key and credit, Render env, merge, `NPM_TOKEN`
-+ tag (the site shows `npx codeflow-local`), a recording.
+
+**Live (2026-11-26)**: merged to `main` (PR #6) and deployed on Render's free plan with new Atlas M0 and
+Upstash databases and the existing Neon project; `/api/meta` reports AI on (`openai`, `gpt-4.1-mini`).
+First runs against the real OpenAI API (measured by the deployed instance): the-super-tiny-compiler, full
+AI run in 16.5 s for $0.0016 (16,081 input / 420 output tokens); expressjs/express 27.5 s;
+AnshulMohanty/Code_Flow 102 s; a Q&A answer cited the right file in 12 s, and the same question again
+answered from the cache in 1 s. psf/requests lost its Q&A index: one input passed OpenAI's 8,192-token
+limit under the old 12,000-character cut, so the cut is now 8,000 bytes (each token is at least one
+byte, so this cannot happen again). `scripts/prewarm-demos.mjs` ignored its URL argument unless
+`--only` was given; fixed.
+What remains needs the owner: deploy the byte-cap fix and re-warm psf/requests, `NPM_TOKEN` + tag (the
+site shows `npx codeflow-local`, which is not on npm yet), a recording.
 
 | Phase | Status | What is left |
 |---|---|---|
-| **0. Land** | PR #4 (`fix/real-repo-correctness`) open; `feat/languages` builds on it (fast-forward of `main`, no conflicts) | Owner: merge; an OpenAI key (the owner has no Gemini key) so the AI half runs against a real model for the first time; grow eval sets from 8/10 to ~50 questions |
+| **0. Land** | **Done.** Merged (PR #6) and live on Render with OpenAI (2026-11-26, above) | Grow eval sets from 8/10 to ~50 questions |
 | **1. Languages** | **Go, Java, C# and C/C++ done**, Python benchmarked too (above). C#: 100% recall on 5 repositories against Roslyn, CI on MediatR. Entry points also come from the code itself (`main-function` evidence: Go `func main` in `package main`, Java/C# `static void main`, C/C++/Rust `main`, Python `if __name__ == "__main__":`) | **Rust** — truth: `rust-analyzer lsif` (JSON lines: every reference → its definition's file) in the official `rust` image after `cargo fetch`; count `use` paths and type/function paths, not method calls (type inference, as with Java/C# member access). Resolver: the `mod` tree (`foo.rs` / `foo/mod.rs` / `#[path]`), `crate::`/`super::`/`self::`, Cargo workspaces, and `pub use` re-export chains (the hard part). **PHP** — truth: composer's class map + nikic/php-parser's NameResolver (`php:cli` image) over every file; resolver: PSR-4/PSR-0 from `composer.json`, `use` and namespaces, plus legacy `include`/`require` paths. Kotlin later. Follow §3.4; each is the size of the C# work. |
 | **2. Speed & scale** | **Done.** Kubernetes 34 s → 20.7 s and 1.95 GB → 1.07 GB peak (parse once, one walk per file, streamed output); a one-file change re-analyses it in 7.8 s; graph identical throughout. Load test (`scripts/load-test.sh`: 26 repos as PR bots, 20 browsing users), 2026-11-16: 1 / 2 / 4 workers → 26/26 jobs each, 26.7 / 52.5 / 91.1 jobs/min (1.97x, 3.4x), job p50 25.7 / 14.8 / 7.6 s, API read p95 ≤ 50 ms, slowest request 115 ms, 0 errors in 15,549 requests; a worker at concurrency 2 peaked at 499 MiB. The first run's anomalies did not recur (`urfave/cli` completed in all 3 runs — its old error was never recorded, so which fix resolved it is unknown; no request exceeded 5 s — the old 205 s request is unexplained, and the 30 s deadline + slow-request log would now catch one). Memory per analysis ≈ 150 MiB + 30 KiB per file (MediatR 224 files 148 MiB, Hugo 2,615 / 264 MiB, django 7,030 / 293 MiB, Kubernetes 26,595 / 890 MiB; CLI, fresh cache), so the repo cap is a per-worker memory budget (`MAX_REPO_FILES` / `MAX_REPO_BYTES`, default 25,000); the Render blueprints are sized to 512 MB. Speculative prefetch is opt-in; fan-out/best-of-N off. | Optional: re-run the load test against the deployed demo (real network, real instances), and add one 10k+-file repository to the burst. |
 | **3. Online beats Claude alone** | **Pilot done** (README table, 76 runs, $4.02). Impact questions: + CodeFlow takes half the turns at 40–46% lower cost with equal accuracy; direct questions: a tie. Tuned from the runs: MCP server instructions (CodeFlow adoption 2/4 → 8/8), `listLimit` (MCP gets full lists; the 25-item cap had sent the client searching). `find_usages` added. | Scale the benchmark to large repositories (Kubernetes: Go truth is package-level, so impact questions per package) and more questions per kind; repeat runs to report variance. Ask the owner before spending on it. |

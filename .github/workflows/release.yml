@@ -44,7 +44,7 @@ jobs:
           cp README.md apps/local-cli/README.md
       - name: Build the bundle
         run: |
-          pnpm --filter "codeflow-local..." build
+          pnpm --filter "codeflow-local..." --workspace-concurrency=1 build
           pnpm --filter codeflow-local bundle
       - name: Publish
         working-directory: apps/local-cli

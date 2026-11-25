@@ -288,13 +288,30 @@ const OPENAI_EMBED_FALLBACK_DIM = 1536;
  */
 const OPENAI_EMBED_MAX_BATCH = 256;
 /**
- * Longest text sent per input. OpenAI's v3 embedding models reject an input over 8,192 tokens with a
- * 400 (they do not truncate, unlike Gemini), and the RAG stage allows a chunk up to 32K estimated
- * tokens — so one very large function would fail the whole index build. 12,000 characters is about
- * 3–4K tokens of typical code, under the limit with room for dense text. Only the VECTOR is built from
- * the head of an oversized chunk; the stored chunk text and its cited line range stay whole.
+ * Longest text sent per input, in UTF-8 BYTES. OpenAI's v3 embedding models reject an input over
+ * 8,192 tokens with a 400 (they do not truncate, unlike Gemini), and the RAG stage allows a chunk up to
+ * 32K estimated tokens — so one very large chunk would fail the whole index build.
+ *
+ * Bytes, not characters, because only bytes give a guarantee: the tokenizer is byte-level BPE and
+ * every token covers at least one byte, so 8,000 bytes is at most 8,000 tokens whatever the text is.
+ * A character cap is not safe. 12,000 characters (the first version) is ~3–4K tokens of ordinary code,
+ * but psf/requests had a chunk dense enough to pass 8,192 tokens and the deployed index build failed
+ * on it (2026-11-26). Only the VECTOR is built from the head of an oversized chunk; the stored chunk
+ * text and its cited line range stay whole.
  */
-export const OPENAI_EMBED_MAX_INPUT_CHARS = 12_000;
+export const OPENAI_EMBED_MAX_INPUT_BYTES = 8_000;
+
+/** The longest prefix of `text` that is at most `maxBytes` in UTF-8, never splitting a character. */
+export function headWithinUtf8Bytes(text: string, maxBytes: number): string {
+  // One UTF-16 code unit is at most 3 UTF-8 bytes, so a string this short always fits.
+  if (text.length * 3 <= maxBytes) return text;
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  // Back up to the first byte of a character: UTF-8 continuation bytes look like 10xxxxxx.
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
 
 /** The model's native vector width, exported so config resolution and tests agree on one answer. */
 export function openAiEmbeddingDimension(model: string): number {
@@ -341,7 +358,7 @@ export function createOpenAiEmbeddingClient(options: OpenAiEmbeddingClientOption
       for (let offset = 0; offset < request.texts.length; offset += OPENAI_EMBED_MAX_BATCH) {
         const batch = request.texts
           .slice(offset, offset + OPENAI_EMBED_MAX_BATCH)
-          .map((text) => (text.length > OPENAI_EMBED_MAX_INPUT_CHARS ? text.slice(0, OPENAI_EMBED_MAX_INPUT_CHARS) : text));
+          .map((text) => headWithinUtf8Bytes(text, OPENAI_EMBED_MAX_INPUT_BYTES));
         const response = await fetch(`${baseUrl}/v1/embeddings`, {
           method: "POST",
           headers: {

@@ -43,7 +43,8 @@ const DEMOS = [
 const args = process.argv.slice(2);
 const onlyIndex = args.indexOf("--only");
 const only = onlyIndex >= 0 ? args[onlyIndex + 1] : undefined;
-const positional = args.filter((value, index) => !value.startsWith("--") && index !== onlyIndex + 1);
+// `onlyIndex < 0 ||` matters: without --only, `onlyIndex + 1` is 0 — the URL itself.
+const positional = args.filter((value, index) => !value.startsWith("--") && (onlyIndex < 0 || index !== onlyIndex + 1));
 const base = (positional[0] ?? process.env.CODEFLOW_API_URL ?? "").replace(/\/+$/, "");
 
 if (!base) {
