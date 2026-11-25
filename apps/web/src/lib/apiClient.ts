@@ -29,6 +29,12 @@ export interface CreateAnalysisJobInput {
   repo?: string;
   branch?: string;
   repoUrl?: string;
+  /**
+   * The visitor's mode. `false` = "Map only": the deterministic stages, nothing spent. `true` asks
+   * for the AI stages too (the server still runs them only if it has a provider). Omitted entirely
+   * for a server that does not report modes, so the request is exactly what it was before.
+   */
+  withAi?: boolean;
 }
 
 export interface CreateAnalysisJobResponse {
@@ -200,6 +206,17 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 function isApiErrorPayload(value: unknown): value is ApiErrorPayload {
   return typeof value === "object" && value !== null && "error" in value;
+}
+
+/** The API's machine-readable error code (`{ error: { code } }`), when the response carried one. */
+export function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiClientError)) return null;
+  return isApiErrorPayload(error.payload) ? error.payload.error.code : null;
+}
+
+/** A 429 the server attributes to the per-visitor DAILY cap — distinct from a per-minute rate limit. */
+export function isDailyLimitError(error: unknown): boolean {
+  return apiErrorCode(error) === "DAILY_LIMIT";
 }
 
 export class ApiClientError extends Error {

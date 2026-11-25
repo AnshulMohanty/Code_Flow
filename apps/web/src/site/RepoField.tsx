@@ -1,4 +1,6 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type RefObject } from "react";
+import { ModeSwitch } from "../components/ModeSwitch";
+import type { AiAvailability, AiChoice } from "../lib/aiMode";
 
 /**
  * THE REPO FIELD — `github.com/<owner>/<repo>` + Analyze.
@@ -34,9 +36,18 @@ export interface RepoFieldProps {
    * backend that is waking is worth waiting for, and one that never answered is not.
    */
   notReady?: string | null;
+  /**
+   * The Map only / Map + AI switch, rendered beside the button. Absent ⇒ no switch (an older server
+   * that cannot honour it, or a caller that does not offer modes).
+   */
+  mode?: { choice: AiChoice; availability: AiAvailability; onChange(choice: AiChoice): void } | null;
+  /** One action offered beside an error — e.g. "Use Map only" after a daily-limit refusal. */
+  errorAction?: { label: string; run(): void } | null;
+  /** The design's magnetic Analyze button. */
+  buttonRef?: RefObject<HTMLButtonElement>;
 }
 
-export function RepoField({ onAnalyze, busy, autoFocus, error, notReady }: RepoFieldProps) {
+export function RepoField({ onAnalyze, busy, autoFocus, error, notReady, mode, errorAction, buttonRef }: RepoFieldProps) {
   const [value, setValue] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
 
@@ -56,7 +67,8 @@ export function RepoField({ onAnalyze, busy, autoFocus, error, notReady }: RepoF
   };
 
   return (
-    <form onSubmit={submit} noValidate>
+    <form onSubmit={submit} noValidate className="repo-form">
+      <div className="repo-row">
       <div className="repo-input">
         <span className="repo-input-prefix" aria-hidden="true">
           github.com/
@@ -75,13 +87,28 @@ export function RepoField({ onAnalyze, busy, autoFocus, error, notReady }: RepoF
             if (parseError) setParseError(null);
           }}
         />
-        <button type="submit" disabled={busy || Boolean(notReady)} title={notReady ?? undefined}>
+        <button
+          type="submit"
+          ref={buttonRef}
+          data-magnetic="true"
+          disabled={busy || Boolean(notReady)}
+          title={notReady ?? undefined}
+        >
           {busy ? "Analyzing…" : notReady ? "Warming up…" : "Analyze"}
         </button>
       </div>
+      {mode ? (
+        <ModeSwitch choice={mode.choice} availability={mode.availability} onChange={mode.onChange} disabled={busy} />
+      ) : null}
+      </div>
       {parseError || error ? (
-        <p className="subline" role="alert" style={{ color: "var(--oxblood)" }}>
-          {parseError ?? error}
+        <p className="subline repo-error" role="alert">
+          <span>{parseError ?? error}</span>
+          {!parseError && errorAction ? (
+            <button type="button" className="link-btn" onClick={errorAction.run}>
+              {errorAction.label}
+            </button>
+          ) : null}
         </p>
       ) : notReady ? (
         // Not role="alert": nothing has gone wrong. It is a state the page is passing through, and

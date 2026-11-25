@@ -57,6 +57,12 @@ export interface RevealOptions {
   threshold?: number;
   /** Shrinks the viewport from the bottom so an element reveals slightly before it is fully in. */
   rootMargin?: string;
+  /**
+   * Observe the element's PARENT instead of the element. Required for the `clip` variant: Chromium's
+   * IntersectionObserver measures the CLIPPED box, and a heading clipped to nothing has no area to
+   * intersect — so it would wait for ever. Its parent is never clipped and sits in the same place.
+   */
+  observeParent?: boolean;
 }
 
 /**
@@ -82,7 +88,7 @@ export function useReveal<T extends HTMLElement>(options: RevealOptions = {}): {
       setRevealed(true);
       return;
     }
-    const element = ref.current;
+    const element = options.observeParent ? (ref.current?.parentElement ?? ref.current) : ref.current;
     if (!element) return;
     const observer = new IntersectionObserver(
       (entries) => {
@@ -95,7 +101,7 @@ export function useReveal<T extends HTMLElement>(options: RevealOptions = {}): {
     );
     observer.observe(element);
     return () => observer.disconnect();
-  }, [unobservable, options.threshold, options.rootMargin]);
+  }, [unobservable, options.threshold, options.rootMargin, options.observeParent]);
 
   return { ref, revealed };
 }
@@ -114,7 +120,7 @@ export function useRevealAttrs<T extends HTMLElement>(
   variant: "up" | "clip" = "up",
   options: RevealOptions = {},
 ): { ref: RefObject<T>; "data-reveal": string; "data-revealed": boolean } {
-  const { ref, revealed } = useReveal<T>(options);
+  const { ref, revealed } = useReveal<T>({ observeParent: variant === "clip", ...options });
   return { ref, "data-reveal": variant, "data-revealed": revealed };
 }
 
@@ -165,7 +171,7 @@ export function useCountUp(target: number | null, options: CountUpOptions = {}):
  * under the cursor that is chasing it. Disabled outright without a fine pointer: on touch there is
  * no hover to lean into, and the listener would only cost battery.
  */
-export function useMagnetic<T extends HTMLElement>(maxPx = 6): RefObject<T> {
+export function useMagnetic<T extends HTMLElement>(maxPx = 8): RefObject<T> {
   const ref = useRef<T>(null);
 
   useEffect(() => {
@@ -175,13 +181,16 @@ export function useMagnetic<T extends HTMLElement>(maxPx = 6): RefObject<T> {
 
     const onMove = (event: PointerEvent) => {
       const rect = element.getBoundingClientRect();
-      const dx = (event.clientX - (rect.left + rect.width / 2)) / (rect.width / 2);
-      const dy = (event.clientY - (rect.top + rect.height / 2)) / (rect.height / 2);
-      const clamp = (n: number) => Math.max(-1, Math.min(1, n)) * maxPx;
-      element.style.transform = `translate(${clamp(dx).toFixed(2)}px, ${clamp(dy).toFixed(2)}px)`;
+      // The design's pull: 16% of the horizontal offset, 28% of the vertical, bounded so the hit
+      // area never leaves the pointer. Written to `translate`, not `transform`, so a hover lift in
+      // CSS (`transform: translateY(-1px)`) composes with it instead of being overwritten.
+      const clamp = (n: number) => Math.max(-maxPx, Math.min(maxPx, n));
+      const dx = clamp((event.clientX - (rect.left + rect.width / 2)) * 0.16);
+      const dy = clamp((event.clientY - (rect.top + rect.height / 2)) * 0.28);
+      element.style.translate = `${dx.toFixed(1)}px ${dy.toFixed(1)}px`;
     };
     const onLeave = () => {
-      element.style.transform = "";
+      element.style.translate = "";
     };
 
     element.addEventListener("pointermove", onMove);
@@ -194,4 +203,34 @@ export function useMagnetic<T extends HTMLElement>(maxPx = 6): RefObject<T> {
   }, [maxPx]);
 
   return ref;
+}
+
+/**
+ * TYPE-OUT for a REAL string — an answer, or the honest reason there is none.
+ *
+ * `active: false` shows nothing (the card's rail has not finished, so the answer is not "spoken"
+ * yet); `active: true` types the text three characters per 16ms, the design's cadence. Under reduced
+ * motion, or where timers cannot be trusted to animate, the whole text appears at once. A changed
+ * `text` restarts from the beginning, because a half-typed old answer under a new question would be
+ * a sentence nobody wrote.
+ */
+export function useTypewriter(text: string, active: boolean): { shown: string; done: boolean } {
+  const still = prefersReducedMotion();
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    if (!active || still) return;
+    setCount(0);
+    let current = 0;
+    const timer = window.setInterval(() => {
+      current = Math.min(text.length, current + 3);
+      setCount(current);
+      if (current >= text.length) window.clearInterval(timer);
+    }, 16);
+    return () => window.clearInterval(timer);
+  }, [text, active, still]);
+
+  if (!active) return { shown: "", done: false };
+  if (still) return { shown: text, done: true };
+  return { shown: text.slice(0, count), done: count >= text.length };
 }

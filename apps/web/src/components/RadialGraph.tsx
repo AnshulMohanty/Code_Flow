@@ -1,6 +1,10 @@
 import { useMemo, useState } from "react";
 import type { GraphModel } from "../lib/graphModel";
 import { edgeKey, radialFocus, radialLayout } from "../lib/radial";
+import { areaOf } from "../lib/heroGraph";
+
+/** The design's muted hues, by AREA (package or top-level directory) — a fact from the path. */
+const AREA_HUES = ["#8C4038", "#41626A", "#6B5B45", "#75505C", "#37484F", "#4F4A38", "#5C4E40", "#42504A"];
 import { moduleLabel } from "../lib/citation";
 import { count } from "../lib/siteModel";
 
@@ -25,11 +29,23 @@ export interface RadialGraphProps {
   readout?: string | null;
   /** Rendered above the graph. The design's "DEPENDENCY GRAPH · RINGS = HOW FOUNDATIONAL". */
   caption?: string;
+  /**
+   * The design's "graph easing into place". False holds every node pushed out along its own spoke
+   * with the edges undrawn; flipping it to true lets CSS ease them home, inner rings last, then draws
+   * the edges and starts the travelling dashes. Omitted ⇒ always assembled (no animation).
+   */
+  assembled?: boolean;
 }
 
-export function RadialGraph({ model, selectedId, onSelect, readout, caption }: RadialGraphProps) {
+export function RadialGraph({ model, selectedId, onSelect, readout, caption, assembled = true }: RadialGraphProps) {
   const layout = useMemo(() => radialLayout(model), [model]);
   const focus = useMemo(() => radialFocus(model, selectedId), [model, selectedId]);
+  const hueOf = useMemo(() => {
+    const tally = new Map<string, number>();
+    for (const node of layout.nodes) tally.set(areaOf(node.id), (tally.get(areaOf(node.id)) ?? 0) + 1);
+    const order = [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([area]) => area);
+    return (id: string) => AREA_HUES[order.indexOf(areaOf(id)) % AREA_HUES.length];
+  }, [layout]);
   // WHAT AN EDGE IS, on hover. The design's instruction is "hover a module · hover an edge for the
   // import", and an unlabelled line is the one thing in this picture a reader cannot decode. The
   // tooltip states the real, resolved edge — `importer → imported` — and nothing else.
@@ -59,6 +75,7 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
         viewBox={`0 0 ${layout.size} ${layout.size}`}
         preserveAspectRatio="xMidYMid meet"
         data-focused={focused}
+        data-assembled={assembled}
         role="img"
         aria-label={`Dependency graph: ${count(model.nodeCount)} modules, ${count(model.linkCount)} resolved edges. Distance from the centre is how foundational a module is.`}
       >
@@ -75,12 +92,17 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
           />
         ))}
 
-        {layout.edges.map((edge) => {
+        {layout.edges.map((edge, index) => {
           const key = edgeKey(edge.from, edge.to);
           const hot = focus.edges.has(key);
           return (
-            <g key={key}>
-              <path className="graph-edge" d={edge.path} data-hot={hot ? "true" : undefined} />
+            // Indexed: a file can import another twice (a value import and a type import), which
+            // are two real edges with the same endpoints.
+            <g key={`${index}:${key}`}>
+              <path className="graph-edge" d={edge.path} pathLength={1} data-hot={hot ? "true" : undefined} />
+              {/* The travelling dash: import direction, importer → imported. Pure decoration over
+                  the same geometry; CSS stops it under reduced motion and while a node is focused. */}
+              <path className="graph-flow" d={edge.path} aria-hidden="true" />
               {/* A transparent fat stroke over the hairline: the drawn edge is under a pixel wide and
                   no pointer can reliably land on it. Same geometry, so the hit area is never
                   somewhere the line is not. */}
@@ -107,6 +129,15 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
               key={node.id}
               className="graph-node"
               data-hot={hot ? "true" : undefined}
+              style={
+                {
+                  // Where this node waits before assembling: further out along its own spoke, with a
+                  // little spin, released inner-ring-last — the design's settle, as CSS.
+                  "--dx": `${((node.x - layout.size / 2) * (0.55 + (node.ring % 3) * 0.08)).toFixed(1)}px`,
+                  "--dy": `${((node.y - layout.size / 2) * (0.55 + (node.ring % 3) * 0.08)).toFixed(1)}px`,
+                  "--delay": `${(4 - node.ring) * 58}ms`,
+                } as React.CSSProperties
+              }
               onClick={() => onSelect(node.id === selectedId ? null : node.id)}
               role="button"
               tabIndex={0}
@@ -123,13 +154,18 @@ export function RadialGraph({ model, selectedId, onSelect, readout, caption }: R
                 cx={node.x}
                 cy={node.y}
                 r={hot ? node.radius + 1.4 : node.radius}
-                fill={hot ? "var(--rust)" : "var(--chalk-3)"}
+                fill={hot ? "var(--rust)" : hueOf(node.id)}
               />
               {/* A generous invisible hit area: the dots are small by design, and a 3px click target
                   makes the graph unusable with a trackpad. */}
               <circle cx={node.x} cy={node.y} r={Math.max(9, node.radius + 6)} fill="transparent" />
               {node.labelled || hot ? (
-                <text className="graph-label" x={node.x + node.radius + 5} y={node.y + 3}>
+                <text
+                  className="graph-label"
+                  x={node.labelAnchor === "start" ? node.x + node.radius + 5 : node.x - node.radius - 5}
+                  y={node.y + 4}
+                  textAnchor={node.labelAnchor}
+                >
                   {node.label}
                 </text>
               ) : null}

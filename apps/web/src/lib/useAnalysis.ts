@@ -1,10 +1,12 @@
 import type { AnalysisResult, ProgressEvent } from "@codeflow/shared-types";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { DAILY_LIMIT_ANALYZE_COPY, DAILY_LIMIT_ASK_COPY } from "./aiMode";
 import {
   askRepo,
   createAnalysisJob,
   getJob,
   getResult,
+  isDailyLimitError,
   normalizeApiError,
   streamJobEvents,
   type ApiJobProgress,
@@ -39,8 +41,22 @@ export interface AnalysisState {
   progress: ApiJobProgress | null;
   result: AnalysisResult | null;
   error: string | null;
+  /**
+   * The API's error code when the failure carried one. `DAILY_LIMIT` is the one the UI branches on:
+   * it is not a failure of the product but a cap on AI spend, and the answer to it (Map only) is one
+   * click away — so it gets its own copy and an action, not the generic error line.
+   */
+  errorCode: string | null;
   /** What the user typed, so the workbench can show it while resolving. */
   target: string | null;
+  /** The `withAi` this run was requested with (undefined = not sent). Lets a resolving view say
+   *  "map only — not requested" instead of "not configured" before the result arrives. */
+  requestedWithAi?: boolean;
+}
+
+export interface AnalyzeOptions {
+  /** See `CreateAnalysisJobInput.withAi`. Undefined ⇒ the field is not sent. */
+  withAi?: boolean;
 }
 
 export interface AskState {
@@ -62,6 +78,7 @@ const IDLE: AnalysisState = {
   progress: null,
   result: null,
   error: null,
+  errorCode: null,
   target: null,
 };
 
@@ -148,15 +165,26 @@ export function useAnalysis() {
   );
 
   const analyze = useCallback(
-    async (input: { owner: string; repo: string }) => {
+    async (input: { owner: string; repo: string }, options: AnalyzeOptions = {}) => {
       teardown();
       settledRef.current = false;
       const target = `${input.owner}/${input.repo}`;
-      setState({ ...IDLE, phase: "starting", target, events: new Map() });
+      setState({
+        ...IDLE,
+        phase: "starting",
+        target,
+        events: new Map(),
+        ...(options.withAi !== undefined ? { requestedWithAi: options.withAi } : {}),
+      });
       setAsk({ question: null, answer: null, busy: false, error: null });
 
       try {
-        const created = await createAnalysisJob({ mode: "public_hosted", owner: input.owner, repo: input.repo });
+        const created = await createAnalysisJob({
+          mode: "public_hosted",
+          owner: input.owner,
+          repo: input.repo,
+          ...(options.withAi !== undefined ? { withAi: options.withAi } : {}),
+        });
         activeJobRef.current = created.jobId;
         setState((current) => ({ ...current, phase: "running", jobId: created.jobId }));
 
@@ -183,7 +211,13 @@ export function useAnalysis() {
         // per-stage stream is lost, and that is a degradation worth having over a dead screen.
         if (!source) startPolling(created.jobId);
       } catch (error) {
-        setState((current) => ({ ...current, phase: "failed", error: normalizeApiError(error) }));
+        const dailyLimit = isDailyLimitError(error);
+        setState((current) => ({
+          ...current,
+          phase: "failed",
+          error: dailyLimit ? DAILY_LIMIT_ANALYZE_COPY : normalizeApiError(error),
+          errorCode: dailyLimit ? "DAILY_LIMIT" : null,
+        }));
       }
     },
     [finalize, startPolling, teardown],
@@ -206,7 +240,12 @@ export function useAnalysis() {
         const answer = await askRepo(jobId, question);
         setAsk({ question, answer, busy: false, error: null });
       } catch (error) {
-        setAsk({ question, answer: null, busy: false, error: normalizeApiError(error) });
+        setAsk({
+          question,
+          answer: null,
+          busy: false,
+          error: isDailyLimitError(error) ? DAILY_LIMIT_ASK_COPY : normalizeApiError(error),
+        });
       }
     },
     [state.jobId],

@@ -128,7 +128,7 @@ describe("MarketingSite renders a snapshot only WITH its provenance", () => {
         meta={{ status: "loading", facts: null, error: null }}
         wake={{ status: "waking", attempts: 1, reachable: false }}
         demo={demo}
-        analysis={{ phase: "idle", jobId: null, events: new Map(), progress: null, result: null, error: null, target: null }}
+        analysis={{ phase: "idle", jobId: null, events: new Map(), progress: null, result: null, error: null, errorCode: null, target: null }}
         ask={{ question: null, answer: null, busy: false, error: null }}
         onAnalyze={() => {}}
         onAsk={() => {}}
@@ -156,6 +156,23 @@ describe("MarketingSite renders a snapshot only WITH its provenance", () => {
     renderWith(snapshot());
     const link = screen.getByRole("link", { name: /view the commit/i });
     expect(link).toHaveAttribute("href", expect.stringContaining("a".repeat(40)));
+  });
+
+  it("labels the HERO MAP with the snapshot's repository, commit and how much of it is drawn", () => {
+    // The hero graph is drawn from the snapshot's REAL graph, so the label beside it must say which
+    // analysis it is, that it is not a live run, and that it is a cut of the whole.
+    const demo = snapshot();
+    renderWith(demo);
+    const label = document.querySelector('[data-hero-graph-label="true"]') as HTMLElement;
+    expect(label).toBeInTheDocument();
+    expect(label).toHaveTextContent("acme/demo-repo @ " + "a".repeat(7));
+    expect(label).toHaveTextContent(/pre-computed demo, not a live run/i);
+    const total = demo.result.graph!.nodes.length;
+    const connected = new Set(demo.result.graph!.edges.flatMap((edge) => [edge.from, edge.to])).size;
+    expect(label).toHaveTextContent(`${connected} of ${total} modules drawn`);
+    // No fine pointer in jsdom, so no hover invitation is made — it is only offered when true.
+    expect(screen.queryByText(/hover any module/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/representative shape/i)).not.toBeInTheDocument();
   });
 
   it("renders NO banner and keeps the empty state when there is no snapshot", () => {

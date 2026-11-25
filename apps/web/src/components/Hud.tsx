@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { API_BASE_URL } from "../lib/apiClient";
 import { formatStat, NOT_MEASURED, type RunNumbers } from "../lib/siteModel";
+import { showToast } from "./Toast";
 
 /**
  * THE HUD — `p50 <x>ms · $<y> measured · copy as cURL`.
@@ -37,7 +38,15 @@ export function Hud({ numbers, jobId }: HudProps) {
       <span title={cost.value === null ? cost.absentReason : "Read back from the provider's own usage counters"}>
         {formatStat(cost)}{" "}
         {cost.value === null ? (
-          <span className="hud-measured">{cost.absentReason ? "unpriced" : "not measured"}</span>
+          <span className="hud-measured">
+            {/* Three different absences, three different words: nothing was spent, something was
+                spent but no price is configured, or nobody measured it. */}
+            {cost.absentReason?.includes("no paid provider call")
+              ? "no AI spend"
+              : cost.absentReason?.includes("price")
+                ? "unpriced"
+                : "not measured"}
+          </span>
         ) : cost.measured === false ? (
           <span className="hud-estimated">estimated</span>
         ) : (
@@ -72,7 +81,10 @@ export function CopyCurl({ jobId }: { jobId: string }) {
         if (clipboard) {
           void clipboard
             .writeText(command)
-            .then(() => setState("copied"))
+            .then(() => {
+              setState("copied");
+              showToast("⌗ cURL copied — the request behind this view");
+            })
             .catch(() => setState("failed"));
         } else {
           setState("failed");

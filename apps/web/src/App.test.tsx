@@ -132,11 +132,15 @@ describe("the marketing site, before any analysis", () => {
     expect(screen.getByText(/never with sample data/i)).toBeInTheDocument();
   });
 
-  it("labels the hero mesh as a representative shape, not a repository", async () => {
-    // A graph-shaped graphic on a page arguing for real data must say what it is.
+  it("draws NO hero map when there is no real analysis to draw — and claims nothing hoverable", async () => {
+    // The hero map is a real graph or nothing. With no snapshot and no run there is nothing real
+    // to draw, so there is no canvas, no map label, and no "hover any module" invitation.
     vi.stubGlobal("fetch", stubFetch({}));
     render(<App />);
-    expect(screen.getByText(/representative shape · not a repository/i)).toBeInTheDocument();
+    expect(document.querySelector(".hero-canvas")).toBeNull();
+    expect(document.querySelector('[data-hero-graph-label="true"]')).toBeNull();
+    expect(screen.queryByText(/hover any module/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/representative shape/i)).not.toBeInTheDocument();
   });
 
   it("has NO path to mock data anywhere in the UI", async () => {

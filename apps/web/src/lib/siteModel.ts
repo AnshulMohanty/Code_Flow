@@ -1,4 +1,5 @@
-import type { AnalysisResult, PipelineStageId, RunMode, StageRunRecord } from "@codeflow/shared-types";
+import type { AnalysisResult, DegradationReason, PipelineStageId, RunMode, StageRunRecord } from "@codeflow/shared-types";
+import { degradationCopy, degradationShort, visitorWarnings } from "./aiMode";
 
 /**
  * THE MEASURED READ-MODEL (V3-FINAL) — every number the site and workbench chrome display.
@@ -85,6 +86,10 @@ export interface GroundingReport {
   headline: string;
   /** The honest reason, built from the run's real degradations and resolution counts. */
   detail: string;
+  /** The design's mono `cause:` line — the single most specific fact behind the state. */
+  cause: string;
+  /** The design's `next:` line — what a reader can do about it. Advice tied to the cause, no data. */
+  next: string;
 }
 
 // ── The whole model ─────────────────────────────────────────────────────────
@@ -95,6 +100,21 @@ export interface MetaFacts {
   answerLatency: { p50Ms: number | null; p95Ms: number | null; sampleCount: number; scope: string };
   indexed: Array<{ analysisId: string; repoFullName: string; commitSha: string; fileCount: number; completedAt: string }>;
   serverTime: string;
+  /**
+   * What AI this server can run (2026-11-25). OPTIONAL: an older server omits it, and the UI then
+   * behaves exactly as it did before the two modes existed. `configError` is operator text and is
+   * never rendered.
+   */
+  ai?: {
+    enabled: boolean;
+    provider: string | null;
+    chatModel: string | null;
+    embeddingModel: string | null;
+    qaEnabled?: boolean;
+    configError?: string;
+  };
+  /** Per-visitor daily caps, or null when uncapped. Optional for the same reason as `ai`. */
+  limits?: { dailyAiAnalysesPerIp: number | null; dailyQuestionsPerIp: number | null };
 }
 
 export interface SiteModel {
@@ -108,7 +128,10 @@ export interface SiteModel {
   grounding: GroundingReport;
   /** Total wall-clock of the run, summed from real per-stage durations. Null when none finished. */
   totalMs: number | null;
-  /** Warnings the run recorded, verbatim. The UI shows them; it does not soften them. */
+  /**
+   * Warnings the run recorded, verbatim — minus the operator-facing ones that name an environment
+   * variable, which are for whoever runs the server and are restated in plain words by the banners.
+   */
   warnings: string[];
 }
 
@@ -116,7 +139,7 @@ const EM_DASH_REASONS = {
   noRag: "no Q&A index was built on this run",
   noAsk: "nobody has asked a question on this server yet",
   noSpend: "this run made no paid provider call",
-  unpriced: "no model price is configured (LLM_PRICING)",
+  unpriced: "no model price is configured on this server",
   noRun: "no analysis has been run yet",
 } as const;
 
@@ -143,7 +166,7 @@ export function buildSiteModel(result: AnalysisResult, meta: MetaFacts | null): 
     numbers: buildNumbers(result, meta),
     grounding: buildGrounding(result),
     totalMs: finished.length > 0 ? finished.reduce((sum, ms) => sum + ms, 0) : null,
-    warnings: result.warnings ?? [],
+    warnings: visitorWarnings(result.warnings ?? []),
   };
 }
 
@@ -216,18 +239,31 @@ function rowDetail(id: PipelineRowId, result: AnalysisResult, status: PipelineRo
     }
     case "embed": {
       const rag = result.ai?.rag;
-      if (!rag) return status === "skipped" ? "no embedding provider configured" : null;
+      if (!rag) return status === "skipped" ? skippedAiDetail(result, "no-embedding-provider") : null;
       return `chunks · ${count(rag.chunks.length)} vectors · dim ${rag.embeddingDim}`;
     }
     case "ground": {
       const synthesis = result.ai?.synthesis;
-      if (!synthesis) return status === "skipped" ? "no chat provider configured" : null;
+      if (!synthesis) return status === "skipped" ? skippedAiDetail(result, "no-chat-provider") : null;
       const dropped = synthesis.droppedCitations ?? 0;
       return dropped > 0
         ? `citation index sealed · ${count(dropped)} ungrounded dropped`
         : "citation index sealed";
     }
   }
+}
+
+/**
+ * Why an AI row did not run, in the run's own terms. A visitor who chose Map only must read "not
+ * requested", not "not configured" — the second would blame the server for a choice they made.
+ */
+function skippedAiDetail(result: AnalysisResult, fallback: DegradationReason): string {
+  const reasons = new Set((result.degradations ?? []).map((notice) => notice.reason));
+  for (const reason of ["map-only", "ai-unavailable", "budget-exhausted"] as const) {
+    if (reasons.has(reason)) return degradationShort(reason);
+  }
+  if (reasons.has(fallback)) return degradationShort(fallback);
+  return fallback === "no-embedding-provider" ? "no embedding provider configured" : "no chat provider configured";
 }
 
 function buildNumbers(result: AnalysisResult, meta: MetaFacts | null): RunNumbers {
@@ -287,6 +323,7 @@ function buildGrounding(result: AnalysisResult): GroundingReport {
 
   if (status === "failed" || status === "aborted" || !graph) {
     const reason = result.pipeline?.statusReason;
+    const firstWarning = visitorWarnings(result.warnings ?? [])[0];
     return {
       state: "refused",
       headline: "REFUSED",
@@ -295,7 +332,21 @@ function buildGrounding(result: AnalysisResult): GroundingReport {
           ? "At capacity — the daily budget was reached, and no answer is guessed in the gap."
           : reason === "repo-too-large"
             ? "Repository is over the configured size limit; nothing was indexed rather than partially indexed."
-            : (result.warnings ?? [])[0] ?? "A required stage failed, so there is nothing to cite from.",
+            : firstWarning ?? "A required stage failed, so there is nothing to cite from.",
+      cause:
+        reason === "budget-exhausted"
+          ? "daily budget reached"
+          : reason === "repo-too-large"
+            ? "repository over the size limit"
+            : status === "aborted"
+              ? "the run was cancelled"
+              : "a required stage failed",
+      next:
+        reason === "repo-too-large"
+          ? "try a smaller repository"
+          : reason === "budget-exhausted"
+            ? "try again tomorrow, or use Map only"
+            : "re-run it; the pipeline rows name the stage that stopped",
     };
   }
 
@@ -306,19 +357,41 @@ function buildGrounding(result: AnalysisResult): GroundingReport {
   if (deterministicOnly || unresolved > 0 || degradations.length > 0 || status === "partial") {
     const parts: string[] = [];
     if (unresolved > 0) parts.push(`${count(unresolved)} unresolved import${unresolved === 1 ? "" : "s"} (static pass only)`);
-    if (deterministicOnly) parts.push("AI stages did not run, so nothing beyond the deterministic graph is claimed");
-    for (const notice of degradations) parts.push(notice.detail);
+    // The worker's `detail` strings are operator text (they can name env vars), so each reason is
+    // restated in this app's own words. De-duplicated: two notices with one reason are one fact.
+    const reasons = [...new Set(degradations.map((notice) => notice.reason))];
+    for (const reason of reasons) parts.push(degradationCopy(reason).text);
+    if (deterministicOnly && reasons.length === 0) {
+      parts.push("AI stages did not run, so nothing beyond the deterministic graph is claimed");
+    }
+    const lead = reasons[0];
     return {
       state: "partial",
       headline: "PARTIAL",
       detail: parts.length > 0 ? parts.join(" · ") : "Some of the run was degraded; see the warnings.",
+      cause:
+        unresolved > 0
+          ? `${count(unresolved)} unresolved import${unresolved === 1 ? "" : "s"} · ${count(graph.resolution.resolved)} resolved`
+          : lead
+            ? degradationShort(lead)
+            : "AI stages did not run",
+      next:
+        lead === "map-only"
+          ? "switch to Map + AI to add the guide and Q&A"
+          : lead === "ai-unavailable" || lead === "budget-exhausted"
+            ? "the map is complete — try AI again later"
+            : unresolved > 0
+              ? "unresolved specifiers are counted, never guessed"
+              : "the map is complete; the banner says what is missing",
     };
   }
 
   return {
     state: "grounded",
     headline: "GROUNDED",
-    detail: `Resolved from the deterministic import graph — ${count(graph.resolution.resolved)} edges, every one to a real file.`,
+    detail: `Resolved from the deterministic import graph — ${count(graph.resolution.resolved)} imports, every one to a real file.`,
+    cause: `${count(graph.resolution.resolved)} imports resolved · 0 unresolved`,
+    next: result.ai?.rag ? "click any citation to open the exact lines" : "open the workbench to trace any module",
   };
 }
 

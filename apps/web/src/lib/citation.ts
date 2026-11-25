@@ -60,5 +60,13 @@ export function citationLabel(target: CitationTarget): string {
 export function moduleLabel(fileId: string): string {
   const withoutExtension = fileId.replace(/\.[^./]+$/, "");
   const parts = withoutExtension.split("/");
-  return parts.length <= 2 ? withoutExtension : parts.slice(-2).join("/");
+  if (parts.length <= 2) return withoutExtension;
+  // An index file is named for its directory: `packages/shared-types/src/index.ts` is
+  // `shared-types/index`, not the `src/index` every package in a monorepo would otherwise share.
+  const last = parts[parts.length - 1];
+  if (last === "index" || last === "__init__" || last === "mod") {
+    const owners = parts.slice(0, -1).filter((part) => part !== "src");
+    if (owners.length > 0) return `${owners[owners.length - 1]}/${last}`;
+  }
+  return parts.slice(-2).join("/");
 }

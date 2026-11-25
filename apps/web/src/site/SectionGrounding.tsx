@@ -42,29 +42,28 @@ export interface SectionGroundingProps {
 }
 
 export function SectionGrounding({ grounding }: SectionGroundingProps) {
-  const head = useRevealAttrs<HTMLDivElement>("clip");
+  // Two lines, two wipes: the second starts 150ms after the first, the design's typesetting beat.
+  const head = useReveal<HTMLHeadingElement>();
+  const aside = useRevealAttrs<HTMLParagraphElement>("up");
   const states = useReveal<HTMLDivElement>();
 
   return (
-    <section className="section" id="grounding">
+    <section className="section section-band" id="grounding">
       <div className="shell">
-        <p className="eyebrow" style={{ marginBottom: 20 }}>
-          02 — Grounding
-        </p>
-        <div className="section-head" {...head}>
-          <h2 className="display display-l">
+        <p className="eyebrow">02 — Grounding</p>
+        <h2 className="display display-xxl" ref={head.ref}>
+          <span className="hero-line" data-reveal="clip" data-revealed={head.revealed}>
             No citation,
-            <br />
-            no answer<span className="dot" aria-hidden="true" />
-          </h2>
-          <p className="aside">
-            If Cartograph can&rsquo;t point at a line, it says so and tells you why. That&rsquo;s the whole
-            product.
-          </p>
-        </div>
-      </div>
+          </span>{" "}
+          <span className="hero-line" data-reveal="clip" data-revealed={head.revealed} style={{ transitionDelay: "150ms" }}>
+            no answer<span className="stop">.</span>
+          </span>
+        </h2>
+        <p className="aside aside-lead" {...aside} style={{ transitionDelay: "380ms" }}>
+          If Cartograph can&rsquo;t point at a line, it says so and tells you why. That&rsquo;s the whole
+          product.
+        </p>
 
-      <div className="shell">
         <div className="states" ref={states.ref}>
           {STATES.map((state, index) => {
             const active = grounding?.state === state.id;
@@ -79,18 +78,26 @@ export function SectionGrounding({ grounding }: SectionGroundingProps) {
                 // so the eye reads them in the order the copy assumes rather than all at once.
                 data-reveal="up"
                 data-revealed={states.revealed}
-                style={{ transitionDelay: `${index * 90}ms` }}
+                style={{ transitionDelay: `${80 + index * 100}ms` }}
               >
                 <p className="state-head">
                   <span aria-hidden="true">{state.mark}</span>
                   {state.label}
                 </p>
                 <p className="state-body">{state.description}</p>
+                {/* The design's mono cause/next lines — ONLY on the state this run is in, and only
+                    from the run's real grounding report. The other two cards are descriptions of
+                    states this run is not in, and a cause for them would be invented. */}
                 {active ? (
-                  <span className="state-active-tag">
-                    this run · {grounding.detail}
-                  </span>
+                  <p className="state-trace">
+                    <span className="state-active-tag">this run</span>
+                    <br />
+                    cause: <span className="state-trace-value">{grounding.cause}</span>
+                    <br />
+                    next: {grounding.next}
+                  </p>
                 ) : null}
+                {active ? <p className="sr-only">{grounding.detail}</p> : null}
               </div>
             );
           })}

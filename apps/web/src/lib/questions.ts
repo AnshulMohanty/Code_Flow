@@ -49,8 +49,18 @@ export function suggestedQuestions(result: AnalysisResult | null): string[] {
   return questions.slice(0, MAX_SUGGESTIONS);
 }
 
-/** The last two path segments — enough to identify a module, short enough for a chip. */
+/**
+ * The last two path segments — enough to identify a module, short enough for a chip. An index file
+ * is named for its package (`shared-types/index.ts`, not the `src/index.ts` every package shares),
+ * or the question would not say which module it is about.
+ */
 function short(fileId: string): string {
   const parts = fileId.split("/");
-  return parts.length <= 2 ? fileId : parts.slice(-2).join("/");
+  if (parts.length <= 2) return fileId;
+  const last = parts[parts.length - 1];
+  if (/^(index|__init__|mod)\.[^.]+$/.test(last)) {
+    const owners = parts.slice(0, -1).filter((part) => part !== "src");
+    if (owners.length > 0) return `${owners[owners.length - 1]}/${last}`;
+  }
+  return parts.slice(-2).join("/");
 }

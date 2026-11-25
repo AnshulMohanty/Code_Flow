@@ -1,3 +1,4 @@
+import { ModeBadge } from "../components/ModeSwitch";
 import { NOT_MEASURED } from "../lib/siteModel";
 import { useUtcClock, type MetaState } from "../lib/useMeta";
 import type { WakeState } from "../lib/useWake";
@@ -37,6 +38,8 @@ export interface SiteNavProps {
   onNavigate(section: string): void;
   onOpenPalette(): void;
   onOpenWorkbench(): void;
+  /** The current analysis mode ("Map only" / "AI · <model>"), or null when the server reports none. */
+  modeBadge?: { label: string; title: string; ai: boolean } | null;
 }
 
 const SECTIONS = [
@@ -45,7 +48,7 @@ const SECTIONS = [
   { id: "numbers", num: "03", label: "Numbers" },
 ] as const;
 
-export function SiteNav({ meta, wake, activeSection, onNavigate, onOpenPalette, onOpenWorkbench }: SiteNavProps) {
+export function SiteNav({ meta, wake, activeSection, onNavigate, onOpenPalette, onOpenWorkbench, modeBadge }: SiteNavProps) {
   const clock = useUtcClock(meta.facts?.serverTime ?? null);
   // Green means REACHED, not "meta parsed". A deployment can answer /health while /api/meta is still
   // failing, and the useful fact for a visitor is the first one.
@@ -77,6 +80,7 @@ export function SiteNav({ meta, wake, activeSection, onNavigate, onOpenPalette, 
       </div>
 
       <div className="nav-right">
+        <ModeBadge badge={modeBadge ?? null} />
         <span
           className="pill"
           data-live={live}
@@ -97,10 +101,10 @@ export function SiteNav({ meta, wake, activeSection, onNavigate, onOpenPalette, 
           <span className="pill-sep">·</span>
           <span className="mono">{clock}</span>
         </span>
-        <button type="button" className="kbd" onClick={onOpenPalette} aria-label="Open command palette">
+        <button type="button" className="kbd" data-magnetic="true" onClick={onOpenPalette} aria-label="Open command palette">
           ⌘K
         </button>
-        <button type="button" className="btn btn-primary" onClick={onOpenWorkbench}>
+        <button type="button" className="btn btn-primary nav-cta" data-magnetic="true" onClick={onOpenWorkbench}>
           Open workbench <span aria-hidden="true">→</span>
         </button>
       </div>

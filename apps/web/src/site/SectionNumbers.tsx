@@ -32,22 +32,21 @@ const EMPTY: RunNumbers = {
 
 export function SectionNumbers({ numbers, provenance }: SectionNumbersProps) {
   const stats = numbers ?? EMPTY;
-  const head = useRevealAttrs<HTMLDivElement>("clip");
+  const head = useRevealAttrs<HTMLHeadingElement>("clip");
+  const aside = useRevealAttrs<HTMLParagraphElement>("up");
   const grid = useReveal<HTMLDivElement>();
 
   return (
     <section className="section" id="numbers">
       <div className="shell">
-        <p className="eyebrow" style={{ marginBottom: 20 }}>
-          03 — Numbers
-        </p>
-        <div className="section-head" {...head}>
-          <h2 className="display display-l">
-            Measured,
-            <br />
-            not marketed<span className="dot" aria-hidden="true" />
-          </h2>
-          <p className="aside">
+        <div className="section-head section-head-split">
+          <div>
+            <p className="eyebrow">03 — Numbers</p>
+            <h2 className="display display-m2" {...head}>
+              Measured, not marketed.
+            </h2>
+          </div>
+          <p className="aside aside-narrow" {...aside} style={{ transitionDelay: "160ms" }}>
             {provenance
               ? `Last full run on ${provenance}. The numbers move because they're read, not written.`
               : "Nothing has been analysed yet, so there is nothing to report. The numbers appear when they are measured — not before."}
@@ -81,7 +80,7 @@ function Stat({
   // final figure, so the intermediate frames use the same units, precision and thousands rule the
   // settled number does. Formatting the animation separately is how a stat ends up counting up in
   // one format and landing in another.
-  const counted = useCountUp(stat.value, { active: counting });
+  const counted = useCountUp(stat.value, { active: counting, durationMs: 1600 + order * 100 });
   // Counts and milliseconds are whole numbers at every frame; only a dollar figure keeps its
   // decimals. `count()` is `toLocaleString`, so an un-rounded frame renders "12,480.317".
   const shown =
@@ -97,7 +96,15 @@ function Stat({
       style={{ transitionDelay: `${order * 80}ms` }}
     >
       <p className="stat-value">
-        {formatStat(shown)}
+        {/* The dollar sign is set small and grey, as the design does — the figure is the fact. */}
+        {measured && stat.format === "usd" ? (
+          <>
+            <span className="stat-unit stat-unit-pre">$</span>
+            {formatStat(shown).replace(/^\$/, "")}
+          </>
+        ) : (
+          formatStat(shown)
+        )}
         {measured && unit ? <span className="stat-unit">{unit}</span> : null}
       </p>
       <p className="stat-label">{stat.label}</p>
