@@ -4,6 +4,7 @@
 
 import type { TokenUsage } from "@codeflow/shared-types";
 import { estimatedUsage, measuredUsage, sumUsage, usageNumber } from "../util/tokens.js";
+import { ProviderHttpError } from "../util/providerError.js";
 
 export interface EmbeddingRequest {
   /** Texts to embed, in order. The returned vectors align 1:1 with this array. */
@@ -108,7 +109,7 @@ export function createVoyageClient(options: VoyageClientOptions): EmbeddingClien
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        throw new Error(`Voyage API error ${response.status}: ${detail.slice(0, 500)}`);
+        throw new ProviderHttpError("Voyage", response.status, detail);
       }
 
       const json = (await response.json()) as {
@@ -213,7 +214,7 @@ export function createGeminiEmbeddingClient(options: GeminiEmbeddingClientOption
 
         if (!response.ok) {
           const detail = await response.text().catch(() => "");
-          throw new Error(`Gemini embeddings API error ${response.status}: ${detail.slice(0, 500)}`);
+          throw new ProviderHttpError("Gemini embeddings", response.status, detail);
         }
 
         const json = (await response.json()) as {
@@ -348,7 +349,7 @@ export function createOpenAiEmbeddingClient(options: OpenAiEmbeddingClientOption
 
         if (!response.ok) {
           const detail = await response.text().catch(() => "");
-          throw new Error(`OpenAI embeddings API error ${response.status}: ${detail.slice(0, 500)}`);
+          throw new ProviderHttpError("OpenAI embeddings", response.status, detail);
         }
 
         const json = (await response.json()) as {

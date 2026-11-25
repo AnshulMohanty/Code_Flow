@@ -50,8 +50,13 @@ export interface PipelineJobDependencies {
   readFile: (repoPath: string, relativePath: string) => Promise<string | null>;
   /** Lists immediate children of a repo-relative dir for Map-structure's tree walk. */
   readDir: (repoPath: string, relativeDir: string) => Promise<WalkEntry[]>;
+  /** `git ls-files` of the clone: a tracked file is never dropped by a .gitignore pattern. */
+  trackedFiles?: (repoPath: string) => Promise<ReadonlySet<string> | null>;
   /** Guard 1 — measures the cloned tree so Ingest can enforce the repo-size cap. */
   measureRepoSize?: (repoPath: string) => Promise<{ fileCount: number; totalBytes: number }>;
+  /** Guard 1 caps (default: MAX_FILES / MAX_BYTES). Size them to the worker's memory — see .env.example. */
+  maxRepoFiles?: number;
+  maxRepoBytes?: number;
   /** Guard 5 — global daily LLM-spend ceiling, passed to the AI stages via ctx.budget. */
   budget?: BudgetHandle;
   /** SSE replay buffer (#20): every emitted ProgressEvent + the terminal done is appended
@@ -77,6 +82,8 @@ export interface PipelineJobDependencies {
    * deterministic spine, and the slices are proven byte-identical either way.
    */
   parallelStages?: boolean;
+  /** Speculative prefetch (`SPECULATIVE_PREFETCH=true`). Off unless asked for — see workerAnalysisService. */
+  speculativePrefetch?: boolean;
   /**
    * V3-P5 observability: prices per model, for the per-run cost figure. INJECTED rather than baked
    * in — prices change, differ per account, and a stale table would report confident wrong money.
@@ -277,9 +284,20 @@ export async function runAnalysisJob(
 
   try {
     const stages: PipelineStage[] = [
-      createIngestStage({ cloner, measureRepoSize: deps.measureRepoSize, now }),
+      createIngestStage({
+        cloner,
+        measureRepoSize: deps.measureRepoSize,
+        now,
+        ...(deps.maxRepoFiles ? { maxFiles: deps.maxRepoFiles } : {}),
+        ...(deps.maxRepoBytes ? { maxBytes: deps.maxRepoBytes } : {}),
+      }),
       createOrientStage({ readFile: deps.readFile, now }),
-      createMapStructureStage({ readDir: deps.readDir, readFile: deps.readFile, now }),
+      createMapStructureStage({
+        readDir: deps.readDir,
+        readFile: deps.readFile,
+        ...(deps.trackedFiles ? { trackedFiles: deps.trackedFiles } : {}),
+        now,
+      }),
       createInventoryStage({ readFile: deps.readFile, now }),
       createConnectStage({ readFile: deps.readFile, now }),
       createAnalyzeStage({ now }),
@@ -374,6 +392,7 @@ export async function runAnalysisJob(
       budget: deps.budget,
       now,
       ...(deps.parallelStages ? { schedule: "layered" as const } : {}),
+      speculate: deps.speculativePrefetch === true,
     });
 
     // Speculation onto the run SPAN, so the hit rate is queryable in the trace rather than only

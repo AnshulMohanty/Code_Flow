@@ -207,9 +207,18 @@ describe("tool surface — a denied tool is ABSENT, not present-and-refusing", (
     // An advertised tool that always refuses wastes a turn every time a model tries it; one that was
     // never advertised is never tried.
     const names = core(["graph"]).listTools().map((tool) => tool.name);
-    expect(names.sort()).toEqual(["find_references", "get_blast_radius", "get_callers", "graph_facts", "symbol_search"]);
+    expect(names.sort()).toEqual(["find_references", "find_usages", "get_blast_radius", "get_callers", "graph_facts", "symbol_search"]);
     expect(names).not.toContain("search_code");
     expect(names).not.toContain("verify_answer");
+  });
+
+  it("instructions route question phrasing to tools — and name only tools that are enabled", () => {
+    const graphOnly = core(["graph"]).instructions();
+    expect(graphOnly).toContain("- get_blast_radius:");
+    expect(graphOnly).toContain("- find_usages:");
+    expect(graphOnly).not.toContain("verify_citations");
+    expect(core(["graph", "verify"]).instructions()).toContain("- verify_citations:");
+    expect(core([]).instructions()).toBe("");
   });
 
   it("omits search_code when the retrieval scope is on but no provider is wired", () => {
@@ -316,6 +325,30 @@ describe("search_code over MCP", () => {
     const { body } = await text(server, "search_code", { query: "quantum beekeeping" });
     expect(body).toMatch(/No code in this repository is relevant/);
     expect(body).toMatch(/Do not guess an answer from outside the repository/);
+  });
+});
+
+describe("verify_citations — references in free text, checked against the repo", () => {
+  const server = core(["verify"]);
+
+  it("is advertised under the verify scope only", () => {
+    expect(server.listTools().map((tool) => tool.name)).toContain("verify_citations");
+    expect(core(["graph"]).listTools().map((tool) => tool.name)).not.toContain("verify_citations");
+  });
+
+  it("marks a real file as verified and a fabricated one as wrong", async () => {
+    const { body, isError } = await text(server, "verify_citations", {
+      text: "Login is handled in src/auth.ts, and sessions live in src/session-store.ts:12.",
+    });
+    expect(isError).toBe(false);
+    expect(body).toContain("✓ src/auth.ts");
+    expect(body).toContain('✗ src/session-store.ts:12 — no file "src/session-store.ts"');
+    expect(body).toContain("1 verified");
+    expect(body).toContain("1 wrong");
+  });
+
+  it("refuses empty text", async () => {
+    expect((await text(server, "verify_citations", { text: "  " })).isError).toBe(true);
   });
 });
 

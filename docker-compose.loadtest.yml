@@ -1,0 +1,12 @@
+# Load-test overlay for docker-compose.app.yml (scripts/load-test.sh uses it):
+#   - the worker publishes no fixed host port, so `--scale worker=N` can start N replicas;
+#   - the API trusts one proxy hop, so each simulated user's X-Forwarded-For is its client IP for the
+#     per-IP rate limit (the same setting Render needs);
+#   - ANALYZER_VERSION namespaces the result cache per run, so every run analyses for real.
+services:
+  api:
+    environment:
+      TRUST_PROXY_HOPS: "1"
+      ANALYZER_VERSION: "${ANALYZER_VERSION:-loadtest}"
+  worker:
+    ports: !reset []

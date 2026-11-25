@@ -176,3 +176,17 @@ export {
   createEmbeddingClientFromEnv,
   type ProviderEnv,
 } from "./providers.js";
+
+// Citation verification for arbitrary text (agent answers, PR descriptions, review comments).
+export {
+  buildReferenceIndex,
+  extractCodeReferences,
+  formatVerificationReport,
+  verifyReferences,
+  type CodeReference,
+  type ReferenceIndex,
+  type ReferenceStatus,
+  type ReferenceVerdict,
+  type VerificationReport,
+  type VerifiedReference,
+} from "./verify/references.js";

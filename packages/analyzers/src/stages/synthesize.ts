@@ -15,6 +15,7 @@ import type {
 import type { LlmClient } from "../llm/llmClient.js";
 import { BudgetExceededError } from "../pipeline/errors.js";
 import { estimateTokens, sumUsage } from "../util/tokens.js";
+import { isRetryableError } from "../util/providerError.js";
 
 export interface SynthesizeDependencies {
   /** Injectable LLM client — tests mock it (no real API calls). */
@@ -102,6 +103,7 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
       let lastError: unknown;
       /** Every attempt's usage — so the terminal event reports what the STAGE spent, not one call. */
       const totalUsage: TokenUsage[] = [];
+      let attemptsMade = maxAttempts;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let completion: string;
         let usage: TokenUsage;
@@ -121,10 +123,15 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
           usage = completed.usage;
         } catch (error) {
           lastError = error;
-          ctx.logger.warn("Synthesis LLM call failed; retrying if attempts remain.", {
-            attempt,
-            error: error instanceof Error ? error.message : String(error),
-          });
+          const retryable = isRetryableError(error);
+          ctx.logger.warn(
+            retryable ? "Synthesis LLM call failed; retrying if attempts remain." : "Synthesis LLM call rejected; not retrying.",
+            { attempt, error: error instanceof Error ? error.message : String(error) },
+          );
+          if (!retryable) {
+            attemptsMade = attempt;
+            break;
+          }
           continue;
         }
 
@@ -176,7 +183,7 @@ export function createSynthesizeStage(deps: SynthesizeDependencies): PipelineSta
       }
 
       throw new Error(
-        `Synthesis failed after ${maxAttempts} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+        `Synthesis failed after ${attemptsMade} attempt${attemptsMade === 1 ? "" : "s"}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
       );
 
       function finish(

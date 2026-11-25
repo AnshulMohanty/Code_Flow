@@ -32,7 +32,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -135,7 +135,6 @@ result.repository = { ...(result.repository ?? {}), provider: "github", owner, n
 const limitations = [
   "No AI summary and no reading order: synthesis needs a chat provider and this was produced offline with no key.",
   "No Q&A index: the same reason. Ask-the-repo is unavailable on this snapshot.",
-  "Imports that resolve to workspace package names rather than to files are counted as unresolved, so the dependency graph is sparser than a hosted run on the same commit.",
 ];
 if (dirty) {
   limitations.unshift(
@@ -148,7 +147,7 @@ const snapshot = {
     repoFullName,
     commitSha,
     generatedAt: new Date().toISOString(),
-    analyzerVersion: result.producedBy?.analyzerVersion ?? result.analyzerVersion ?? "unknown",
+    analyzerVersion: await analyzerVersion(),
     producedBy: "codeflow-local (offline, deterministic, no provider key)",
     limitations,
   },
@@ -163,3 +162,13 @@ console.log(`\nwrote ${outPath}`);
 console.log(`  ${repoFullName} @ ${commitSha.slice(0, 7)}`);
 console.log(`  ${result.graph?.nodes?.length ?? 0} files · ${result.graph?.edges?.length ?? 0} resolved edges`);
 console.log(`  ${(bytes / 1024).toFixed(0)} KB — loaded as its own lazy chunk, never in the entry bundle.`);
+
+/** The analyser version that produced the snapshot, from the built config package. */
+async function analyzerVersion() {
+  try {
+    const config = await import(pathToFileURL(join(repoRoot, "packages/config/dist/index.js")).href);
+    return config.ANALYZER_VERSION ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}

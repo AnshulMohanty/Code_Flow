@@ -12,7 +12,7 @@ import type { AttributeValue, PricingTable, RecordedSpan, TraceExporter, TraceRe
  * payload, or a span-per-span push into a provider — so what is here is a `fetch`-based exporter
  * (the pattern the LLM adapters already use, with no SDK) and an OTel BRIDGE that takes an INJECTED
  * tracer-provider. That keeps this package at zero dependencies and puts the one-line install in
- * GO_LIVE.md rather than in every consumer's node_modules.
+ * DESIGN.md rather than in every consumer's node_modules.
  */
 
 export interface HttpExporterOptions {
@@ -273,7 +273,7 @@ function safeHost(endpoint: string): string {
  *
  * WHY IT EXISTS AT ALL. `RecordingTracerOptions.pricing` was an accepted option no composition root
  * ever supplied, which meant every trace reported `usd: null` for a reason nobody had chosen. Now
- * the absence is a deployment decision with a documented way to fix it (see GO_LIVE.md), and the
+ * the absence is a deployment decision with a documented way to fix it (see DESIGN.md), and the
  * tokens — which ARE measured either way — are unaffected.
  *
  * FORMAT: `LLM_PRICING` as JSON, model id → USD per million tokens.

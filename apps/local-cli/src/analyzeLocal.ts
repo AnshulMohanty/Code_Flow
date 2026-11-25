@@ -1,5 +1,8 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { createDirectoryFactsStore } from "./factsCache.js";
+import { factsStoreStats, setFactsStore, type FactsStore } from "@codeflow/parsers";
 import {
   createAnalyzeStage,
   createConnectStage,
@@ -23,41 +26,16 @@ import {
 import type { AnalysisResult, PipelineInput, PipelineStage } from "@codeflow/shared-types";
 
 /**
- * LOCAL-FIRST ANALYSIS (V3-P5 task 4) — on-device, keyless, ZERO CODE EGRESS.
+ * Local analysis: on-device, keyless, no code leaves the machine. Parsing is tree-sitter WASM, embedding
+ * is `createLocalEmbeddingClient` (feature hashing), the index is a JSON file (`createFileVectorStore`),
+ * retrieval is the same `hybridSearch` as hosted — the same stages and grounding, so a local and a
+ * hosted analysis cannot disagree about the code.
  *
- * WHAT MAKES THE EGRESS CLAIM CHECKABLE RATHER THAN ASSERTED. Every component on this path is
- * in-process:
- *   - parsing is `web-tree-sitter` WASM (already in from V3-P1, and the reason V3-P1 chose WASM over
- *     the native bindings was precisely so it could run here);
- *   - embedding is `createLocalEmbeddingClient` — feature hashing, no provider (see
- *     `localEmbedding.ts` for what that does and does not buy, and why an ONNX MiniLM was rejected);
- *   - the index is `createFileVectorStore` — a JSON file on disk (LanceDB probed and rejected: 656 MB
- *     and it drags `onnxruntime-node` back in);
- *   - retrieval is the SAME `hybridSearch` the hosted path uses.
- * WHAT THAT CLAIM IS, EXACTLY — because the first version of this comment overstated it and the
- * zero-egress test is what caught that. It said there was "no HTTP client anywhere in this module's
- * import graph". There is: importing `@codeflow/analyzers` for the stages pulls in that package's
- * BARREL, which re-exports `llmClient.ts` and `embeddingClient.ts`, and both call `fetch`.
- *
- * Nothing leaks, and the accurate statement is stronger than the loose one because it is checkable
- * at two levels:
- *   - This module NEVER REFERENCES a provider constructor. Reachability through a barrel is not use;
- *     nothing here can construct a client, so nothing here can call one.
- *   - The PUBLISHED BUNDLE contains no `fetch` call, no provider client and no provider hostname at
- *     all — Rollup drops them as unreferenced. That is the artifact a user installs, it is
- *     deliberately not minified, and anyone can grep the file they downloaded to confirm it.
- * Both are asserted in `__tests__/zeroEgress.test.ts`, including an exact list of the two reachable
- * fetch-capable modules, so a third cannot appear quietly.
- *
- * THE SYNTHESIZE STAGE IS ABSENT, deliberately. It needs an LLM, and there is no keyless local one —
- * so rather than degrade it into something that looks like a summary and is not, the local run stops
- * at a complete deterministic analysis plus a searchable index. That is genuinely useful (the graph,
- * the metrics, the communities, and Q&A retrieval all work offline) and it is honest about the one
- * thing it cannot do.
- *
- * IT SHARES THE CORE PACKAGES rather than reimplementing them: the same stages, the same graph, the
- * same chunker, the same grounding. So a local analysis and a hosted one cannot disagree about what
- * the code says — the only differences are the embedder and the store, both behind interfaces.
+ * "No egress", precisely: `@codeflow/analyzers`' barrel makes two fetch-capable modules REACHABLE, but
+ * nothing here constructs a provider client, and the published bundle contains no `fetch` call and no
+ * provider hostname (Rollup drops them). `__tests__/zeroEgress.test.ts` asserts both, with the exact list
+ * of reachable modules. Synthesize is absent on purpose: there is no keyless local LLM, and a fake
+ * summary would be worse than none.
  */
 
 export interface LocalAnalysisOptions {
@@ -67,6 +45,12 @@ export interface LocalAnalysisOptions {
   indexDir?: string;
   /** Skip the RAG index build (deterministic analysis only). */
   skipIndex?: boolean;
+  /**
+   * Per-file parse cache (incremental analysis). Default: a directory store at `<indexDir>/cache`, so
+   * a re-run parses only changed files. `false` disables it; a store can be passed to share one
+   * across analyses in one process (`impact` analyses head and base).
+   */
+  factsCache?: FactsStore | false;
   /** Injectable clock, for deterministic tests. */
   now?: () => number;
   onProgress?(message: string): void;
@@ -83,28 +67,35 @@ export interface LocalAnalysisResult {
   warnings: string[];
 }
 
-/** Directories never worth walking. Same spirit as the hosted walker's ignores. */
-const SKIP_DIRS = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "build",
-  "coverage",
-  ".next",
-  ".turbo",
-  ".codeflow",
-  "__pycache__",
-  ".venv",
-  "venv",
-]);
+/**
+ * Directories never listed: this tool's own index, plus heavy trees Map-structure hard-ignores
+ * anyway. Ambiguous names (`build`, `out`, `coverage`) are NOT here — Map-structure decides those
+ * by content (a Go package named `coverage` is source), and a second list would overrule it.
+ */
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".next", ".turbo", ".codeflow", "__pycache__", ".venv", "venv"]);
 
-/** Read a repo-relative file. Returns null when unreadable — a single bad file is not a failure. */
+/**
+ * Read a repo-relative file. Returns null when unreadable — a single bad file is not a failure — and
+ * when it resolves OUTSIDE the repository: the GitHub Action runs this on a pull request's code, and
+ * a committed `README.md -> /proc/self/environ` must not be read into the analysis.
+ */
 async function readRepoFile(repoPath: string, relativePath: string): Promise<string | null> {
   try {
-    return await readFile(path.join(repoPath, relativePath), "utf8");
+    const [root, real] = await Promise.all([realpath(repoPath), realpath(path.join(repoPath, relativePath))]);
+    if (real !== root && !real.startsWith(root + path.sep)) return null;
+    return await readFile(real, "utf8");
   } catch {
     return null;
   }
+}
+
+/** The files git tracks in `repoPath`, or null when it is not a git checkout (or git is missing). */
+function gitTrackedFiles(repoPath: string): Promise<ReadonlySet<string> | null> {
+  return new Promise((resolve) => {
+    execFile("git", ["-C", repoPath, "ls-files", "-z"], { maxBuffer: 256 * 1024 * 1024 }, (error, stdout) => {
+      resolve(error ? null : new Set(stdout.split("\u0000").filter(Boolean)));
+    });
+  });
 }
 
 /** List the immediate children of a repo-relative directory, in the shape Map-structure wants. */
@@ -154,9 +145,9 @@ async function readRepoDir(repoPath: string, relativeDir: string): Promise<WalkE
  * is never zero. The first version of this used 0.05, which is the noise level itself — so the refusal
  * silently stopped refusing, and the acceptance test caught it.
  *
- * 0.15 sits ~3x above the measured noise and ~4.5x below a real match. It is intentionally HIGHER than
- * the hosted floor: a lexical embedder has no semantic recall to protect, so a near-miss here is much
- * more likely to be a collision than a paraphrase.
+ * 0.15 sits ~3x above the measured noise and ~4.5x below a real match. It is not comparable with the
+ * hosted floor (`RAG_MIN_SIMILARITY`, 0.2): that one is a cosine between a real model's embeddings,
+ * this one between 256-dimension hashed bags of words, so each is set against its own noise level.
  */
 export const LOCAL_MIN_SIMILARITY = 0.15;
 
@@ -216,7 +207,7 @@ export async function analyzeLocal(options: LocalAnalysisOptions): Promise<Local
       },
     },
     createOrientStage({ readFile: readRepoFile, now }),
-    createMapStructureStage({ readDir: readRepoDir, readFile: readRepoFile, now }),
+    createMapStructureStage({ readDir: readRepoDir, readFile: readRepoFile, trackedFiles: gitTrackedFiles, now }),
     createInventoryStage({ readFile: readRepoFile, now }),
     createConnectStage({ readFile: readRepoFile, now }),
     createAnalyzeStage({ now }),
@@ -236,14 +227,25 @@ export async function analyzeLocal(options: LocalAnalysisOptions): Promise<Local
 
   report(`analysing ${repoPath} on-device (parser: web-tree-sitter WASM, embedder: ${LOCAL_EMBEDDING_MODEL})`);
 
-  const { result } = await runPipeline(stages, input, {
+  setFactsStore(
+    options.factsCache === false ? null : (options.factsCache ?? createDirectoryFactsStore(path.join(indexDir, "cache"))),
+  );
+  let pipeline: Awaited<ReturnType<typeof runPipeline>>;
+  try {
+    pipeline = await runPipeline(stages, input, {
     now,
     emit: (event) => report(`  ${event.stage}: ${event.status}${event.detail ? ` — ${event.detail}` : ""}`),
     // Layered scheduling is ON here without an env flag: a local run has no shared cache to
     // invalidate and no second replica to disagree with, and the slices are proven byte-identical
     // either way — so the only thing it changes is how long a developer waits.
     schedule: "layered",
-  });
+    });
+  } finally {
+    const { hits, misses } = factsStoreStats();
+    if (hits + misses > 0) report(`  parse cache: ${hits} file(s) reused, ${misses} parsed`);
+    setFactsStore(null);
+  }
+  const { result } = pipeline;
 
   return {
     result,

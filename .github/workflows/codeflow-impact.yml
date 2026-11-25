@@ -1,0 +1,21 @@
+name: CodeFlow impact
+
+# Dogfood: this repository's own PRs get the report the action produces for anyone else.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be in the checkout — the action never fetches
+
+      - uses: ./
+        with:
+          fail-on: new-cycle,broken-import,rule

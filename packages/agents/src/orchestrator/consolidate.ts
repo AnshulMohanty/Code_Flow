@@ -3,40 +3,14 @@ import type { AnalysisResult } from "@codeflow/shared-types";
 import type { Blackboard, SpecialistFinding, SpecialistId } from "./contracts.js";
 
 /**
- * OFFLINE MEMORY CONSOLIDATION (V3-P5 task 6) — per-community findings into a compact, queryable
- * repository knowledge base.
+ * Consolidates the fan-out's per-community findings (up to 5 lenses x 12 communities) into a compact,
+ * queryable knowledge base — EXTRACTIVELY: sorting, merging by normalised headline, de-duplicating and
+ * templating. No LLM, clock or RNG, so the same blackboard always yields the byte-identical KB (an LLM
+ * summary would cost money, differ every run, and open a new door for ungrounded claims).
  *
- * THE PROBLEM. A V3-P4 fan-out over a 12-community repository produces up to 60 specialist findings
- * (5 lenses x 12 communities). They are structured and bounded individually, but as a set they are
- * repetitive: five lenses looking at the same community say overlapping things, and the supervisor
- * only ever reads a bounded selection of 12. The rest is paid for and then discarded. That is the
- * waste this closes — the findings already exist, and consolidating them costs nothing further.
- *
- * "CONSOLIDATE" HERE MEANS EXTRACTIVE, NOT GENERATIVE, and that is the central decision rather than
- * a limitation to apologise for. The obvious approach is another LLM pass that reads all 60 findings
- * and writes a summary. Three reasons that is the wrong tool:
- *
- *   1. It would spend money to compress information the fan-out already paid to produce, and the
- *      compression is the part a machine does exactly.
- *   2. It would make the KB NON-DETERMINISTIC, so the same analysis would produce a different KB on
- *      every run — and a knowledge base you cannot reproduce is not one you can diff, cache, or
- *      trust to answer the same question twice.
- *   3. It would introduce a new place for an ungrounded claim to enter, immediately after the
- *      fan-out went to some trouble to ground every fileId to its own community.
- *
- * So this is sorting, merging, de-duplicating and templating. No clock, no RNG, no provider. The
- * same blackboard always produces the byte-identical KB.
- *
- * CORROBORATION IS THE MOST VALUABLE THING IT PRODUCES. When the architecture lens and the
- * dependency-risk lens independently say the same thing about a community, that agreement is a
- * stronger signal than either finding alone — and it is invisible while the findings sit in a flat
- * list. Merging by normalised headline surfaces it explicitly as `corroboratedBy`, which is
- * information that did not exist before consolidation rather than a restatement of what did.
- *
- * GROUNDING IS RE-CHECKED, not trusted. Findings were grounded to their community's files when they
- * were produced, but a KB is a durable artefact that outlives the run, so every fileId is re-checked
- * against `graph.nodes` and drops are COUNTED. A KB that cites a file the graph does not contain
- * would be the same failure the three grounding passes exist to prevent, just one layer later.
+ * Merging surfaces corroboration (`corroboratedBy`): two lenses independently saying the same thing is a
+ * stronger signal than either alone. Every fileId is re-checked against `graph.nodes` and drops are
+ * counted, because the KB outlives the run.
  */
 
 /** Deterministic facts read straight off the graph and metrics. No agent involved. */

@@ -4,7 +4,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@codeflow/shared-types": ["packages/shared-types/dist/index.d.ts"]
+      "@codeflow/shared-types": ["../shared-types/dist/index.d.ts"]
     }
   },
   "include": ["src"]

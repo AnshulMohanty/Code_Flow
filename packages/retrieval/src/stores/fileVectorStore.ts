@@ -15,7 +15,7 @@ import { cosineSimilarity } from "../vectorMath.js";
 /**
  * THE EMBEDDED, FILE-BACKED VECTOR STORE (V3-P5 task 4) — local-first, zero egress.
  *
- * WHY THIS AND NOT LANCEDB, which V3_PLAN §5 named. Probed with the same discipline as the
+ * WHY THIS AND NOT LANCEDB, which the original plan named. Probed with the same discipline as the
  * tree-sitter grammars and the reranker, and rejected on the evidence:
  *
  *   `@lancedb/lancedb@0.37.1` installs **656 MB** of node_modules, ships a platform-specific Rust

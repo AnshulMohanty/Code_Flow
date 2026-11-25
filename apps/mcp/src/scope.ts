@@ -27,7 +27,7 @@
 export const MCP_SCOPES = ["graph", "retrieval", "verify"] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
 
-/** Human-readable, for the server's startup log and for GO_LIVE.md. */
+/** Human-readable, for the server's startup log and for DESIGN.md. */
 export const SCOPE_DESCRIPTIONS: Record<McpScope, string> = {
   graph: "Exact, free, read-only lookups over the code graph (references, callers, blast radius, symbols).",
   retrieval: "Hybrid semantic + keyword code search. Read-only, but a query embedding is a PAID provider call.",

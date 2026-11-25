@@ -1,48 +1,11 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 const OWNER_REPO_RE = /^[A-Za-z0-9_.-]+$/;
 const BRANCH_RE = /^[A-Za-z0-9_./-]+$/;
-const EXCLUDED_DIRS = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "build",
-  ".next",
-  "coverage",
-  "vendor",
-  "target",
-  ".turbo",
-  ".cache",
-]);
-
-const LANGUAGE_BY_EXTENSION: Record<string, string> = {
-  ".c": "C",
-  ".cpp": "C++",
-  ".cs": "C#",
-  ".css": "CSS",
-  ".go": "Go",
-  ".html": "HTML",
-  ".java": "Java",
-  ".js": "JavaScript",
-  ".jsx": "JavaScript",
-  ".json": "JSON",
-  ".kt": "Kotlin",
-  ".md": "Markdown",
-  ".php": "PHP",
-  ".py": "Python",
-  ".rb": "Ruby",
-  ".rs": "Rust",
-  ".tsx": "TypeScript",
-  ".ts": "TypeScript",
-  ".vue": "Vue",
-  ".yml": "YAML",
-  ".yaml": "YAML",
-};
-
 export interface NormalizedGitHubRepo {
   owner: string;
   repo: string;
@@ -56,22 +19,6 @@ export interface ClonePublicRepoInput extends NormalizedGitHubRepo {
 export interface ClonePublicRepoResult {
   repoPath: string;
   cloneUrl: string;
-}
-
-export interface DiscoveredRepoFile {
-  path: string;
-  name: string;
-  extension: string;
-  language: string;
-  sizeBytes: number;
-  lines: number;
-}
-
-export interface DiscoverRepoFilesResult {
-  files: DiscoveredRepoFile[];
-  totalFiles: number;
-  languageBreakdown: Record<string, number>;
-  truncated: boolean;
 }
 
 export function normalizeGitHubRepoInput(input: {
@@ -146,84 +93,11 @@ export async function getHeadCommitSha(repoPath: string) {
   return result.stdout.trim();
 }
 
-export async function discoverRepoFiles(
-  repoPath: string,
-  options: { maxFiles?: number } = {},
-): Promise<DiscoverRepoFilesResult> {
-  const maxFiles = options.maxFiles ?? getMaxFiles();
-  const root = path.resolve(repoPath);
-  const files: DiscoveredRepoFile[] = [];
-  let truncated = false;
-
-  async function walk(current: string) {
-    if (files.length >= maxFiles) {
-      truncated = true;
-      return;
-    }
-
-    const entries = await readdir(current, { withFileTypes: true });
-    for (const entry of entries) {
-      if (files.length >= maxFiles) {
-        truncated = true;
-        return;
-      }
-
-      const absolutePath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!EXCLUDED_DIRS.has(entry.name)) {
-          await walk(absolutePath);
-        }
-        continue;
-      }
-
-      if (!entry.isFile()) {
-        continue;
-      }
-
-      const relativePath = toPosixRelative(root, absolutePath);
-      const extension = path.extname(entry.name).toLowerCase();
-      const fileStat = await stat(absolutePath);
-      files.push({
-        path: relativePath,
-        name: entry.name,
-        extension,
-        language: languageForExtension(extension),
-        sizeBytes: fileStat.size,
-        lines: await countLinesIfSmall(absolutePath, fileStat.size),
-      });
-    }
-  }
-
-  await walk(root);
-
-  return {
-    files,
-    totalFiles: files.length,
-    languageBreakdown: buildLanguageBreakdown(files),
-    truncated,
-  };
-}
-
 export async function cleanupRepoPath(repoPath: string) {
   if (process.env.CODEFLOW_KEEP_TMP === "true") {
     return;
   }
   await rm(repoPath, { recursive: true, force: true });
-}
-
-export function shouldExcludeDirectory(name: string) {
-  return EXCLUDED_DIRS.has(name);
-}
-
-export function languageForExtension(extension: string) {
-  return LANGUAGE_BY_EXTENSION[extension.toLowerCase()] ?? "Other";
-}
-
-export function buildLanguageBreakdown(files: Array<{ language: string }>) {
-  return files.reduce<Record<string, number>>((acc, file) => {
-    acc[file.language] = (acc[file.language] ?? 0) + 1;
-    return acc;
-  }, {});
 }
 
 function isSafeBranch(branch: string) {
@@ -309,26 +183,4 @@ async function runGit(args: string[], options: { cwd?: string; timeoutMs?: numbe
       reject(new Error(`git ${args[0]} failed with exit code ${code}: ${stderr.trim()}`));
     });
   });
-}
-
-function getMaxFiles() {
-  const parsed = Number(process.env.CODEFLOW_MAX_FILES || 5000);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
-}
-
-function toPosixRelative(root: string, absolutePath: string) {
-  return path.relative(root, absolutePath).split(path.sep).join("/");
-}
-
-async function countLinesIfSmall(filePath: string, sizeBytes: number) {
-  if (sizeBytes > 128 * 1024) {
-    return 0;
-  }
-
-  try {
-    const content = await readFile(filePath, "utf8");
-    return content.length === 0 ? 0 : content.split(/\r\n|\r|\n/).length;
-  } catch {
-    return 0;
-  }
 }

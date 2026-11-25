@@ -4,6 +4,7 @@ import { createLexicalOverlapReranker } from "@codeflow/retrieval";
 import {
   createBlastRadiusTool,
   createFindReferencesTool,
+  createFindUsagesTool,
   createGetCallersTool,
   createGraphTools,
   createSymbolSearchTool,
@@ -192,12 +193,13 @@ describe("symbol_search", () => {
 });
 
 describe("createGraphTools", () => {
-  it("returns all four in a stable order", () => {
+  it("returns every graph tool in a stable order", () => {
     expect(createGraphTools().map((tool) => tool.id)).toEqual([
       "find_references",
       "get_callers",
       "get_blast_radius",
       "symbol_search",
+      "find_usages",
     ]);
   });
 
@@ -373,5 +375,56 @@ describe("what_changed", () => {
     const outcome = await tool.run({}, { result: unpinned, memory: emptySession("s", "a") });
     expect(outcome.empty).toBe(true);
     expect(outcome.text).toContain("not pinned to a commit");
+  });
+});
+
+describe("find_usages — a symbol's declaration and every resolved use, at file:line", () => {
+  it("lists where it is declared and each call site with its count", async () => {
+    const out = await createFindUsagesTool().run({ name: "login" }, context());
+    expect(out.text).toContain("src/auth.ts:5 login (method)");
+    expect(out.text).toContain("src/index.ts:4 → src/auth.ts — call `login` (×2)");
+    expect(out.fileIds).toEqual(["src/auth.ts", "src/index.ts"]);
+  });
+
+  it("matches a qualified use by its last segment, and only uses that reach a declaring file", async () => {
+    const result = fixtureResult();
+    result.graph!.cpgEdges!.push(
+      { from: "src/db.ts", to: "src/auth.ts", kind: "call", symbol: "auth.login", count: 1, line: 7 },
+      // A different `login` that resolved to another file is NOT a use of the declared one.
+      { from: "src/orphan.ts", to: "src/util.ts", kind: "call", symbol: "login", count: 1, line: 2 },
+    );
+    const out = await createFindUsagesTool().run({ name: "login" }, { ...context(), result });
+    expect(out.text).toContain("src/db.ts:7 → src/auth.ts — call `auth.login`");
+    expect(out.text).not.toContain("src/orphan.ts");
+  });
+
+  it("says so when nothing is known, instead of guessing", async () => {
+    const out = await createFindUsagesTool().run({ name: "nothingLikeThis" }, context());
+    expect(out.empty).toBe(true);
+    expect(out.text).toContain("No declaration");
+  });
+});
+
+describe("list limit — the internal agent truncates, an MCP client gets the whole list", () => {
+  function wideResult() {
+    const result = fixtureResult();
+    for (let i = 0; i < 30; i += 1) {
+      const id = `src/feature${String(i).padStart(2, "0")}.ts`;
+      result.graph!.nodes.push({ id, path: id, name: id.split("/").pop()!, layer: "source", language: "TypeScript", lines: 5, symbolCount: 1 });
+      result.graph!.edges.push({ from: id, to: "src/util.ts", kind: "import", specifier: "./util" });
+    }
+    return result;
+  }
+
+  it("keeps the default cap of 25 for the internal agent's small context budget", async () => {
+    const out = await createBlastRadiusTool().run({ fileId: "src/util.ts" }, { ...context(), result: wideResult() });
+    expect(out.text).toMatch(/\(\+\d+ more of \d+\)/);
+  });
+
+  it("lists every affected file when the caller asks for it (MCP)", async () => {
+    const out = await createBlastRadiusTool().run({ fileId: "src/util.ts" }, { ...context(), result: wideResult(), listLimit: 1000 });
+    expect(out.text).not.toMatch(/more of/);
+    expect(out.text).toContain("src/feature29.ts");
+    expect(out.fileIds).toHaveLength(32); // 30 features + auth.ts + index.ts (through auth.ts)
   });
 });

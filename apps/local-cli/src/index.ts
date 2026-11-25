@@ -1,7 +1,23 @@
 #!/usr/bin/env node
-import { writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { createMemoryFactsStore } from "@codeflow/parsers";
+import { writeJsonFile } from "./jsonOut.js";
 import path from "node:path";
+import { buildReferenceIndex, formatVerificationReport, verifyReferences } from "@codeflow/analyzers";
 import { analyzeLocal, queryLocal } from "./analyzeLocal.js";
+import {
+  changedFilesSince,
+  checkoutToTemp,
+  computeImpact,
+  defaultBase,
+  renderImpactMarkdown,
+  isNotable,
+  renderImpactText,
+  selectTests,
+  type ChangedFile,
+} from "./impact.js";
+import { checkRules, loadRules, RULES_FILE } from "./rules.js";
+import { filesRunByPackageJson, findUnreferenced } from "./unused.js";
 
 /**
  * `codeflow-local` — the LOCAL-FIRST CLI (V3-P5 task 4).
@@ -15,8 +31,10 @@ import { analyzeLocal, queryLocal } from "./analyzeLocal.js";
  * searchable index. Everything that does not need a model — the graph, the metrics, the communities,
  * the cycles, and grounded retrieval — works offline.
  *
- *   codeflow-local analyze <repo-path> [--out result.json] [--no-index] [--index-dir DIR]
+ *   codeflow-local analyze <repo-path> [--out result.json] [--no-index] [--no-cache] [--index-dir DIR]
  *   codeflow-local ask <repo-path> "<question>" [--index-dir DIR] [-k N]
+ *   codeflow-local verify <repo-path> [text-file | -] [--text "…"] [--format text|markdown|json]
+ *   codeflow-local impact <repo-path> [--base REF] [--files a,b] [--format text|markdown|json]
  */
 
 interface ParsedArgs {
@@ -32,7 +50,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
-    if (!token.startsWith("-")) {
+    if (!token.startsWith("-") || token === "-") {
       positional.push(token);
       continue;
     }
@@ -61,10 +79,47 @@ const USAGE = `codeflow-local — analyse a repository entirely on your machine 
       --out FILE          also write the AnalysisResult JSON here
       --index-dir DIR     where the searchable index lives (default <repo>/.codeflow)
       --no-index          deterministic analysis only; skip the searchable index
+      --no-cache          parse every file (default: reuse unchanged files' parses from .codeflow/cache)
 
   codeflow-local ask <repo-path> "<question>" [options]
       --index-dir DIR     the index built by \`analyze\` (default <repo>/.codeflow)
       -k N                how many code chunks to return (default 5)
+
+  codeflow-local verify <repo-path> [text-file | -] [options]
+      Check every code reference in a piece of text — an agent's answer, a PR description, a review
+      comment — against the repository: does the file exist, are the cited lines inside it, is the
+      named symbol declared there? Reads the text from a file, from stdin ("-"), or from --text.
+      --text "..."        the text to check, inline
+      --format F          text (default) | markdown | json
+      Exit code 1 when any reference is wrong.
+
+  codeflow-local impact <repo-path> [options]
+      What a change set touches: dependents (direct + transitive), entry points, tests that reach
+      it, new import cycles and imports that resolve to nothing. Local git only — never fetches.
+      --base REF          compare against REF's merge-base with HEAD (default origin/HEAD, main, master)
+      --files a,b         use this file list instead of git
+      --format F          text (default) | markdown (PR comment) | json
+      --link-base URL     markdown only: prefix for file links (e.g. https://github.com/o/r/blob/SHA)
+      --fail-on LIST      exit 1 on: new-cycle, broken-import, rule, untested (comma-separated)
+      --quiet             print nothing unless there is a new cycle, a broken import, a rule
+                          violation, or an untested change to a file 5+ files depend on
+
+  codeflow-local check <repo-path> [--json]
+      Architecture rules from codeflow.rules.json, checked against the resolved graph:
+        { "rules": [ { "name": "web never imports the worker",
+                       "from": "apps/web/**", "forbid": "apps/worker/**", "except": [] } ] }
+      Exit code 1 on any violation. \`impact\` checks the same rules on a PR's changed files.
+
+  codeflow-local unused <repo-path> [--json]
+      Source files nothing in the repository imports, includes or calls (JS/TS, Python, C/C++
+      headers), excluding entry points and files tools load by convention. A list to review —
+      a dynamically loaded file is invisible to a static graph.
+
+  codeflow-local tests <repo-path> [--base REF | --files a,b] [--json]
+      The test files a change set can affect, one per line — for \`vitest run $(...)\`, \`go test\`,
+      \`pytest\`. Every test whose import closure reaches a changed file, every changed test, and Go
+      package tests. A change the graph cannot trace (package.json, a lockfile, a config, CI) selects
+      EVERY test and says why on stderr: skipping a failing test is worse than running one more.
 
 WHAT YOU GET, and what you do not:
   ✓ dependency graph, centrality, cycles, communities, symbols, entry points  — all offline
@@ -94,6 +149,7 @@ async function main(): Promise<number> {
       repoPath,
       ...(typeof flags["index-dir"] === "string" ? { indexDir: flags["index-dir"] } : {}),
       skipIndex: flags["no-index"] === true,
+      ...(flags["no-cache"] === true ? { factsCache: false as const } : {}),
       onProgress: (message) => console.log(message),
     });
 
@@ -106,7 +162,10 @@ async function main(): Promise<number> {
     console.log(
       `communities:  ${metrics?.clusters ? `${metrics.clusters.count} (modularity ${metrics.clusters.modularity.toFixed(3)})` : "not computed"}`,
     );
-    console.log(`entry points: ${(analysis.result.entryPoints ?? []).map((entry) => entry.fileId).join(", ") || "none detected"}`);
+    const entryPoints = (analysis.result.entryPoints ?? []).map((entry) => entry.fileId);
+    console.log(
+      `entry points: ${entryPoints.length === 0 ? "none detected" : `${entryPoints.slice(0, 6).join(", ")}${entryPoints.length > 6 ? ` (+${entryPoints.length - 6} more)` : ""}`}`,
+    );
     console.log(`indexed:      ${analysis.chunkCount} chunk(s)${analysis.chunkCount ? ` in ${analysis.indexDir}` : ""}`);
     for (const warning of analysis.warnings) console.log(`warning:      ${warning}`);
     // Said every time, not once in a README: the absence of a summary is the one thing a user of the
@@ -114,7 +173,7 @@ async function main(): Promise<number> {
     console.log("note:         no AI summary in local mode (no keyless local LLM). Everything above is deterministic.");
 
     if (typeof flags.out === "string") {
-      await writeFile(path.resolve(flags.out), `${JSON.stringify(analysis.result, null, 2)}\n`, "utf8");
+      writeJsonFile(path.resolve(flags.out), analysis.result);
       console.log(`wrote:        ${flags.out}`);
     }
     return 0;
@@ -156,43 +215,205 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  if (command === "verify") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("verify needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const text =
+      typeof flags.text === "string"
+        ? flags.text
+        : positional[1] === "-" || (!positional[1] && !process.stdin.isTTY)
+          ? await readStdin()
+          : positional[1]
+            ? await readFile(path.resolve(positional[1]), "utf8")
+            : undefined;
+    if (text === undefined) {
+      console.error('verify needs the text to check: a file, "-" for stdin, or --text "...".');
+      return 1;
+    }
+    const analysis = await analyzeLocal({ repoPath, skipIndex: true, onProgress: () => {} });
+    const root = path.resolve(repoPath);
+    const index = buildReferenceIndex(analysis.result, async (relative) => {
+      // Only paths the analysis discovered reach here (buildReferenceIndex checks), so no traversal.
+      const content = await readFile(path.join(root, relative), "utf8").catch(() => null);
+      return content === null ? undefined : content.split(/\r\n|\r|\n/).length - (content.endsWith("\n") ? 1 : 0);
+    });
+    const report = await verifyReferences(text, index);
+    const format = typeof flags.format === "string" ? flags.format : "text";
+    console.log(format === "json" ? JSON.stringify(report, null, 2) : formatVerificationReport(report, format === "markdown" ? "markdown" : "text"));
+    return report.fail > 0 ? 1 : 0;
+  }
+
+  if (command === "tests") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("tests needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    let changed: ChangedFile[];
+    if (typeof flags.files === "string") {
+      changed = flags.files.split(",").map((file) => file.trim()).filter(Boolean).map((file) => ({ path: file, status: "modified" as const }));
+    } else {
+      const base = typeof flags.base === "string" ? flags.base : await defaultBase(root);
+      if (!base) {
+        console.error("tests: no --base given and none of origin/HEAD, origin/main, origin/master, main, master exists.");
+        return 1;
+      }
+      changed = await changedFilesSince(root, base);
+    }
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const selection = selectTests(head.result, changed);
+    if (flags.json === true) {
+      console.log(JSON.stringify({ changed: changed.map((file) => file.path), ...selection }, null, 2));
+    } else {
+      if (selection.all) console.error(`tests: running ALL ${selection.tests.length} test file(s) — ${selection.reason}`);
+      else console.error(`tests: ${selection.tests.length} test file(s) reach ${changed.length} changed file(s)`);
+      for (const test of selection.tests) console.log(test);
+    }
+    return 0;
+  }
+
+  if (command === "impact") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("impact needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    let changed: ChangedFile[];
+    let base: string | undefined;
+    if (typeof flags.files === "string") {
+      changed = flags.files.split(",").map((file) => file.trim()).filter(Boolean).map((file) => ({ path: file, status: "modified" as const }));
+    } else {
+      base = typeof flags.base === "string" ? flags.base : await defaultBase(root);
+      if (!base) {
+        console.error("impact: no --base given and none of origin/HEAD, origin/main, origin/master, main, master exists.");
+        return 1;
+      }
+      changed = await changedFilesSince(root, base);
+    }
+
+    // One in-memory parse cache for both sides: every file the PR did not touch is parsed once.
+    const shared = createMemoryFactsStore();
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, factsCache: shared, onProgress: () => {} });
+    let baseResult;
+    if (base) {
+      try {
+        const checkout = await checkoutToTemp(root, base);
+        try {
+          baseResult = (await analyzeLocal({ repoPath: checkout.dir, skipIndex: true, factsCache: shared, onProgress: () => {} })).result;
+        } finally {
+          await checkout.cleanup();
+        }
+      } catch (error) {
+        console.error(`impact: could not analyse base ${base} (${error instanceof Error ? error.message : String(error)}); new-cycle check skipped.`);
+      }
+    }
+    const { rules, errors: ruleErrors } = await loadRules(root);
+    if (ruleErrors.length) {
+      for (const error of ruleErrors) console.error(`impact: ${error}`);
+      return 1;
+    }
+    const report = computeImpact(head.result, changed, {
+      ...(base ? { base } : {}),
+      ...(baseResult ? { baseResult } : {}),
+      rules,
+    });
+    const format = typeof flags.format === "string" ? flags.format : "text";
+    // --quiet: say nothing unless something needs a human (see isNotable). A bot that always talks gets muted.
+    const silent = flags.quiet === true && !isNotable(report);
+    if (silent) {
+      if (format === "json") console.log(JSON.stringify({ notable: false }));
+    } else if (format === "json") console.log(JSON.stringify(report, null, 2));
+    else if (format === "markdown") {
+      console.log(renderImpactMarkdown(report, typeof flags["link-base"] === "string" ? { linkBase: flags["link-base"].replace(/\/$/, "") } : {}));
+    } else console.log(renderImpactText(report));
+
+    const failOn = new Set(typeof flags["fail-on"] === "string" ? flags["fail-on"].split(",").map((v) => v.trim()) : []);
+    const failed =
+      (failOn.has("new-cycle") && (report.newCycles?.length ?? 0) > 0) ||
+      (failOn.has("broken-import") && report.brokenImports.length > 0) ||
+      (failOn.has("rule") && report.ruleViolations.length > 0) ||
+      (failOn.has("untested") && report.untested.length > 0);
+    return failed ? 1 : 0;
+  }
+
+  if (command === "check") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("check needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    const { rules, errors } = await loadRules(root);
+    if (errors.length) {
+      for (const error of errors) console.error(`check: ${error}`);
+      return 1;
+    }
+    if (!rules.length) {
+      console.error(`check: no rules — add a ${RULES_FILE} at the repository root (see \`codeflow-local help\`).`);
+      return 1;
+    }
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const violations = checkRules(head.result, rules);
+    if (flags.json === true) console.log(JSON.stringify({ rules: rules.length, violations }, null, 2));
+    else {
+      console.log(`${rules.length} rule(s), ${violations.length} violation(s)`);
+      for (const violation of violations) console.log(`  ${violation.rule}: ${violation.from} → ${violation.to}  (${violation.specifier})`);
+    }
+    return violations.length ? 1 : 0;
+  }
+
+  if (command === "unused") {
+    const repoPath = positional[0];
+    if (!repoPath) {
+      console.error("unused needs a <repo-path>.\n");
+      console.error(USAGE);
+      return 1;
+    }
+    const root = path.resolve(repoPath);
+    const head = await analyzeLocal({ repoPath: root, skipIndex: true, onProgress: () => {} });
+    const nodeIds = (head.result.graph?.nodes ?? []).map((node) => node.id);
+    const manifests: Array<{ path: string; json: Record<string, unknown> }> = [];
+    for (const id of nodeIds.filter((file) => file === "package.json" || file.endsWith("/package.json"))) {
+      try {
+        manifests.push({ path: id, json: JSON.parse(await readFile(path.join(root, id), "utf8")) as Record<string, unknown> });
+      } catch {
+        // An unreadable manifest names nothing; the report just cannot use it.
+      }
+    }
+    const { files, judged } = findUnreferenced(head.result, filesRunByPackageJson(manifests, new Set(nodeIds)));
+    if (flags.json === true) console.log(JSON.stringify({ judged, unreferenced: files }, null, 2));
+    else {
+      console.log(`${files.length} of ${judged} judged source file(s) are imported, included or called by nothing in the repository:`);
+      for (const file of files) console.log(`  ${file.path}  (${file.lines} lines)`);
+      console.log(
+        "\nCheck before deleting: a computed dynamic import, a plugin loaded by name, or a file another repository " +
+          "imports is invisible to a static graph. Java/C#/Go and C/C++ source files are not judged per file.",
+      );
+    }
+    return 0;
+  }
+
   console.error(`Unknown command "${command}".\n`);
   console.error(USAGE);
   return 1;
 }
 
 /**
- * Run only when INVOKED, not when imported.
+ * Run only when invoked, not when imported (a test importing `parseArgs` must not run `main()`).
  *
- * Without this guard, a test importing `parseArgs` from here would execute `main()` as a side effect
- * of the import — which is exactly what happened the first time, and it surfaced as
- * "process.exit unexpectedly called with 1" rather than as anything that named the cause.
- *
- * THE SEPARATOR IS NORMALISED FIRST, and that is not a nicety. `process.argv[1]` uses the PLATFORM
- * separator, so on Windows this path is delimited by backslashes — and the original pattern's
- * character class matched only a forward slash. The guard was therefore ALWAYS FALSE on Windows, and
- * `codeflow-local` exited 0 with NO OUTPUT on every Windows machine: not an error, not a usage
- * message, nothing. A silent no-op is the worst way for an entrypoint guard to fail, because nothing
- * looks wrong — and it is invisible to a POSIX-only CI.
- *
- * THE FIRST FIX FOR THAT WAS ITSELF PLATFORM-DEPENDENT, which is the more interesting bug. It split on
- * `path.sep`, and `path.sep` describes the HOST, not the string: on Linux it is "/", so a Windows-style
- * argv path passed straight through with its backslashes intact. The result was a normaliser that
- * worked only where normalisation was already unnecessary — green on a Windows laptop, red on the
- * Linux CI runner. The normalisation is now unconditional (see `normalizeEntryPath`), so the guard
- * reads the string it was given instead of inferring anything from the platform underneath it.
- *
- * Built with `new RegExp` over a normalised path rather than a literal, so the pattern needs no
- * escape sequences at all and cannot regress into the same class of bug.
- *
- * THREE ENTRYPOINTS, because there are three ways this file legitimately becomes `argv[1]`:
- *   - `src/index.ts`   — `pnpm dev:local`, via tsx
- *   - `dist/index.js`  — the tsc output, inside the workspace
- *   - `codeflow-local.mjs` — the PUBLISHED bundle, which is what `npx codeflow-local` runs
- *
- * The third was missed on the first pass and the symptom was identical to the Windows bug above:
- * the bundle ran, matched nothing, and exited 0 in silence. Anything narrower than this ships a CLI
- * that works everywhere except where users actually run it.
+ * `argv[1]` is normalised to forward slashes unconditionally (`normalizeEntryPath`): matching only "/"
+ * made the guard always false on Windows, and splitting on `path.sep` describes the host, not the
+ * string. Either way the CLI exited 0 with no output. Three files can be `argv[1]`: `src/index.ts`
+ * (tsx), `dist/index.js` (tsc) and the published `codeflow-local.mjs` bundle that `npx` runs.
  */
 const ENTRY_PATTERN = new RegExp("(?:local-cli/(?:dist|src)/index[.](?:js|ts)|codeflow-local(?:[.]mjs)?)$");
 
@@ -222,11 +443,27 @@ export function isDirectInvocation(argvPath: string | undefined): boolean {
 
 const invokedDirectly = isDirectInvocation(process.argv[1]);
 
+/**
+ * Exit only after stdout has DRAINED. Writes to a pipe are asynchronous in Node; `process.exit` right
+ * after a large `console.log` drops whatever is still buffered — past the 64 KB pipe buffer, the JSON a
+ * consumer reads (`impact --format json | jq`, a CI step) was silently cut off. A write's callback fires
+ * once everything written before it has been flushed.
+ */
+function exitAfterFlush(code: number): void {
+  process.stdout.write("", () => process.exit(code));
+}
+
 if (invokedDirectly) {
   main()
-    .then((code) => process.exit(code))
+    .then(exitAfterFlush)
     .catch((error: unknown) => {
       console.error(`codeflow-local failed: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(1);
+      exitAfterFlush(1);
     });
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
 }

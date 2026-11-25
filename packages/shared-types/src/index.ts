@@ -205,7 +205,7 @@ export interface AnalysisResult {
   cost?: CostBreakdown;
 }
 
-export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "generic" | "unknown";
+export type LanguageId = "javascript" | "typescript" | "jsx" | "tsx" | "python" | "go" | "java" | "c" | "cpp" | "csharp" | "generic" | "unknown";
 
 export type ParserConfidence = number;
 
@@ -438,7 +438,7 @@ export interface RepoStructure {
 export interface EntryPoint {
   /** References FileNode.id. */
   fileId: string;
-  reason: "main" | "index" | "server" | "cli-bin" | "exported-root";
+  reason: "main" | "index" | "server" | "app" | "cli-bin" | "exported-root";
 }
 
 // ── Inventory slice (stage 4) ────────────────────────────────────────────────
@@ -498,7 +498,10 @@ export type EntryPointEvidence =
   | "package-json-main"
   | "package-json-exports"
   | "filename-convention"
-  | "framework";
+  | "framework"
+  /** The code declares a program entry: Go `func main` in `package main`, Java/C# `static void main`,
+   *  C/C++/Rust `main`, Python `if __name__ == "__main__":`. */
+  | "main-function";
 
 /** An entry point detected by Inventory, keyed by repo-relative POSIX `filePath`. */
 export interface InventoryEntryPoint {
@@ -532,6 +535,11 @@ export interface Inventory {
   symbolCount: number;
   /** Real lines-of-code per parsed file, keyed by repo-relative POSIX path. */
   loc: Record<string, number>;
+  /**
+   * PHYSICAL line count per parsed file (blank and comment lines included). `loc` is not a file
+   * length — checking that a cited line exists needs this one.
+   */
+  lines?: Record<string, number>;
   /** Hard-evidence project-type verdict for orchestrator reconciliation, if any. */
   projectTypeSignal?: ProjectTypeSignal;
   /** Files that could not be parsed (skipped — a single bad file is not a stage failure). */
@@ -553,6 +561,10 @@ export interface RepoDependencyEdge {
   kind: "import" | "require" | "dynamic" | "reexport";
   /** The raw import/require/from string as written in source. */
   specifier: string;
+  /** Erased at runtime (`import type`, `if TYPE_CHECKING:`). Present only when true. */
+  typeOnly?: true;
+  /** Runs only when a function is called (import inside a function body). Present only when true. */
+  lazy?: true;
 }
 
 /**
@@ -675,6 +687,12 @@ export interface CpgProvenance {
   fallbackFiles: number;
   /** True when at least one file was parsed by tree-sitter. */
   enriched: boolean;
+  /**
+   * Committed JavaScript BUNDLES (webpack / browserify / Parcel output) left out of the graph:
+   * their `require("./_x")` calls address modules inside the bundle, not files in the repo, and
+   * would surface as hundreds of fake broken imports. Absent when there were none.
+   */
+  bundledFiles?: number;
 }
 
 // ── Analyze slice (stage 6) ──────────────────────────────────────────────────

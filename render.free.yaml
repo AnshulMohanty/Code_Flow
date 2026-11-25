@@ -1,7 +1,7 @@
 # CodeFlow — Render Blueprint, FREE TIER.
 #
 # NOTHING HERE HAS BEEN APPLIED. Same status as render.yaml: this is the deployment described so it
-# can be reviewed. Creating the services and filling the secrets are owner steps; DEPLOY.md
+# can be reviewed. Creating the services and filling the secrets are owner steps; DESIGN.md
 # Appendix C is the walkthrough.
 #
 # ── Why this file exists separately ───────────────────────────────────────────────────────────
@@ -66,6 +66,10 @@ services:
       # concurrency to 1 and logs both facts at boot.
       - key: RUN_WORKER_IN_PROCESS
         value: "true"
+      # API (≈ 110–150 MiB under load) and worker share 512 MB here; a job needs about 150 MiB + 30 KiB
+      # per file (measured), so refuse clones over 3,000 files rather than run out of memory mid-job.
+      - key: MAX_REPO_FILES
+        value: "3000"
       # PORT is assigned by Render and read by apps/api/src/config/port.ts. API_PORT is deliberately
       # NOT set: it takes precedence, so setting it would bind a port the proxy is not routing to.
       - key: POSTGRES_URL
@@ -80,6 +84,10 @@ services:
       # Needs the static site's URL, which does not exist until the first deploy. Owner step.
       - key: CORS_ORIGINS
         sync: false
+      # Render terminates TLS in ONE proxy hop. Without this every visitor shares the proxy's IP,
+      # so the per-IP rate limit becomes one global bucket.
+      - key: TRUST_PROXY_HOPS
+        value: "1"
 
   # ── Web (static SPA) — free, always on, never sleeps ────────────────────────────────────────
   - type: web
@@ -155,13 +163,13 @@ envVarGroups:
         sync: false
       # OFF on free, deliberately. The fan-out is 5N+1 provider calls where the single-shot stage is
       # 1 — the right trade for a real onboarding guide and the wrong one for a free demo. Turning it
-      # on is a single variable; see GO_LIVE.md.
+      # on is a single variable; see DESIGN.md.
       - key: FANOUT_SYNTHESIS
         value: "false"
       # Also off: it touches the deterministic spine, and on a 0.1-CPU free instance there is no
       # parallelism to win anyway.
       - key: PARALLEL_STAGES
         value: "false"
-      # Set it to turn `usd: null` into a real number. Format and current values in GO_LIVE.md §1.
+      # Set it to turn `usd: null` into a real number. Format and current values in DESIGN.md (Deploy).
       - key: LLM_PRICING
         sync: false
