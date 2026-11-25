@@ -2,6 +2,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ANALYZER_VERSION } from "@codeflow/config";
 import { createApp } from "../app.js";
+import { createDailyCaps } from "../middleware/dailyCap.js";
 import { clearAnalysisCacheForTests, saveAnalysis } from "../services/analysisCacheService.js";
 import { answerLatency, recordAnswerLatency, resetAnswerLatencyForTests, LATENCY_WINDOW } from "../services/answerLatency.js";
 import { env } from "../config/env.js";
@@ -54,6 +55,41 @@ describe("GET /api/meta", () => {
   });
   afterEach(() => {
     delete process.env.GIT_SHA;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+  });
+
+  it("reports AI as OFF with no key — the UI offers 'map only' and nothing else", async () => {
+    const response = await request(app).get("/api/meta").expect(200);
+    expect(response.body.ai).toEqual({ enabled: false, qaEnabled: false, provider: null, chatModel: null, embeddingModel: null });
+    expect(response.body.limits).toEqual({ dailyAiAnalysesPerIp: null, dailyQuestionsPerIp: null });
+  });
+
+  it("reports the provider and BOTH models a key turns on, never the key itself", async () => {
+    process.env.OPENAI_API_KEY = "sk-test-secret";
+    const response = await request(app).get("/api/meta").expect(200);
+    expect(response.body.ai).toEqual({
+      enabled: true,
+      qaEnabled: true,
+      provider: "openai",
+      chatModel: "gpt-4.1-mini",
+      embeddingModel: "text-embedding-3-small",
+    });
+    expect(JSON.stringify(response.body)).not.toContain("sk-test-secret");
+  });
+
+  it("reports an ambiguous configuration instead of failing the page load", async () => {
+    process.env.OPENAI_API_KEY = "o";
+    process.env.GEMINI_API_KEY = "g";
+    const response = await request(app).get("/api/meta").expect(200);
+    expect(response.body.ai.enabled).toBe(false);
+    expect(response.body.ai.configError).toMatch(/LLM_PROVIDER/);
+  });
+
+  it("reports the per-visitor daily caps so the UI can state them up front", async () => {
+    const capped = createApp({ dailyCaps: createDailyCaps({ limits: { aiAnalyses: 3, questions: 20 } }) });
+    const response = await request(capped).get("/api/meta").expect(200);
+    expect(response.body.limits).toEqual({ dailyAiAnalysesPerIp: 3, dailyQuestionsPerIp: 20 });
   });
 
   it("reports the ANALYZER version — the thing that actually decides cache reuse", async () => {

@@ -116,8 +116,9 @@ services:
     # VITE_API_BASE_URL is set HERE and not in envVars because Render does not expand `$VAR`
     # inside an envVar `value:` -- it would bake the literal string `https://$CODEFLOW_API_HOST`
     # into the bundle. The build command is a real shell, so the expansion happens.
+    # `npm install -g pnpm`, not `corepack enable`: the static builder's /usr/bin is read-only (EROFS).
     buildCommand: >-
-      corepack enable &&
+      npm install -g pnpm@9.15.4 &&
       pnpm install --frozen-lockfile &&
       pnpm --filter @codeflow/shared-types --filter @codeflow/config build &&
       VITE_API_BASE_URL="https://$CODEFLOW_API_HOST"
@@ -227,7 +228,7 @@ envVarGroups:
       - key: VOYAGE_MODEL
         sync: false
       - key: OPENAI_MODEL
-        sync: false # default gpt-4.1. SYNTHESIS_MODEL is anthropic-only and is NOT read for openai.
+        sync: false # default gpt-4.1-mini. SYNTHESIS_MODEL is anthropic-only and is NOT read for openai.
       - key: GEMINI_EMBEDDING_MODEL
         sync: false
       - key: GEMINI_EMBEDDING_DIM

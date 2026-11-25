@@ -10,6 +10,7 @@ import {
   createGeminiClient,
   createLlmClientFromEnv,
   createOpenAiClient,
+  budgetLimitsFromEnv,
   createRedisBudgetHandle,
   maybeRouted,
   warmupRegistry,
@@ -111,8 +112,12 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
     // An unhandled ioredis 'error' event would kill the process; the handle fails open.
     console.error("[worker] budget Redis error:", error.message);
   });
-  const budget = createRedisBudgetHandle(budgetRedis);
-  console.log("Guard 5 — daily LLM budget ledger: Redis (shared with the API Q&A path).");
+  const budgetLimits = budgetLimitsFromEnv(process.env);
+  const budget = createRedisBudgetHandle(budgetRedis, { limitTokens: budgetLimits });
+  console.log(
+    `Guard 5 — daily LLM budget ledger: Redis (shared with the API Q&A path); ceilings per UTC day: ` +
+      `chat ${budgetLimits.chat.toLocaleString("en-US")} tokens, embedding ${budgetLimits.embedding.toLocaleString("en-US")} tokens.`,
+  );
   const eventLog = createMongoEventLogStore(); // SSE replay buffer (#20)
 
   // AI providers are selected by env (LLM_PROVIDER / EMBEDDING_PROVIDER, else inferred
@@ -172,7 +177,8 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
   const embeddingClient = createEmbeddingClientFromEnv(process.env);
   console.log(
     embeddingClient
-      ? `RAG (AI) enabled — provider ${embeddingClient.provider}, model ${embeddingClient.model} (dim ${embeddingClient.dimension}).`
+      ? `RAG (AI) enabled — provider ${embeddingClient.provider}, model ${embeddingClient.model} (dim ${embeddingClient.dimension}); ` +
+          `index cap ${env.maxIndexChunks ? `${env.maxIndexChunks} chunks` : "none"}, embedding cache ${env.embeddingCache ? "on" : "off"}.`
       : "RAG (AI) disabled: no embedding provider key configured.",
   );
 
@@ -260,7 +266,10 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
   // An unset WORKER_CONCURRENCY resolves to the same 2, so an existing deployment is unchanged.
   const scaling = resolveScalingConfig(process.env);
   for (const warning of scaling.warnings) console.warn(`[worker] ${warning}`);
-  console.log(`Job concurrency: ${scaling.concurrency} per instance.`);
+  // The EFFECTIVE number: embedded mode passes 1 in `options`, and logging the env-derived value here
+  // printed "2" on a deployment that runs one job at a time.
+  const concurrency = options.concurrency ?? scaling.concurrency;
+  console.log(`Job concurrency: ${concurrency} per instance.`);
 
   // In-flight count, so /metrics reports THIS instance's load rather than only the shared queue.
   let activeJobs = 0;
@@ -282,6 +291,8 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
           measureRepoSize,
           ...(env.maxRepoFiles ? { maxRepoFiles: env.maxRepoFiles } : {}),
           ...(env.maxRepoBytes ? { maxRepoBytes: env.maxRepoBytes } : {}),
+          ...(env.maxIndexChunks ? { maxIndexChunks: env.maxIndexChunks } : {}),
+          embeddingCache: env.embeddingCache,
           cleanupRepo: cleanupRepoPath,
           ...(routedSynthesisClient ? { synthesisClient: routedSynthesisClient } : {}),
           fanOutSynthesis: env.fanOutSynthesis,
@@ -305,7 +316,7 @@ export async function startAnalysisWorker(options: StartWorkerOptions = {}): Pro
     },
     {
       connection: createRedisConnectionOptions({ forWorker: true }),
-      concurrency: options.concurrency ?? scaling.concurrency,
+      concurrency,
     },
   );
 

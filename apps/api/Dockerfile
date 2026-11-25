@@ -10,7 +10,9 @@ RUN corepack enable
 WORKDIR /repo
 COPY . .
 RUN pnpm install --frozen-lockfile
-RUN pnpm -r build
+# Only this app and the workspace packages it depends on ("..."), one at a time: a parallel build
+# raced on the shared packages' dist folders (CI moved to serial for the same reason).
+RUN pnpm --filter "@codeflow/api..." --workspace-concurrency=1 build
 # `pnpm deploy` produces a self-contained, prod-pruned folder with the internal @codeflow/*
 # packages copied in (the pnpm-native way to ship one workspace app).
 RUN pnpm --filter=@codeflow/api deploy --prod /prod

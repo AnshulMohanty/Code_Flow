@@ -16,7 +16,7 @@ import {
   type ChunkTextStore,
   type VectorStore,
 } from "@codeflow/retrieval";
-import { createRagStage } from "../stages/rag.js";
+import { capChunkPlan, createRagStage } from "../stages/rag.js";
 import { createSynthesizeStage } from "../stages/synthesize.js";
 import { createIngestStage, type RepoCloner } from "../stages/ingest.js";
 import { runPipeline, type CachedAnalysisLookup } from "../pipeline/orchestrator.js";
@@ -199,7 +199,7 @@ async function runRag(
   ctx: PipelineContext,
   readFile: ReturnType<typeof fakeReadFile>,
   client: EmbeddingClient,
-  overrides: { maxAttempts?: number; maxChunkTokens?: number; windowLines?: number } = {},
+  overrides: { maxAttempts?: number; maxChunkTokens?: number; windowLines?: number; maxChunks?: number; embeddingCache?: boolean } = {},
 ) {
   const stores = storesFor(client);
   const stage = createRagStage({ client, ...stores, readFile, now: () => 1000, ...overrides });
@@ -364,6 +364,58 @@ describe("rag — embedding cache (wallet defense)", () => {
     const { partial } = await runRag(ctx, readFile, second);
     expect(second.calls).toHaveLength(0); // ZERO API
     expect(partial.aiRag!.chunkCount).toBeGreaterThan(0);
+  });
+});
+
+describe("rag — EMBEDDING_CACHE=false (no second copy of every vector)", () => {
+  it("never reads or writes the embedding cache, and still builds the index", async () => {
+    const cache = memCache();
+    const get = vi.spyOn(cache, "get");
+    const set = vi.spyOn(cache, "set");
+    const client = mockEmbedClient();
+    const { ctx, readFile } = ctxFor({ cache });
+    const { partial } = await runRag(ctx, readFile, client, { embeddingCache: false });
+    expect(partial.aiRag!.chunkCount).toBeGreaterThan(0);
+    const embedKeys = (calls: unknown[][]) => calls.map((call) => String(call[0])).filter((key) => !key.startsWith("rag/"));
+    expect(embedKeys(get.mock.calls)).toEqual([]);
+    expect(embedKeys(set.mock.calls)).toEqual([]);
+  });
+});
+
+describe("rag — MAX_INDEX_CHUNKS (bounded memory, spend and storage)", () => {
+  it("keeps WHOLE files, most connected first, until the cap; ties broken by path", () => {
+    const plan = [
+      { id: "a#1", fileId: "a.ts" },
+      { id: "a#2", fileId: "a.ts" },
+      { id: "b#1", fileId: "b.ts" },
+      { id: "c#1", fileId: "c.ts" },
+      { id: "c#2", fileId: "c.ts" },
+      { id: "c#3", fileId: "c.ts" },
+    ];
+    const perFile = [
+      { fileId: "a.ts", blastRadius: 1 },
+      { fileId: "b.ts", blastRadius: 9 },
+      { fileId: "c.ts", blastRadius: 5 },
+    ];
+    // b (1 chunk) then c (3) fit in 4; a (2) would exceed it and is not split.
+    expect(capChunkPlan(plan, 4, perFile).map((chunk) => chunk.id)).toEqual(["b#1", "c#1", "c#2", "c#3"]);
+    // A file bigger than the remaining budget is skipped; a smaller one after it still fits.
+    expect(capChunkPlan(plan, 3, perFile).map((chunk) => chunk.id)).toEqual(["a#1", "a#2", "b#1"]);
+  });
+
+  it("records the cap on the slice so the UI can say how much of the repo Q&A covers", async () => {
+    const client = mockEmbedClient();
+    const { ctx, readFile } = ctxFor();
+    const full = await runRag(ctx, readFile, client);
+    const total = full.partial.aiRag!.chunkCount;
+    expect(total).toBeGreaterThan(1);
+
+    const again = ctxFor();
+    const { partial } = await runRag(again.ctx, again.readFile, mockEmbedClient(), { maxChunks: total - 1 });
+    expect(partial.aiRag!.chunkCount).toBeLessThan(total);
+    expect(partial.aiRag!.capped).toMatchObject({ chunkCap: total - 1, totalChunks: total });
+    // Uncapped runs carry no `capped` field at all (absent ≠ empty).
+    expect(full.partial.aiRag!.capped).toBeUndefined();
   });
 });
 

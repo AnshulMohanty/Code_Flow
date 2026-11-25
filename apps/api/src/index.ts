@@ -82,6 +82,11 @@ try {
         `warmedUp: ${warm.warmedUp})`,
     );
   });
-} catch {
+} catch (error: unknown) {
+  // Say WHY before exiting: on a managed host the log is the only place a boot failure is visible,
+  // and a silent exit reads as "the service is down" with nothing to act on (a paused database, two
+  // provider keys with no LLM_PROVIDER, a bad URI all looked identical).
+  const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  console.error(`codeflow-api failed to start: ${message}`);
   process.exit(1);
 }

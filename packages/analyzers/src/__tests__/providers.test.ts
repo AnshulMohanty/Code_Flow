@@ -6,6 +6,7 @@ import {
   createGeminiEmbeddingClient,
   createOpenAiClient,
   createOpenAiEmbeddingClient,
+  OPENAI_EMBED_MAX_INPUT_CHARS,
   createVoyageClient,
   createEmbeddingClientFromEnv,
   createLlmClientFromEnv,
@@ -320,15 +321,15 @@ describe("OpenAI is a first-class provider for BOTH roles", () => {
     expect(createEmbeddingClientFromEnv(env)?.provider).toBe("voyage");
   });
 
-  it("defaults to gpt-4.1 and honours OPENAI_MODEL", () => {
-    expect(createLlmClientFromEnv({ OPENAI_API_KEY: "o" })?.model).toBe("gpt-4.1");
-    expect(createLlmClientFromEnv({ OPENAI_API_KEY: "o", OPENAI_MODEL: "gpt-4.1-mini" })?.model).toBe("gpt-4.1-mini");
+  it("defaults to gpt-4.1-mini and honours OPENAI_MODEL", () => {
+    expect(createLlmClientFromEnv({ OPENAI_API_KEY: "o" })?.model).toBe("gpt-4.1-mini");
+    expect(createLlmClientFromEnv({ OPENAI_API_KEY: "o", OPENAI_MODEL: "gpt-4.1" })?.model).toBe("gpt-4.1");
   });
 
   it("does NOT read SYNTHESIS_MODEL — a claude model id sent to OpenAI is a 404 that reads like an outage", () => {
     const client = createLlmClientFromEnv({ OPENAI_API_KEY: "o", SYNTHESIS_MODEL: "claude-opus-4-8" });
     expect(client?.provider).toBe("openai");
-    expect(client?.model).toBe("gpt-4.1");
+    expect(client?.model).toBe("gpt-4.1-mini");
   });
 
   it("selected-but-keyless is undefined, not a crash (the stage is simply not registered)", () => {
@@ -400,7 +401,7 @@ describe("the OpenAI chat adapter conforms to LlmClient", () => {
     const client = createOpenAiClient({ apiKey: "o" });
     await client.complete({ cachePrefix: "STABLE", system: "volatile", prompt: "p" });
     const b = body(captured[0]);
-    expect(b.model).toBe("gpt-4.1");
+    expect(b.model).toBe("gpt-4.1-mini");
     expect(b.temperature).toBe(0); // determinism, same as the other two adapters
     expect(b.response_format).toEqual({ type: "json_object" });
     expect(b.messages).toEqual([
@@ -448,6 +449,25 @@ describe("the OpenAI embedding adapter conforms to EmbeddingClient", () => {
     const truncated = stubFetch({ data: [{ embedding: [1], index: 0 }], usage: { total_tokens: 1 } });
     await createOpenAiEmbeddingClient({ apiKey: "o", dimension: 512 }).embed({ texts: ["x"], inputType: "document" });
     expect(body(truncated[0]).dimensions).toBe(512);
+  });
+
+  it("OPENAI_BASE_URL routes BOTH OpenAI clients to a compatible endpoint (trailing slash tolerated)", async () => {
+    const env = { OPENAI_API_KEY: "o", OPENAI_BASE_URL: "http://gateway.local:8080/" };
+    const chatCalls = stubFetch({ choices: [{ message: { content: "{}" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+    await createLlmClientFromEnv(env)!.complete({ prompt: "p" });
+    expect(chatCalls[0].url).toBe("http://gateway.local:8080/v1/chat/completions");
+    const embedCalls = stubFetch({ data: [{ embedding: [1], index: 0 }], usage: { total_tokens: 1 } });
+    await createEmbeddingClientFromEnv(env)!.embed({ texts: ["x"], inputType: "document" });
+    expect(embedCalls[0].url).toBe("http://gateway.local:8080/v1/embeddings");
+  });
+
+  it("sends at most OPENAI_EMBED_MAX_INPUT_CHARS per input (OpenAI 400s an input over 8,192 tokens)", async () => {
+    const captured = stubFetch({ data: [{ embedding: [1], index: 0 }, { embedding: [2], index: 1 }], usage: { total_tokens: 2 } });
+    const huge = "x".repeat(OPENAI_EMBED_MAX_INPUT_CHARS * 3);
+    await createOpenAiEmbeddingClient({ apiKey: "o" }).embed({ texts: [huge, "short"], inputType: "document" });
+    const sent = body(captured[0]).input as string[];
+    expect(sent[0]).toHaveLength(OPENAI_EMBED_MAX_INPUT_CHARS);
+    expect(sent[1]).toBe("short"); // a normal chunk is untouched
   });
 
   it("re-chunks under its per-request input cap (>256 texts → multiple calls, order preserved)", async () => {

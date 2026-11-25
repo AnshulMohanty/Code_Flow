@@ -50,6 +50,19 @@ export interface RagDependencies {
   readFile(repoPath: string, relativePath: string): Promise<string | null>;
   /** Max embedding-API attempts per batch (1 initial + retries). Default 3. */
   maxAttempts?: number;
+  /**
+   * Cap on chunks EMBEDDED per run (`MAX_INDEX_CHUNKS`). Unset ⇒ no cap. Memory, embedding spend and
+   * vector storage all grow with the chunk count, and on a 512 MB host an uncapped index of a
+   * ~3,000-file repository ran the process out of heap (measured 2026-11-25). Over the cap, the most
+   * connected files are indexed first (blast radius, then path) and the slice says so (`capped`).
+   */
+  maxChunks?: number;
+  /**
+   * Read/write the per-chunk embedding cache in `ctx.cache` (default true). The cache saves money on
+   * re-runs, but it is a SECOND copy of every vector (~20 KB each at 1,536 dims) next to the one in
+   * the vector store — enough to fill a free 512 MB Mongo after a few repositories (`EMBEDDING_CACHE=false`).
+   */
+  embeddingCache?: boolean;
   /** Override the per-chunk token cap (defaults to MAX_CHUNK_TOKENS). For tests. */
   maxChunkTokens?: number;
   /** Override the fixed window size in lines (defaults to WINDOW_CHUNK_LINES). For tests. */
@@ -266,8 +279,22 @@ export function createRagStage(
         throw new Error("RAG produced no grounded chunks; nothing to index.");
       }
 
+      // --- Chunk budget (MAX_INDEX_CHUNKS) -----------------------------------
+      let capped: Rag["capped"];
+      if (deps.maxChunks !== undefined && plan.length > deps.maxChunks) {
+        const kept = capChunkPlan(plan, deps.maxChunks, ctx.prior.metrics?.perFile ?? []);
+        capped = {
+          chunkCap: deps.maxChunks,
+          totalChunks: plan.length,
+          indexedFiles: new Set(kept.map((chunk) => chunk.fileId)).size,
+          totalFiles: new Set(plan.map((chunk) => chunk.fileId)).size,
+        };
+        ctx.logger.warn("RAG: chunk plan over MAX_INDEX_CHUNKS; indexing the most connected files first.", capped);
+        plan = kept;
+      }
+
       // --- Embed (embedding cache → batch the misses, transient retry) --------
-      const { embeddings, usage: embedUsage } = await embedChunks(plan, ctx, client, maxAttempts);
+      const { embeddings, usage: embedUsage } = await embedChunks(plan, ctx, client, maxAttempts, deps.embeddingCache !== false);
 
       // GUARD (V3-P2): the store must live in the SAME embedding space as the client that
       // just produced these vectors. Checked here rather than at wiring time because the
@@ -323,6 +350,7 @@ export function createRagStage(
         embeddingModel: client.model,
         embeddingDim: client.dimension,
         ...(droppedChunks ? { droppedChunks } : {}),
+        ...(capped ? { capped } : {}),
         store: {
           namespace,
           vectorStoreId: deps.vectorStore.id,
@@ -626,6 +654,7 @@ async function embedChunks(
   ctx: PipelineContext,
   client: EmbeddingClient,
   maxAttempts: number,
+  useCache: boolean,
 ): Promise<{ embeddings: number[][]; usage: TokenUsage | null }> {
   // V3-P2: what gets EMBEDDED is the enriched text (path + scope + signature + docstring,
   // then the raw bytes) — see `embedTextFor`. What gets STORED stays byte-exact for the line
@@ -640,9 +669,13 @@ async function embedChunks(
   const embeddings: (number[] | null)[] = new Array(plan.length).fill(null);
 
   // 1) Embedding cache READ (wallet defense) — an unchanged repo costs ZERO API.
-  for (let i = 0; i < plan.length; i++) {
-    const hit = await ctx.cache.get<CachedEmbedding>(keys[i]);
-    if (hit && Array.isArray(hit.embedding)) embeddings[i] = hit.embedding;
+  // Several in flight at once (2026-11-25): one awaited round trip per chunk was thousands of
+  // sequential calls, minutes per run when the cache is a managed database in another region.
+  if (useCache) {
+    await forEachLimit(plan.length, CACHE_IO_CONCURRENCY, async (i) => {
+      const hit = await ctx.cache.get<CachedEmbedding>(keys[i]);
+      if (hit && Array.isArray(hit.embedding)) embeddings[i] = hit.embedding;
+    });
   }
 
   // 2) Batch the misses under Voyage's per-request limits, embed with transient retry,
@@ -673,11 +706,12 @@ async function embedChunks(
         provider: client.provider,
       });
     }
-    for (let j = 0; j < batch.length; j++) {
-      const i = batch[j];
-      embeddings[i] = vectors[j];
-      const entry: CachedEmbedding = { embedding: vectors[j], model: client.model, dim: client.dimension };
-      await ctx.cache.set(keys[i], entry);
+    for (let j = 0; j < batch.length; j++) embeddings[batch[j]] = vectors[j];
+    if (useCache) {
+      await forEachLimit(batch.length, CACHE_IO_CONCURRENCY, async (j) => {
+        const entry: CachedEmbedding = { embedding: vectors[j], model: client.model, dim: client.dimension };
+        await ctx.cache.set(keys[batch[j]], entry);
+      });
     }
   }
 
@@ -695,6 +729,56 @@ async function embedChunks(
     // zero-token usage: one means "spent nothing", the other means "a provider charged us nothing".
     usage: missing.length > 0 ? usage : null,
   };
+}
+
+/** Cache round trips kept in flight at once by `embedChunks`. */
+const CACHE_IO_CONCURRENCY = 16;
+
+/** Run `fn(0..count-1)` with at most `limit` calls pending. The first rejection is rethrown. */
+async function forEachLimit(count: number, limit: number, fn: (index: number) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < count) {
+      const index = next++;
+      await fn(index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, count) }, worker));
+}
+
+/**
+ * Keep at most `cap` chunks, whole files at a time, most connected files first (blast radius, then
+ * path, so the choice is deterministic). A file is never split: a half-indexed file would answer a
+ * question about its second half with "not found" while its first half is searchable. A file larger
+ * than the remaining budget is skipped and smaller ones after it can still fit.
+ */
+export function capChunkPlan<T extends { fileId: string }>(
+  plan: readonly T[],
+  cap: number,
+  perFile: ReadonlyArray<{ fileId: string; blastRadius: number }>,
+): T[] {
+  const radius = new Map(perFile.map((file) => [file.fileId, file.blastRadius]));
+  const byFile = new Map<string, T[]>();
+  for (const chunk of plan) {
+    const list = byFile.get(chunk.fileId);
+    if (list) list.push(chunk);
+    else byFile.set(chunk.fileId, [chunk]);
+  }
+  const files = [...byFile.keys()].sort(
+    (a, b) => (radius.get(b) ?? 0) - (radius.get(a) ?? 0) || a.localeCompare(b),
+  );
+  const keep = new Set<string>();
+  let budget = cap;
+  for (const fileId of files) {
+    const size = byFile.get(fileId)!.length;
+    if (size <= budget) {
+      keep.add(fileId);
+      budget -= size;
+    }
+    if (budget === 0) break;
+  }
+  // Original order preserved (the plan is sorted by file and line already).
+  return plan.filter((chunk) => keep.has(chunk.fileId));
 }
 
 /** Greedily group miss indices into batches under MAX_BATCH_TEXTS and MAX_BATCH_TOKENS.

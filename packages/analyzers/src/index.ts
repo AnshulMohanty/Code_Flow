@@ -75,9 +75,11 @@ export {
   statusReasonOf,
 } from "./pipeline/errors.js";
 export {
+  budgetLimitsFromEnv,
   createInMemoryBudgetHandle,
   createRedisBudgetHandle,
   tokensOf,
+  type BudgetLimits,
   type BudgetRedisLike,
   type RedisBudgetOptions,
 } from "./budget/budgetHandle.js";
@@ -157,6 +159,7 @@ export {
   createGeminiEmbeddingClient,
   createOpenAiEmbeddingClient,
   openAiEmbeddingDimension,
+  OPENAI_EMBED_MAX_INPUT_CHARS,
   DEFAULT_GEMINI_EMBED_DIM,
   DEFAULT_OPENAI_EMBED_MODEL,
   DEFAULT_VOYAGE_DIM,
@@ -174,6 +177,9 @@ export {
   resolveEmbeddingDimension,
   createLlmClientFromEnv,
   createEmbeddingClientFromEnv,
+  aiStatusFromEnv,
+  lacksAvailableAi,
+  type AiStatus,
   type ProviderEnv,
 } from "./providers.js";
 

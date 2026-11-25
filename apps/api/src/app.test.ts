@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "./config/env.js";
 import { createApp, trustProxyHopsFromEnv } from "./app.js";
 import { createInMemoryRateLimitStore } from "./middleware/rateLimit.js";
+import { createDailyCaps } from "./middleware/dailyCap.js";
 import { setAnalysisQueueEnqueueForTests } from "./queues/analysisQueue.js";
 import { setProgressSubscriberForTests } from "./queues/progressChannel.js";
 import { BudgetExceededError } from "@codeflow/analyzers";
@@ -342,6 +343,61 @@ describe("codeflow api", () => {
     });
   });
 
+  // ── Two modes: "map only" and "map + AI" (2026-11-25) ─────────────────────
+  /** Run `fn` with an OpenAI key in the environment (AI available), then remove it. */
+  async function withAiKey<T>(fn: () => Promise<T>): Promise<T> {
+    process.env.OPENAI_API_KEY = "sk-test";
+    try {
+      return await fn();
+    } finally {
+      delete process.env.OPENAI_API_KEY;
+    }
+  }
+
+  it("POST /api/analyze queues map-only when asked, AI by default, and map-only on a keyless server", async () => {
+    const payloads = withAvailableQueue() as Array<{ withAi?: boolean }>;
+    const body = { mode: "public_hosted", owner: "facebook", repo: "react", branch: "main" };
+    await withAiKey(async () => {
+      await request(app).post("/api/analyze").send({ ...body, withAi: false }).expect(202);
+      await request(app).post("/api/analyze").send(body).expect(202);
+    });
+    await request(app).post("/api/analyze").send(body).expect(202); // no key: AI cannot run
+    expect(payloads.map((payload) => payload.withAi)).toEqual([false, true, false]);
+  });
+
+  it("POST /api/analyze rejects a non-boolean withAi (400)", async () => {
+    const response = await request(app)
+      .post("/api/analyze")
+      .send({ mode: "public_hosted", owner: "facebook", repo: "react", withAi: "yes" })
+      .expect(400);
+    expect(response.body.error.code).toBe("INVALID_REQUEST");
+  });
+
+  it("a cached map-only result answers a map request, but not an AI request on a server with AI", async () => {
+    await seedCachedAnalysis(); // buildResult carries no ai slice
+    withAvailableQueue();
+    const body = { mode: "public_hosted", owner: "facebook", repo: "react", branch: "main", commitSha: COMMIT_SHA };
+    await withAiKey(async () => {
+      const mapOnly = await request(app).post("/api/analyze").send({ ...body, withAi: false }).expect(202);
+      expect(mapOnly.body.cached).toBe(true);
+      const withAi = await request(app).post("/api/analyze").send(body).expect(202);
+      expect(withAi.body).toMatchObject({ cached: false, status: "queued" });
+    });
+  });
+
+  it("the daily AI-analysis cap counts only runs that spend: map only stays free (429 DAILY_LIMIT)", async () => {
+    withAvailableQueue();
+    const capped = createApp({ dailyCaps: createDailyCaps({ limits: { aiAnalyses: 1, questions: null } }) });
+    const body = { mode: "public_hosted", owner: "facebook", repo: "react", branch: "main" };
+    await withAiKey(async () => {
+      await request(capped).post("/api/analyze").send(body).expect(202);
+      const blocked = await request(capped).post("/api/analyze").send(body).expect(429);
+      expect(blocked.body.error.code).toBe("DAILY_LIMIT");
+      expect(blocked.body.error.message).toMatch(/Map only/);
+      await request(capped).post("/api/analyze").send({ ...body, withAi: false }).expect(202);
+    });
+  });
+
   // ── Ask-the-repo (P18) ────────────────────────────────────────────────────
   async function seedAskJob(withRag = true): Promise<string> {
     const result = buildResult("ask-analysis");
@@ -472,6 +528,17 @@ describe("codeflow api", () => {
     await request(limited).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(200);
     const blocked = await request(limited).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(429);
     expect(blocked.body).toMatchObject({ error: { code: "RATE_LIMITED" } });
+  });
+
+  it("the daily question cap returns 429 DAILY_LIMIT, and an 'unavailable' answer does not use one up", async () => {
+    setAskHandlerForTests(async () => ({ answer: "ok", answered: true, citations: [], retrievedChunkIds: [] }));
+    const capped = createApp({ dailyCaps: createDailyCaps({ limits: { aiAnalyses: null, questions: 1 } }) });
+    const noIndex = await seedAskJob(false);
+    await request(capped).post(`/api/result/${noIndex}/ask`).send({ question: "q?" }).expect(200);
+    const jobId = await seedAskJob();
+    await request(capped).post(`/api/result/${jobId}/ask`).send({ question: "q?" }).expect(200);
+    const blocked = await request(capped).post(`/api/result/${jobId}/ask`).send({ question: "again?" }).expect(429);
+    expect(blocked.body.error.code).toBe("DAILY_LIMIT");
   });
 
   // The SSE write path is unit-tested via streamProgress with a fake sink —

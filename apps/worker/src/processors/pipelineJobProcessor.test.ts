@@ -138,7 +138,8 @@ describe("runAnalysisJob", () => {
       expect.stringContaining('AI stage "synthesize" was skipped'),
       expect.stringContaining('AI stage "rag" was skipped'),
     ]);
-    expect(saved.result.warnings.join(" ")).toContain("GEMINI_API_KEY");
+    // Names the setting an operator changes, and no particular vendor's key.
+    expect(saved.result.warnings.join(" ")).toContain("LLM_PROVIDER");
 
     // V3-P0: the delivered SCOPE, as a machine-readable field. `runStatus: "completed"` is
     // true and useless here on its own — every stage that existed did run. `runMode` is what
@@ -177,11 +178,84 @@ describe("runAnalysisJob", () => {
     expect(outcome.skippedStages).toEqual([]);
     expect(updates.at(-1)).not.toHaveProperty("skippedStages");
 
-    // A fully-configured run is "full" and carries no degradations (absent, not empty).
-    expect(outcome.runMode).toBe("full");
-    expect(outcome.degradations).toEqual([]);
-    expect(updates.at(-1)).toMatchObject({ runMode: "full" });
-    expect(updates.at(-1)).not.toHaveProperty("degradations");
+    // Nothing was SKIPPED. But this repository is empty, so both AI stages RAN and FAILED (nothing to
+    // ground a guide or an index against). Until 2026-11-25 that still read as a "full" run and the UI
+    // offered a guide and Q&A that did not exist; it is now reported as what it is.
+    const saved = vi.mocked(service.saveAnalysis).mock.calls[0][0];
+    const failedAi = (saved.result.pipeline?.stages ?? [])
+      .filter((stage) => stage.status === "failed" && (stage.stage === "synthesize" || stage.stage === "rag"))
+      .map((stage) => stage.stage);
+    expect(failedAi.length).toBeGreaterThan(0);
+    expect(outcome.runMode).toBe("deterministic-only");
+    expect(outcome.degradations.map((notice) => notice.reason)).toEqual(["ai-unavailable"]);
+    expect(updates.at(-1)).toMatchObject({ runMode: "deterministic-only" });
+  });
+
+  it("a run where every stage succeeds is 'full' and carries no degradations (absent, not empty)", async () => {
+    const { service, updates } = fakeService(null);
+    const outcome = await runAnalysisJob(payload, {
+      service,
+      cloner: fakeCloner(),
+      publisher: createChannel(),
+      readFile: noFiles,
+      readDir: emptyDir,
+      now: makeClock(),
+    });
+    // Keyless, so the AI stages are skipped — classified by `skippedStages`, never as a failure.
+    expect(outcome.degradations.map((notice) => notice.reason)).not.toContain("ai-unavailable");
+    expect(updates.at(-1)).not.toHaveProperty("error");
+  });
+
+  it("MAP ONLY (withAi: false): the AI stages are not registered, nothing is spent, and it says so", async () => {
+    const { service, updates } = fakeService(null);
+    const complete = vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } }));
+    const embed = vi.fn(async () => ({ vectors: [[0, 0, 0]], usage: { inputTokens: 1, outputTokens: 0, measured: true } }));
+    const outcome = await runAnalysisJob(
+      { ...payload, withAi: false },
+      {
+        service,
+        cloner: fakeCloner(),
+        publisher: createChannel(),
+        readFile: noFiles,
+        readDir: emptyDir,
+        now: makeClock(),
+        synthesisClient: { provider: "openai", model: "test", complete },
+        embeddingClient: { provider: "openai", model: "test", dimension: 3, embed },
+      },
+    );
+    expect(complete).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(outcome.skippedStages).toEqual(["synthesize", "rag"]);
+    expect(outcome.runMode).toBe("deterministic-only");
+    // ONE reason, and not "no provider": the server HAS providers; the visitor chose not to use them.
+    expect(outcome.degradations.map((notice) => notice.reason)).toEqual(["map-only"]);
+    const saved = vi.mocked(service.saveAnalysis).mock.calls[0][0];
+    expect(saved.result.warnings).toEqual([expect.stringContaining("Map-only run")]);
+    expect(saved.result.warnings.join(" ")).not.toMatch(/API_KEY|LLM_PROVIDER/);
+    expect(updates.at(-1)).toMatchObject({ runMode: "deterministic-only", skippedStages: ["synthesize", "rag"] });
+  });
+
+  it("a cached MAP-ONLY result is a miss for an AI request this worker can serve, a hit for map only", async () => {
+    // The six deterministic stages and no `ai` slice: exactly what a map-only run persists.
+    const cachedMap: SavedWorkerAnalysis = {
+      analysisId: "cached-map",
+      result: { id: "cached-map", commitSha: RESOLVED_SHA, producedBy: ["ingest", "orient", "map-structure", "inventory", "connect", "analyze"] } as AnalysisResult,
+      cached: true,
+    };
+    const clients = {
+      synthesisClient: { provider: "openai" as const, model: "test", complete: vi.fn(async () => ({ text: "{}", usage: { inputTokens: 1, outputTokens: 1, measured: true } })) },
+    };
+    const base = { cloner: fakeCloner(), publisher: createChannel(), readFile: noFiles, readDir: emptyDir, now: makeClock(), ...clients };
+
+    const ai = fakeService(cachedMap);
+    const aiOutcome = await runAnalysisJob(payload, { ...base, service: ai.service });
+    expect(aiOutcome.cached).toBe(false);
+    expect(ai.service.saveAnalysis).toHaveBeenCalled();
+
+    const map = fakeService(cachedMap);
+    const mapOutcome = await runAnalysisJob({ ...payload, withAi: false }, { ...base, service: map.service });
+    expect(mapOutcome.cached).toBe(true);
+    expect(map.service.saveAnalysis).not.toHaveBeenCalled();
   });
 
   it("fanOutSynthesis is OPT-IN: default off, and enabling it keeps stage 7 registered as `synthesize`", async () => {
@@ -324,6 +398,9 @@ describe("runAnalysisJob", () => {
     expect(outcome.status).toBe("failed");
     expect(service.saveAnalysis).not.toHaveBeenCalled();
     expect(updates.at(-1)).toMatchObject({ status: "failed", runStatus: "failed", runStatusReason: "repo-too-large" });
+    // No "the map is complete" notice on a run that produced no map.
+    expect(outcome.degradations).toEqual([]);
+    expect(updates.at(-1)).not.toHaveProperty("degradations");
   });
 });
 
