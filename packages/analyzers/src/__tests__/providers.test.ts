@@ -6,7 +6,8 @@ import {
   createGeminiEmbeddingClient,
   createOpenAiClient,
   createOpenAiEmbeddingClient,
-  OPENAI_EMBED_MAX_INPUT_CHARS,
+  OPENAI_EMBED_MAX_INPUT_BYTES,
+  headWithinUtf8Bytes,
   createVoyageClient,
   createEmbeddingClientFromEnv,
   createLlmClientFromEnv,
@@ -461,13 +462,27 @@ describe("the OpenAI embedding adapter conforms to EmbeddingClient", () => {
     expect(embedCalls[0].url).toBe("http://gateway.local:8080/v1/embeddings");
   });
 
-  it("sends at most OPENAI_EMBED_MAX_INPUT_CHARS per input (OpenAI 400s an input over 8,192 tokens)", async () => {
-    const captured = stubFetch({ data: [{ embedding: [1], index: 0 }, { embedding: [2], index: 1 }], usage: { total_tokens: 2 } });
-    const huge = "x".repeat(OPENAI_EMBED_MAX_INPUT_CHARS * 3);
-    await createOpenAiEmbeddingClient({ apiKey: "o" }).embed({ texts: [huge, "short"], inputType: "document" });
+  it("sends at most OPENAI_EMBED_MAX_INPUT_BYTES per input (OpenAI 400s an input over 8,192 tokens)", async () => {
+    const captured = stubFetch({ data: [{ embedding: [1], index: 0 }, { embedding: [2], index: 1 }, { embedding: [3], index: 2 }], usage: { total_tokens: 3 } });
+    const ascii = "x".repeat(OPENAI_EMBED_MAX_INPUT_BYTES * 3);
+    // 3 UTF-8 bytes per character: under a 12,000-CHARACTER cap this was 36,000 bytes, enough to
+    // pass 8,192 tokens. The byte cap bounds the tokens whatever the text is.
+    const dense = "漢".repeat(OPENAI_EMBED_MAX_INPUT_BYTES);
+    await createOpenAiEmbeddingClient({ apiKey: "o" }).embed({ texts: [ascii, dense, "short"], inputType: "document" });
     const sent = body(captured[0]).input as string[];
-    expect(sent[0]).toHaveLength(OPENAI_EMBED_MAX_INPUT_CHARS);
-    expect(sent[1]).toBe("short"); // a normal chunk is untouched
+    const utf8 = (text: string) => new TextEncoder().encode(text).length;
+    expect(utf8(sent[0])).toBe(OPENAI_EMBED_MAX_INPUT_BYTES);
+    expect(utf8(sent[1])).toBeLessThanOrEqual(OPENAI_EMBED_MAX_INPUT_BYTES);
+    expect(sent[1]).toBe("漢".repeat(Math.floor(OPENAI_EMBED_MAX_INPUT_BYTES / 3))); // whole characters only
+    expect(sent[2]).toBe("short"); // a normal chunk is untouched
+  });
+
+  it("headWithinUtf8Bytes never splits a character", () => {
+    expect(headWithinUtf8Bytes("abc", 10)).toBe("abc");
+    expect(headWithinUtf8Bytes("ab😀cd", 5)).toBe("ab"); // the 4-byte emoji does not fit after 2 bytes
+    expect(headWithinUtf8Bytes("ab😀cd", 6)).toBe("ab😀");
+    expect(headWithinUtf8Bytes("éééé", 3)).toBe("é"); // 2 bytes each
+    expect(headWithinUtf8Bytes("x".repeat(20), 7)).toBe("xxxxxxx");
   });
 
   it("re-chunks under its per-request input cap (>256 texts → multiple calls, order preserved)", async () => {
